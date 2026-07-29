@@ -1,0 +1,8 @@
+{
+  "host": "0.0.0.0",
+  "port": 5001,
+  "manager_url": "http://manager.internal:5000",
+  "refresh_interval_seconds": 30,
+  "log_file": "/var/log/lab-monitor-dashboard.log",
+  "log_level": "INFO"
+}

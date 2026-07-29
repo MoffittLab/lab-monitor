@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 5000,
+  "data_dir": "/var/lib/lab-monitor/data",
+  "auth_tokens": ["change-me-token-1", "change-me-token-2"],
+  "log_file": "/var/log/lab-monitor-manager.log",
+  "log_level": "INFO",
+  "retention_days": 90
+}

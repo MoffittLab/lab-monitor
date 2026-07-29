@@ -1,0 +1,15 @@
+{
+  "nas_name": "nas-01",
+  "nas_id": "synology_01",
+  "manager_url": "http://manager.internal:5000",
+  "manager_token": "your-auth-token-here",
+  "folders_to_monitor": [
+    "/volume1/shared",
+    "/volume1/media"
+  ],
+  "log_file": "/var/log/lab-monitor-collector.log",
+  "log_level": "INFO",
+  "timeout_seconds": 300,
+  "retry_attempts": 3,
+  "retry_delay_seconds": 10
+}
