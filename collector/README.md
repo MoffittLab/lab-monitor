@@ -61,6 +61,8 @@ python3 --version
 
 If not installed, install via **Control Panel → Package Center → search "Python"**.
 
+**Note:** Python 3.8+ is required. Synology typically provides python3 or python3.9, both of which support venv.
+
 ### Step 4: Create Directory Structure (via Synology GUI)
 
 Create `/volume1/lab-monitor` shared folder via **Control Panel → Shared Folder**, then create subdirectories:
@@ -74,6 +76,30 @@ sudo mkdir -p /volume1/lab-monitor/data
 sudo chmod 755 /volume1/lab-monitor/scripts
 sudo chmod 755 /volume1/lab-monitor/data
 ```
+
+### Step 4.5: Create Python Virtual Environment
+
+Create an isolated Python environment for the collector. This ensures pip works and dependencies are isolated:
+
+```bash
+# Navigate to lab-monitor directory
+cd /volume1/lab-monitor
+
+# Create virtual environment (use python3.9 if available, otherwise python3)
+python3 -m venv lab-monitor-env
+
+# Activate the environment
+source lab-monitor-env/bin/activate
+
+# You should see (lab-monitor-env) in your prompt
+# Verify pip works
+pip --version
+
+# Deactivate for now (we'll activate again during installation)
+deactivate
+```
+
+**Note:** The virtual environment is at `/volume1/lab-monitor/lab-monitor-env`. All pip installs and Python runs should happen within this activated environment.
 
 ### Step 5: Copy Collector Code
 
@@ -94,9 +120,20 @@ scp -r /path/to/lab-monitor/collector/* Admin@t1.hms.harvard.edu:/volume1/lab-mo
 
 ### Step 6: Install Python Dependencies
 
+**Activate the virtual environment and install dependencies:**
+
 ```bash
+# Activate the venv
+source /volume1/lab-monitor/lab-monitor-env/bin/activate
+
+# Navigate to collector
 cd /volume1/lab-monitor/scripts/lab-monitor/collector
-sudo python3 -m pip install -r requirements.txt
+
+# Install dependencies (pip now installs into the venv, not system-wide)
+pip install -r requirements.txt
+
+# Deactivate the venv (we'll activate it in the task scheduler)
+deactivate
 ```
 
 ### Step 7: Create Configuration
@@ -143,9 +180,20 @@ The `local/` directory is **ignored by git**, so your config won't be committed 
 
 ### Step 8: Test the Script
 
+**Activate the venv and run the script:**
+
 ```bash
+# Activate the venv
+source /volume1/lab-monitor/lab-monitor-env/bin/activate
+
+# Navigate to collector
 cd /volume1/lab-monitor/scripts/lab-monitor/collector
-sudo python3 collector.py --config local/config.json
+
+# Run the script
+sudo /volume1/lab-monitor/lab-monitor-env/bin/python3 collector.py --config local/config.json
+
+# Deactivate when done
+deactivate
 ```
 
 You should see output like:
@@ -158,6 +206,8 @@ Checking Manager availability...
 Flushing queue to Manager...
 Collector completed successfully
 ```
+
+**Note:** Using the venv Python path directly (`/volume1/lab-monitor/lab-monitor-env/bin/python3`) is more reliable for automated Task Scheduler runs.
 
 ### Step 9: Schedule Daily Execution
 
@@ -178,8 +228,10 @@ Collector completed successfully
 5. **Task Settings tab → User-defined script:**
 
 ```bash
-cd /volume1/lab-monitor/scripts/lab-monitor/collector && sudo /usr/bin/python3 collector.py --config local/config.json
+cd /volume1/lab-monitor/scripts/lab-monitor/collector && sudo /volume1/lab-monitor/lab-monitor-env/bin/python3 collector.py --config local/config.json
 ```
+
+**Key difference:** Use the venv Python path (`/volume1/lab-monitor/lab-monitor-env/bin/python3`) instead of the system Python. This ensures the script uses the dependencies you installed in the venv.
 
 If you configured passwordless sudo (Step 2b), this will run without prompting.
 
@@ -220,13 +272,44 @@ git clone https://github.com/MoffittLab/lab-monitor.git
 cd lab-monitor\collector
 ```
 
-### Step 3: Install Python Dependencies
+### Step 3: Create Python Virtual Environment
 
 ```powershell
-python -m pip install -r requirements.txt
+# Navigate to lab-monitor directory
+cd C:\lab-monitor
+
+# Create virtual environment
+python -m venv lab-monitor-env
+
+# Activate the environment
+.\lab-monitor-env\Scripts\Activate.ps1
+
+# Verify pip works
+pip --version
+
+# Deactivate for now (we'll activate again during installation)
+deactivate
 ```
 
-### Step 4: Create Configuration
+**Note:** The virtual environment is at `C:\lab-monitor\lab-monitor-env`.
+
+### Step 4: Install Python Dependencies
+
+```powershell
+# Activate the venv
+.\lab-monitor-env\Scripts\Activate.ps1
+
+# Navigate to collector
+cd scripts\lab-monitor\collector
+
+# Install dependencies (pip installs into the venv, not system-wide)
+pip install -r requirements.txt
+
+# Deactivate
+deactivate
+```
+
+### Step 5: Create Configuration
 
 ```powershell
 # Create local/ directory if it doesn't exist
@@ -251,15 +334,17 @@ The `local/` directory is **ignored by git**, so your config won't be committed 
 
 Volumes and queue path are auto-discovered/auto-defaulted. All optional fields match the Synology configuration reference below.
 
-### Step 5: Schedule via Task Scheduler
+### Step 6: Schedule via Task Scheduler
 
 1. **Task Scheduler → Create Basic Task**
 2. **Name:** Lab Monitor Collector
 3. **Trigger:** Daily at 2:00 AM
 4. **Action:**
-   - Program: `C:\Python311\python.exe`
+   - Program: `C:\lab-monitor\lab-monitor-env\Scripts\python.exe`
    - Arguments: `C:\lab-monitor\scripts\lab-monitor\collector\collector.py --config local\config.json`
 5. **Finish**
+
+**Key difference:** Use the venv Python path (`C:\lab-monitor\lab-monitor-env\Scripts\python.exe`) instead of the system Python.
 
 ---
 
