@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lab Monitor Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>🔬 Lab Monitor</h1>
+            <div class="header-info">
+                <span class="last-update" id="lastUpdate">Last updated: --</span>
+                <span class="status" id="status">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- Summary Section -->
+        <section class="summary">
+            <div class="summary-card">
+                <h3>NAS Systems</h3>
+                <p class="summary-value" id="nasCount">0</p>
+            </div>
+            <div class="summary-card">
+                <h3>Total Usage</h3>
+                <p class="summary-value" id="totalUsage">0 B</p>
+            </div>
+            <div class="summary-card">
+                <h3>Last Update</h3>
+                <p class="summary-value" id="lastUpdateTime">--</p>
+            </div>
+        </section>
+
+        <!-- NAS Grid -->
+        <section class="nas-grid" id="nasGrid">
+            <div class="loading">Loading NAS data...</div>
+        </section>
+
+        <!-- Detail Modal -->
+        <div id="detailModal" class="modal">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2 id="modalNasName"></h2>
+                <div id="modalContent"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    <script>
+        // Initialize dashboard with config
+        const config = {
+            refreshInterval: {{ refresh_interval }} * 1000
+        };
+        initDashboard(config);
+    </script>
+</body>
+</html>

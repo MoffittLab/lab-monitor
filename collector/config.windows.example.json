@@ -1,0 +1,9 @@
+{
+  "manager_url": "http://a1.med.harvard.edu:5000",
+  "manager_token": "your-secret-token-here",
+  "log_level": "INFO",
+  "timeout_seconds": 300,
+  "manager_timeout_seconds": 5,
+  "retry_attempts": 3,
+  "retry_delay_seconds": 10
+}
