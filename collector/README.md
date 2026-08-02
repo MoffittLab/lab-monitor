@@ -371,7 +371,7 @@ Volumes and queue path are auto-discovered/auto-defaulted. All optional fields m
 | `exclude_folders` | `[]` | Folders to skip when auto-discovering (case-insensitive) |
 | `log_file` | stdout only | Log file path |
 | `log_level` | `"INFO"` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-| `timeout_seconds` | `300` | Max time to measure all folders |
+| `timeout_seconds` | `3600` | Max time to measure a single folder (seconds); default 1 hour for large filesystems |
 | `manager_timeout_seconds` | `5` | Timeout for Manager health check |
 | `retry_attempts` | `3` | Retry attempts if POST fails |
 | `retry_delay_seconds` | `10` | Delay between retries |

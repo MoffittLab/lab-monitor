@@ -91,7 +91,7 @@ def get_git_version() -> tuple:
         return None, None
 
 
-def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
+def build_report(nas_name: str, nas_id: str, folders_usage: dict, execution_time: float = None) -> dict:
     """
     Build a usage report dict.
     
@@ -99,6 +99,7 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
         nas_name: Human-readable NAS name
         nas_id: Unique identifier
         folders_usage: Dict of {path: size_bytes}
+        execution_time: Total execution time in seconds (optional)
     
     Returns: Report dict
     """
@@ -112,6 +113,10 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
         ]
     }
     
+    # Add execution time if provided
+    if execution_time is not None:
+        report["execution_time_seconds"] = round(execution_time, 2)
+    
     # Add collector version info if available
     tag, commit = get_git_version()
     if tag:
@@ -123,6 +128,9 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
 
 
 def main():
+    # Track execution time
+    execution_start = time.time()
+    
     # Parse arguments
     parser = argparse.ArgumentParser(description="Lab Monitor Collector")
     parser.add_argument(
@@ -160,7 +168,7 @@ def main():
     manager_token = config.get("manager_token")
     queue_path = config.get("queue_path", "/volume1/lab-monitor/data/queue.jsonl")
     archive_dir = config.get("archive_dir")  # If None, archive_queue will use queue parent + /archive
-    timeout_seconds = config.get("timeout_seconds", 300)
+    timeout_seconds = config.get("timeout_seconds", 3600)  # Default: 1 hour per folder
     retry_attempts = config.get("retry_attempts", 3)
     retry_delay = config.get("retry_delay_seconds", 10)
     
@@ -197,7 +205,8 @@ def main():
     
     # Step 2: Build and enqueue report
     logger.info("Step 2: Enqueuing report...")
-    report = build_report(nas_name, nas_id, folders_usage)
+    execution_time = time.time() - execution_start
+    report = build_report(nas_name, nas_id, folders_usage, execution_time=execution_time)
     
     if not enqueue_report(report, queue_path):
         logger.error("Failed to enqueue report")

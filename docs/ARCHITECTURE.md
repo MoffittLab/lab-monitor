@@ -54,6 +54,9 @@ Three-service distributed system for tracking NAS usage:
   "nas_name": "nas-01",
   "nas_id": "synology_01",
   "timestamp": "2026-07-29T02:00:00Z",
+  "execution_time_seconds": 1285.47,
+  "collector_version": "v0.0.8",
+  "collector_commit": "8f93b23",
   "folders": [
     {"path": "/volume1/shared", "usage_bytes": 5368709120},
     {"path": "/volume1/media", "usage_bytes": 1099511627776}

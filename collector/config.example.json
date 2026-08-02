@@ -2,7 +2,7 @@
   "manager_url": "http://manager.internal:5000",
   "manager_token": "your-auth-token-here",
   "log_level": "INFO",
-  "timeout_seconds": 300,
+  "timeout_seconds": 3600,
   "retry_attempts": 3,
   "retry_delay_seconds": 10,
   "archive_dir": null
