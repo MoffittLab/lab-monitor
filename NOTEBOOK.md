@@ -43,7 +43,23 @@ Modify Collector to **retain local records** instead of deleting them after succ
 - Or: New config flag: `local_archive_path` for separate archival location
 - Or: Hybrid: Keep queue, also archive to separate dir for long-term storage
 
-## Implementation Complete ✓ (v0.0.2)
+## Implementation Complete ✓ (Latest: v0.0.14)
+
+### Key Decisions Made (Final)
+
+**Permissions Approach:** Synology-native ACL (not sudo modifications)
+- GUI-based folder permissions survive Synology updates
+- No risky `/etc/sudoers` modifications
+- Follows Synology official recommendations
+- Admin user (not root) runs Task Scheduler
+- Least privilege security model
+
+**Monitoring:** Non-Root User Friendly
+- SSH + tail logs for post-run verification
+- Optional email notifications for failures
+- Archive files accumulate monthly for audit trail
+- Queue status shows sync success/failure
+- Daily routine takes ~2 minutes
 
 ### What Was Implemented
 
