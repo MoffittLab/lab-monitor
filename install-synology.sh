@@ -66,7 +66,13 @@ echo "   NAS ID (boot_id): $NAS_ID"
 echo -e "${GREEN}✓ NAS configuration detected${NC}"
 echo
 
-echo -e "${YELLOW}Step 3: Creating Python virtual environment...${NC}"
+echo -e "${YELLOW}Step 3: Configuring passwordless sudo for automation...${NC}"
+# Allow Admin user to run Python venv without password prompts
+echo "Admin ALL=(ALL) NOPASSWD: $VENV_PATH/bin/python3" | sudo tee -a /etc/sudoers > /dev/null
+echo -e "${GREEN}✓ Passwordless sudo configured${NC}"
+echo
+
+echo -e "${YELLOW}Step 4: Creating Python virtual environment...${NC}"
 cd "$LAB_MONITOR_HOME"
 
 # Check if venv already exists
@@ -78,7 +84,7 @@ else
 fi
 echo
 
-echo -e "${YELLOW}Step 4: Cloning lab-monitor repository...${NC}"
+echo -e "${YELLOW}Step 5: Cloning lab-monitor repository...${NC}"
 if [ -d "$SCRIPTS_DIR/lab-monitor" ]; then
     echo "   Repository already exists, updating..."
     cd "$SCRIPTS_DIR/lab-monitor"
@@ -90,7 +96,7 @@ else
 fi
 echo
 
-echo -e "${YELLOW}Step 5: Installing Python dependencies...${NC}"
+echo -e "${YELLOW}Step 6: Installing Python dependencies...${NC}"
 # Activate venv and install requirements
 source "$VENV_PATH/bin/activate"
 cd "$COLLECTOR_DIR"
@@ -100,7 +106,7 @@ deactivate
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 echo
 
-echo -e "${YELLOW}Step 6: Prompting for Manager configuration...${NC}"
+echo -e "${YELLOW}Step 7: Prompting for Manager configuration...${NC}"
 echo
 echo "Enter Manager Configuration:"
 read -p "Manager URL (e.g., http://a1.med.harvard.edu:5000): " MANAGER_URL
@@ -113,7 +119,7 @@ if [ -z "$MANAGER_URL" ] || [ -z "$MANAGER_TOKEN" ]; then
     exit 1
 fi
 
-echo -e "${YELLOW}Step 7: Creating configuration file...${NC}"
+echo -e "${YELLOW}Step 8: Creating configuration file...${NC}"
 mkdir -p "$COLLECTOR_DIR/local"
 
 cat > "$CONFIG_PATH" << EOF
@@ -137,7 +143,7 @@ chmod 600 "$CONFIG_PATH"
 echo -e "${GREEN}✓ Configuration file created at $CONFIG_PATH${NC}"
 echo
 
-echo -e "${YELLOW}Step 8: Testing the installation...${NC}"
+echo -e "${YELLOW}Step 9: Testing the installation...${NC}"
 source "$VENV_PATH/bin/activate"
 cd "$COLLECTOR_DIR"
 

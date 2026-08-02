@@ -36,22 +36,28 @@ You'll be prompted for your admin password.
 
 ### Step 2b: Configure Sudo (For Passwordless Script Execution)
 
-To avoid password prompts during automated collection, configure sudo:
+To avoid password prompts during automated collection, configure sudo for passwordless execution:
 
 ```bash
-# SSH into NAS as Admin, then:
-sudo visudo
+# SSH into NAS as Admin, then append to sudoers:
+echo "Admin ALL=(ALL) NOPASSWD: /volume1/lab-monitor/lab-monitor-env/bin/python3" | sudo tee -a /etc/sudoers > /dev/null
 ```
 
-Add this line at the end:
+This safely adds passwordless sudo access for the Python venv **only** (restricted to one command).
 
+**Verify it works:**
+```bash
+# Should run without prompting for password
+sudo /volume1/lab-monitor/lab-monitor-env/bin/python3 --version
 ```
-Admin ALL=(ALL) NOPASSWD: /usr/bin/python3
-```
 
-Save and exit (Ctrl+X, then Y, then Enter if using nano).
+**Why this approach?**
+- ✅ Safe: Synology doesn't have `visudo`; this avoids direct file editing
+- ✅ Restricted: Only allows the specific Python path
+- ✅ Auditable: Can view sudoers with `sudo cat /etc/sudoers`
+- ✅ No password prompts in automated Task Scheduler
 
-**Alternative:** If you prefer not to modify sudo config, you can run the collection script directly as Admin if folder permissions allow, or use `sudo` with a password in the Task Scheduler.
+**Alternative:** If you prefer not to modify sudo config, you can run the collection script directly (without sudo) by adjusting folder permissions, or use `sudo` with a password in the Task Scheduler (slower for automated tasks).
 
 ### Step 3: Check Python
 
