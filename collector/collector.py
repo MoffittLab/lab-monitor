@@ -6,7 +6,7 @@ Runs on each NAS/Windows system. Daily:
 1. Measures disk usage of configured folders
 2. Enqueues locally
 3. Attempts to POST to Manager
-4. Deletes queue on success
+4. Archives queue to monthly files on success
 
 Usage:
     python3 collector.py --config config.json
@@ -17,6 +17,7 @@ import json
 import logging
 import argparse
 import socket
+import subprocess
 from datetime import datetime
 
 # Add lib directory to path
@@ -65,6 +66,31 @@ def load_config(config_path: str) -> dict:
         sys.exit(1)
 
 
+def get_git_version() -> tuple:
+    """
+    Get collector version tag and commit hash from git.
+    Returns: (tag, commit) or (None, None) if not in git repo
+    """
+    try:
+        # Get current git tag (or closest tag)
+        tag = subprocess.check_output(
+            ['git', 'describe', '--tags', '--always'],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        
+        # Get short commit hash
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        
+        return tag, commit
+    except Exception:
+        return None, None
+
+
 def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
     """
     Build a usage report dict.
@@ -76,7 +102,7 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
     
     Returns: Report dict
     """
-    return {
+    report = {
         "nas_name": nas_name,
         "nas_id": nas_id,
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -85,6 +111,15 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict) -> dict:
             for path, size in folders_usage.items()
         ]
     }
+    
+    # Add collector version info if available
+    tag, commit = get_git_version()
+    if tag:
+        report["collector_version"] = tag
+    if commit:
+        report["collector_commit"] = commit
+    
+    return report
 
 
 def main():
