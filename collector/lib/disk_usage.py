@@ -4,12 +4,50 @@ Disk usage measurement for monitored folders
 import os
 import subprocess
 import logging
+import time
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def get_folder_size(path: str, timeout: int = 300) -> Optional[int]:
+def format_bytes(size_bytes: int) -> str:
+    """
+    Format bytes as human-readable size (B, KB, MB, GB, TB).
+    
+    Args:
+        size_bytes: Size in bytes
+    
+    Returns: Formatted string (e.g., "5.4 GB", "2.1 TB")
+    """
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} EB"
+
+
+def format_duration(seconds: float) -> str:
+    """
+    Format duration as human-readable (s, m, h).
+    
+    Args:
+        seconds: Duration in seconds
+    
+    Returns: Formatted string (e.g., "23s", "5m 32s", "2h 14m")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+
+def get_folder_size(path: str, timeout: int = 300, folder_num: int = None, total_folders: int = None) -> Optional[int]:
     """
     Get total size of a folder in bytes.
     
@@ -17,11 +55,25 @@ def get_folder_size(path: str, timeout: int = 300) -> Optional[int]:
     - Windows: dir command with /s flag (if du.exe not available)
     - Linux/Synology: du -sb
     
+    Args:
+        path: Folder path to measure
+        timeout: Timeout in seconds
+        folder_num: Progress indicator (current folder number)
+        total_folders: Progress indicator (total folders)
+    
     Returns: Size in bytes, or None if measurement fails
     """
     if not os.path.exists(path):
         logger.warning(f"Path does not exist: {path}")
         return None
+    
+    # Log progress header
+    progress_str = ""
+    if folder_num and total_folders:
+        progress_str = f" [{folder_num}/{total_folders}]"
+    logger.info(f"Measuring {path}{progress_str}...")
+    
+    start_time = time.time()
     
     try:
         # Try du command (Linux/Synology/Git Bash on Windows)
@@ -35,7 +87,10 @@ def get_folder_size(path: str, timeout: int = 300) -> Optional[int]:
             )
             if result.returncode == 0:
                 size_bytes = int(result.stdout.split()[0])
-                logger.info(f"Measured {path}: {size_bytes} bytes")
+                elapsed = time.time() - start_time
+                size_str = format_bytes(size_bytes)
+                duration_str = format_duration(elapsed)
+                logger.info(f"  ✓ {path}: {size_str} ({duration_str})")
                 return size_bytes
         else:
             # Windows: try du.exe first, fall back to Python recursion
@@ -48,28 +103,42 @@ def get_folder_size(path: str, timeout: int = 300) -> Optional[int]:
                 )
                 if result.returncode == 0:
                     size_bytes = int(result.stdout.split()[0])
-                    logger.info(f"Measured {path}: {size_bytes} bytes")
+                    elapsed = time.time() - start_time
+                    size_str = format_bytes(size_bytes)
+                    duration_str = format_duration(elapsed)
+                    logger.info(f"  ✓ {path}: {size_str} ({duration_str})")
                     return size_bytes
             except FileNotFoundError:
                 logger.debug("du.exe not found, falling back to Python recursion")
-                return _get_folder_size_python(path)
+                return _get_folder_size_python(path, start_time)
     
     except subprocess.TimeoutExpired:
-        logger.error(f"Timeout measuring {path} (>{timeout}s)")
+        elapsed = time.time() - start_time
+        duration_str = format_duration(elapsed)
+        logger.error(f"  ✗ Timeout measuring {path} (>{timeout}s, elapsed {duration_str})")
         return None
     except Exception as e:
-        logger.error(f"Error measuring {path}: {e}")
+        elapsed = time.time() - start_time
+        duration_str = format_duration(elapsed)
+        logger.error(f"  ✗ Error measuring {path}: {e} (elapsed {duration_str})")
         return None
     
     # Fallback: Python-based recursion (slower but reliable)
-    return _get_folder_size_python(path)
+    return _get_folder_size_python(path, start_time)
 
 
-def _get_folder_size_python(path: str) -> Optional[int]:
+def _get_folder_size_python(path: str, start_time: float = None) -> Optional[int]:
     """
     Fallback: Measure folder size using Python os.walk.
     Slower than du but works on any system.
+    
+    Args:
+        path: Folder path to measure
+        start_time: Start time for duration calculation
     """
+    if start_time is None:
+        start_time = time.time()
+    
     try:
         total_size = 0
         for dirpath, dirnames, filenames in os.walk(path):
@@ -81,11 +150,16 @@ def _get_folder_size_python(path: str) -> Optional[int]:
                     # Skip files we can't access
                     pass
         
-        logger.info(f"Measured {path}: {total_size} bytes (Python fallback)")
+        elapsed = time.time() - start_time
+        size_str = format_bytes(total_size)
+        duration_str = format_duration(elapsed)
+        logger.info(f"  ✓ {path}: {size_str} ({duration_str}, Python fallback)")
         return total_size
     
     except Exception as e:
-        logger.error(f"Error measuring {path} (Python fallback): {e}")
+        elapsed = time.time() - start_time
+        duration_str = format_duration(elapsed)
+        logger.error(f"  ✗ Error measuring {path} (Python fallback): {e} (elapsed {duration_str})")
         return None
 
 
@@ -139,9 +213,9 @@ def discover_folders(volumes: List[str], exclude: List[str] = None, timeout: int
     
     logger.info(f"Discovered {len(discovered)} folder(s) to measure")
     
-    # Measure all discovered folders
-    for folder in discovered:
-        size = get_folder_size(folder, timeout=timeout)
+    # Measure all discovered folders with progress tracking
+    for idx, folder in enumerate(discovered, 1):
+        size = get_folder_size(folder, timeout=timeout, folder_num=idx, total_folders=len(discovered))
         if size is not None:
             results[folder] = size
         else:

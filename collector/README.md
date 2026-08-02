@@ -463,6 +463,31 @@ The collector will:
 └── cache/            ← MEASURED (if not excluded)
 ```
 
+### Measurement Progress
+
+For large folders (10TB+), measurement can take several minutes. The collector logs progress as it measures:
+
+**Example log output:**
+```
+Measuring /volume1/shared [1/5]...
+  ✓ /volume1/shared: 5.4 GB (2m 14s)
+Measuring /volume1/media [2/5]...
+  ✓ /volume1/media: 45.2 GB (5m 32s)
+Measuring /volume1/backup [3/5]...
+  ✓ /volume1/backup: 2.1 TB (18m 45s)
+```
+
+Each line shows:
+- Folder being measured (with progress `[current/total]`)
+- ✓ Completion with size and duration
+- Human-readable format: GB, TB, and time (s, m, h)
+
+**Check live progress:**
+```bash
+# SSH into NAS and tail the log
+tail -f /volume1/lab-monitor/data/lab-monitor-collector.log
+```
+
 ### Customize Excludes
 
 Common system folders to exclude:
