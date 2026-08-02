@@ -104,8 +104,7 @@ echo -e "${YELLOW}Step 6: Prompting for Manager configuration...${NC}"
 echo
 echo "Enter Manager Configuration:"
 read -p "Manager URL (e.g., http://a1.med.harvard.edu:5000): " MANAGER_URL
-read -sp "Manager Token (will not echo): " MANAGER_TOKEN
-echo
+read -p "Manager Token: " MANAGER_TOKEN
 echo
 
 # Validate inputs
@@ -168,6 +167,7 @@ echo
 echo "  NAS Name: $NAS_NAME"
 echo "  NAS ID: $NAS_ID"
 echo "  Manager URL: $MANAGER_URL"
+echo "  Manager Token: $MANAGER_TOKEN"
 echo
 echo "Next steps:"
 echo "  1. Schedule daily execution via Control Panel → Task Scheduler"
