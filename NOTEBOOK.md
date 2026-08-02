@@ -43,9 +43,11 @@ Modify Collector to **retain local records** instead of deleting them after succ
 - Or: New config flag: `local_archive_path` for separate archival location
 - Or: Hybrid: Keep queue, also archive to separate dir for long-term storage
 
-## Implementation Plan (Selected: Option 2 with Monthly Rollup)
+## Implementation Complete ✓ (v0.0.2)
 
-### Behavior
+### What Was Implemented
+
+**Behavior:**
 1. Collector measures folders daily → writes to `queue.jsonl`
 2. POSTs to Manager
 3. **On success:**
@@ -53,45 +55,39 @@ Modify Collector to **retain local records** instead of deleting them after succ
    - Clear `queue.jsonl` for next run
 4. **On failure:**
    - Queue persists, retried next run (existing behavior)
-5. Monthly archives grow indefinitely (or with optional retention policy TBD)
+5. Monthly archives accumulate indefinitely
 
-### Directory Structure
-```
-/volume1/lab-monitor/data/
-├── queue.jsonl              # Daily working queue (cleared after success)
-├── archive/
-│   ├── 2026-07.jsonl       # July 2026 accumulation
-│   ├── 2026-08.jsonl       # August 2026 accumulation
-│   └── 2026-09.jsonl       # September 2026 accumulation
-└── lab-monitor-collector.log
-```
+### Code Changes Made
 
-### Code Changes
+**`collector/lib/queue.py`**
+- Added `archive_queue(queue_path, archive_dir)` function
+  - Reads queue entries
+  - Appends to monthly archive file `{archive_dir}/YYYY-MM.jsonl`
+  - Truncates queue for next run
+  - Creates archive directory automatically
 
 **`collector/collector.py`**
-- After successful POST to Manager:
-  - Instead of `os.remove(queue_path)`
-  - Call new function: `archive_queue(queue_path, archive_dir)`
-  - Function reads queue.jsonl, appends to `archive/YYYY-MM.jsonl`, then clears queue
-- Archive function handles:
-  - Creating `archive/` directory if not exists
-  - Determining current month (YYYY-MM format)
-  - Appending queue lines to monthly file
-  - Preserving queue.jsonl structure (JSONL = one JSON per line)
+- Updated POST success handler:
+  - Changed from `clear_queue()` to `archive_queue(queue_path, archive_dir)`
+  - Added `archive_dir` config loading
 
-**`collector/config.*.example.json`**
-- New optional field: `archive_dir` (default: relative to queue_path parent)
-- Example: `"archive_dir": "./archive"`
+**Config Files**
+- `config.example.json`: Added `archive_dir: null`
+- `config.synology.example.json`: Added `archive_dir: "/volume1/lab-monitor/data/archive"`
+- `config.windows.example.json`: Added `archive_dir: "C:\\lab-monitor\\data\\archive"`
 
 **Documentation**
-- Update `collector/README.md` with new archive behavior
-- Note: Monthly files are append-only, records never deleted (or with optional retention)
+- Updated `collector/README.md`:
+  - Overview now mentions "Archives queue to monthly files"
+  - Added `archive_dir` to Configuration Reference table
+  - New "Archive Behavior" section with directory structure, file format, and customization
+  - Updated Notes section with data retention info
 
-### Next Steps
-1. Implement `archive_queue()` function in collector.py
-2. Update POST success handler to call archive instead of delete
-3. Add `archive_dir` config option
-4. Test on dev machine (create fake data, run through cycle)
-5. Update README with new behavior and monthly archive structure
-6. Test on actual NAS/Windows to verify permissions and folder creation
+### Testing
+- ✓ Manual test: Created queue with 2 reports → archived to YYYY-MM.jsonl → queue cleared
+- ✓ Archive file verified: Correct monthly naming, valid JSONL format
+
+### Commit & Tag
+- **Commit**: `9a29ef2` - "feat: implement local record archival with monthly rollup"
+- **Tag**: `v0.0.2` - Local record archival with monthly rollup
 
