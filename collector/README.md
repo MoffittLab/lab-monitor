@@ -414,6 +414,25 @@ The `manager_token` is a **secret authentication token** that proves the collect
 
 ## Folder Discovery
 
+### Volume Filtering
+
+When `volumes` is omitted from config, the collector **auto-discovers mounted volumes** but **only monitors volumes with names starting with 'volume'** (e.g., `/volume1`, `/volume2`, `/volumeX`).
+
+This prevents accidentally measuring system volumes, backup mounts, or network shares.
+
+**Example on Synology:**
+- ✓ `/volume1` — MONITORED (matches 'volume*' pattern)
+- ✓ `/volume2` — MONITORED (matches 'volume*' pattern)
+- ✗ `/mnt/backup` — IGNORED (doesn't match pattern)
+- ✗ `/mnt/nfs` — IGNORED (doesn't match pattern)
+
+You can still override this by explicitly setting `volumes` in config:
+```json
+{
+  "volumes": ["/volume1", "/volume2", "/custom/storage"]
+}
+```
+
 ### How It Works
 
 Given this configuration:

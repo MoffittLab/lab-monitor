@@ -171,9 +171,10 @@ def measure_all_folders(folders: List[str], timeout: int = 300) -> Dict[str, int
 
 def discover_volumes() -> List[str]:
     """
-    Auto-discover all mounted volumes on the system.
+    Auto-discover mounted volumes on the system.
+    Only returns volumes starting with 'volume' (e.g., /volume1, /volume2).
     
-    Returns: List of volume paths (e.g., ['/volume1', '/volume2', '/mnt/...'])
+    Returns: List of volume paths matching pattern (e.g., ['/volume1', '/volume2'])
     """
     volumes = []
     
@@ -194,8 +195,9 @@ def discover_volumes() -> List[str]:
                     parts = line.split()
                     if len(parts) >= 6:
                         mount_point = parts[-1]
-                        # Skip system mount points
-                        if mount_point not in ['/', '/dev', '/sys', '/proc', '/run', '/boot']:
+                        # Only include volumes starting with 'volume' (e.g., /volume1, /volume2)
+                        basename = os.path.basename(mount_point)
+                        if basename.startswith('volume'):
                             if os.path.exists(mount_point) and os.path.isdir(mount_point):
                                 volumes.append(mount_point)
         else:
@@ -212,8 +214,8 @@ def discover_volumes() -> List[str]:
                     lines = result.stdout.strip().split('\n')[1:]  # Skip header
                     for line in lines:
                         drive = line.strip()
-                        if drive:
-                            # Add with backslash
+                        # Only include volumes starting with 'volume' (e.g., C:, V:, etc. if labeled)
+                        if drive and drive[0].lower() in ['v']:
                             volumes.append(drive + '\\')
             except FileNotFoundError:
                 logger.warning("wmic not found, unable to auto-discover Windows volumes")
@@ -221,5 +223,5 @@ def discover_volumes() -> List[str]:
     except Exception as e:
         logger.error(f"Error discovering volumes: {e}")
     
-    logger.info(f"Auto-discovered {len(volumes)} volume(s): {volumes}")
+    logger.info(f"Auto-discovered {len(volumes)} 'volume*' volume(s): {volumes}")
     return volumes
