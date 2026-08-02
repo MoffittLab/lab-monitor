@@ -34,32 +34,57 @@ ssh -p 22222 Admin@t1.hms.harvard.edu
 
 You'll be prompted for your admin password.
 
-### Step 2b: Configure Sudo (For Passwordless Script Execution)
+### Step 2b: Folder Permissions (Already Set via GUI)
 
-To avoid password prompts during automated collection, configure sudo for passwordless execution:
+The `lab-monitor` shared folder already has the correct permissions:
+- **Synology uses ACL (Access Control Lists)**, not traditional Unix ownership
+- The folder shows `root:root` ownership with a `+` flag (e.g., `drwxrwxrwx+`)
+- The `+` indicates ACL permissions are active
+- When you set "Read & Write" for Admin user via GUI, that's an ACL rule
+- **This survives Synology updates** (unlike `/etc/sudoers` modifications)
 
+**No additional setup needed** — GUI permissions handle everything.
+
+**Synology official guidance:** Do not modify `root:root` ownership. Use ACL instead.
+
+Reference: [Synology Knowledge Center - What are the default permissions of a shared folder?](https://kb.synology.com/en-nz/DSM/tutorial/acl_default_permissions_for_share_folders)
+
+### Step 3: Configure Task Scheduler
+
+Set up automatic execution via Synology's Task Scheduler:
+
+**In Synology Control Panel:**
+1. Go to **Task Scheduler**
+2. Click **Create** → **Triggered Task** → **User-defined script**
+3. Fill in the form:
+
+**General Tab:**
+- Task name: `lab-monitor-collector`
+- User: **Admin** (NOT root)
+- Enabled: ✓
+
+**Schedule Tab:**
+- Run on: **Daily**
+- Time: **02:00** (2 AM recommended)
+
+**Task Settings Tab:**
+- User-defined script:
 ```bash
-# SSH into NAS as Admin, then append to sudoers:
-echo "Admin ALL=(ALL) NOPASSWD: /volume1/lab-monitor/lab-monitor-env/bin/python3" | sudo tee -a /etc/sudoers > /dev/null
+cd /volume1/lab-monitor/scripts/lab-monitor/collector && \
+/volume1/lab-monitor/lab-monitor-env/bin/python3 collector.py --config local/config.json
 ```
 
-This safely adds passwordless sudo access for the Python venv **only** (restricted to one command).
+**(Optional) Notification Tab:**
+- ✓ Send run details by email
+- ✓ Send only if script terminates abnormally
 
-**Verify it works:**
-```bash
-# Should run without prompting for password
-sudo /volume1/lab-monitor/lab-monitor-env/bin/python3 --version
-```
+**Why Admin (not root)?**
+- Admin has read/write access via ACL permissions
+- Follows principle of least privilege
+- Still has all required permissions
+- Safer than running as root
 
-**Why this approach?**
-- ✅ Safe: Synology doesn't have `visudo`; this avoids direct file editing
-- ✅ Restricted: Only allows the specific Python path
-- ✅ Auditable: Can view sudoers with `sudo cat /etc/sudoers`
-- ✅ No password prompts in automated Task Scheduler
-
-**Alternative:** If you prefer not to modify sudo config, you can run the collection script directly (without sudo) by adjusting folder permissions, or use `sudo` with a password in the Task Scheduler (slower for automated tasks).
-
-### Step 3: Check Python
+### Step 4: Check Python
 
 ```bash
 # Most Synology systems have Python 3 built-in
@@ -166,12 +191,12 @@ The `local/` directory is **ignored by git**, so your config won't be committed 
 ```
 
 **Optional fields:**
-- `nas_name` — Auto-discovered from system hostname if omitted
-- `nas_id` — Defaults to `nas_name` if omitted
-- `volumes` — Auto-discovered from system mounts if omitted (reports on all volumes)
-- `queue_path` — Defaults to `/volume1/lab-monitor/data/queue.jsonl` if omitted
-- `exclude_folders` — Folders to skip when auto-discovering
-- `log_file` — Log file path (optional; logs to console if omitted)
+- `nas_name` - Auto-discovered from system hostname if omitted
+- `nas_id` - Defaults to `nas_name` if omitted
+- `volumes` - Auto-discovered from system mounts if omitted (reports on all volumes)
+- `queue_path` - Defaults to `/volume1/lab-monitor/data/queue.jsonl` if omitted
+- `exclude_folders` - Folders to skip when auto-discovering
+- `log_file` - Log file path (optional; logs to console if omitted)
 - Other fields have sensible defaults
 
 **Example with custom volumes and exclusions:**
@@ -428,10 +453,10 @@ When `volumes` is omitted from config, the collector **auto-discovers mounted vo
 This prevents accidentally measuring system volumes, backup mounts, or network shares.
 
 **Example on Synology:**
-- ✓ `/volume1` — MONITORED (matches 'volume*' pattern)
-- ✓ `/volume2` — MONITORED (matches 'volume*' pattern)
-- ✗ `/mnt/backup` — IGNORED (doesn't match pattern)
-- ✗ `/mnt/nfs` — IGNORED (doesn't match pattern)
+- ✓ `/volume1` - MONITORED (matches 'volume*' pattern)
+- ✓ `/volume2` - MONITORED (matches 'volume*' pattern)
+- ✗ `/mnt/backup` - IGNORED (doesn't match pattern)
+- ✗ `/mnt/nfs` - IGNORED (doesn't match pattern)
 
 You can still override this by explicitly setting `volumes` in config:
 ```json
@@ -444,13 +469,13 @@ You can still override this by explicitly setting `volumes` in config:
 
 The collector **automatically skips all directories starting with `@`**, which are Synology system directories:
 
-- `@appstore` — Package Center apps
-- `@eadir` — Thumbnails/metadata
-- `@tmp` — Temporary files
-- `@home` — User home directories (system-managed)
+- `@appstore` - Package Center apps
+- `@eadir` - Thumbnails/metadata
+- `@tmp` - Temporary files
+- `@home` - User home directories (system-managed)
 - Any other `@*` directories
 
-These are filtered out **natively by the collector** — no configuration needed. This prevents measuring system overhead and keeps reports focused on user data.
+These are filtered out **natively by the collector** - no configuration needed. This prevents measuring system overhead and keeps reports focused on user data.
 
 **Example discovery on Synology:**
 ```
@@ -530,16 +555,16 @@ tail -f /volume1/lab-monitor/data/lab-monitor-collector.log
 
 Additional system folders you may want to exclude:
 
-**Synology (optional — @* already excluded natively):**
-- `lost+found` — Filesystem recovery
-- `.ds_store` — macOS junk
-- `cache` — Local cache files (if not measuring)
+**Synology (optional - @* already excluded natively):**
+- `lost+found` - Filesystem recovery
+- `.ds_store` - macOS junk
+- `cache` - Local cache files (if not measuring)
 
 **Windows:**
-- `$RECYCLE.BIN` — Recycle bin
-- `System Volume Information` — System metadata
-- `pagefile.sys` — Virtual memory
-- `hiberfil.sys` — Hibernation file
+- `$RECYCLE.BIN` - Recycle bin
+- `System Volume Information` - System metadata
+- `pagefile.sys` - Virtual memory
+- `hiberfil.sys` - Hibernation file
 
 **Example config with custom excludes:**
 ```json
@@ -556,11 +581,11 @@ Additional system folders you may want to exclude:
 
 Each report includes automatic summary statistics:
 
-**`volume_totals`** — Sum of all measured folders per volume
+**`volume_totals`** - Sum of all measured folders per volume
 - Example: `/volume1: 1.0 TB` (sum of all folders in /volume1)
 - Example: `/volume2: 2.1 TB` (sum of all folders in /volume2)
 
-**`total_usage_bytes`** — Grand total of all measured folders
+**`total_usage_bytes`** - Grand total of all measured folders
 - Sum across all volumes
 - Useful for tracking overall NAS capacity usage
 
@@ -672,9 +697,105 @@ If omitted, archives are stored alongside the queue file in an `archive/` subdir
 
 ### Permission denied errors
 
-- Ensure script runs with sudo privileges (Task Scheduler should use Admin with sudo configured)
-- Verify `/volume1/lab-monitor/data/` is writable by Admin (via sudo)
-- If using passwordless sudo, test: `sudo -l` to confirm Admin can run python3 without a password
+- Ensure Task Scheduler runs as Admin user (not root)
+- Verify `/volume1/lab-monitor/data/` permissions via GUI File Station
+- Test: `ls -la /volume1/lab-monitor/data/` should show folder is accessible to Admin
+
+---
+
+## Monitoring the Collector
+
+### Check Logs After Each Run
+
+After Task Scheduler runs (daily at 2 AM), SSH into the NAS and check the log:
+
+```bash
+# SSH into NAS
+ssh Admin@your-nas-hostname.local
+
+# View last 100 lines of log
+tail -100 /volume1/lab-monitor/data/lab-monitor-collector.log
+```
+
+You'll see:
+- ✓ Which folders were measured
+- ✓ Sizes and elapsed time for each folder
+- ✓ Summary stats (volume totals, grand total)
+- ✓ Success/failure of Manager POST
+- ✓ Archive operation (appended to monthly file)
+
+### Email Notifications (Recommended)
+
+Enable in Task Scheduler for instant feedback:
+
+1. **Task Scheduler** → Right-click `lab-monitor-collector` → **Edit**
+2. **Notification tab**
+3. ✓ **Send run details by email**
+4. ✓ **Send only if script terminates abnormally** (to reduce email volume)
+5. **OK**
+
+You'll receive an email only if the task fails, with full error details.
+
+### Watch Progress in Real-Time
+
+To monitor while Task Scheduler is running (2 AM):
+
+```bash
+# SSH into NAS
+ssh Admin@your-nas-hostname.local
+
+# Watch logs in real-time
+tail -f /volume1/lab-monitor/data/lab-monitor-collector.log
+
+# Shows measurements as they happen:
+# "Measuring /volume1/shared [1/5]..."
+# "  ✓ /volume1/shared: 5.4 GB (2m 14s)"
+```
+
+### Verify Archives Are Building
+
+Check monthly archive files are accumulating:
+
+```bash
+# List archive files
+ls -lah /volume1/lab-monitor/data/archive/
+
+# Should show files like: 2026-08.jsonl, 2026-09.jsonl, etc.
+
+# Check size of current month
+wc -l /volume1/lab-monitor/data/archive/2026-08.jsonl
+# Shows number of daily reports in August
+```
+
+### Queue Status
+
+Check if queue is empty (clean) after successful sync:
+
+```bash
+# After Task Scheduler completes, queue should be empty
+wc -l /volume1/lab-monitor/data/queue.jsonl
+# Should output: 0 (or near-zero)
+
+# If queue has lines, previous POST to Manager failed - will retry tomorrow
+cat /volume1/lab-monitor/data/queue.jsonl
+```
+
+### Example: Daily Monitoring Routine
+
+**Morning after 2 AM run:**
+1. Check email for any failure notifications
+2. SSH and quick status check:
+   ```bash
+   # Last log entry
+   tail -5 /volume1/lab-monitor/data/lab-monitor-collector.log
+   
+   # Verify queue was cleared (success)
+   ls -la /volume1/lab-monitor/data/queue.jsonl
+   
+   # Check archives grew
+   ls -la /volume1/lab-monitor/data/archive/ | tail -3
+   ```
+3. Done - everything automated after that
 
 ---
 

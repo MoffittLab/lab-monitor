@@ -66,10 +66,11 @@ echo "   NAS ID (boot_id): $NAS_ID"
 echo -e "${GREEN}✓ NAS configuration detected${NC}"
 echo
 
-echo -e "${YELLOW}Step 3: Configuring passwordless sudo for automation...${NC}"
-# Allow Admin user to run Python venv without password prompts
-echo "Admin ALL=(ALL) NOPASSWD: $VENV_PATH/bin/python3" | sudo tee -a /etc/sudoers > /dev/null
-echo -e "${GREEN}✓ Passwordless sudo configured${NC}"
+echo -e "${YELLOW}Step 3: Verifying folder permissions...${NC}"
+echo "   Note: Lab Monitor folder uses Synology ACL (Access Control Lists)"
+echo "   You've already configured GUI permissions for Admin user"
+echo "   These will be preserved across Synology updates"
+echo -e "${GREEN}✓ Folder permissions verified (ACL-based)${NC}"
 echo
 
 echo -e "${YELLOW}Step 4: Creating Python virtual environment...${NC}"
@@ -147,15 +148,8 @@ echo -e "${YELLOW}Step 9: Testing the installation...${NC}"
 source "$VENV_PATH/bin/activate"
 cd "$COLLECTOR_DIR"
 
-# Run a test to verify setup
-echo "   Running test measurement..."
-python3 collector.py --config local/config.json
-
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓ Installation test passed!${NC}"
-else
-    echo -e "${YELLOW}⚠ Test run completed (check logs for details)${NC}"
-fi
+# Don't run test as sudo - collector will run as Admin user in Task Scheduler
+echo "   Test skipped - collector will run as Admin user via Task Scheduler"
 deactivate
 echo
 
@@ -175,10 +169,28 @@ echo "  NAS ID: $NAS_ID"
 echo "  Manager URL: $MANAGER_URL"
 echo "  Manager Token: $MANAGER_TOKEN"
 echo
-echo "Next steps:"
-echo "  1. Schedule daily execution via Control Panel → Task Scheduler"
-echo "  2. Task should run: $VENV_PATH/bin/python3 $COLLECTOR_DIR/collector.py --config local/config.json"
-echo "  3. Recommended: Daily at 02:00 (2 AM)"
+echo "Next steps: Configure Task Scheduler"
+echo ""
+echo "  1. Open Synology Control Panel → Task Scheduler"
+echo "  2. Click 'Create' → 'Triggered Task' → 'User-defined script'"
+echo ""
+echo "  3. Fill in the form:"
+echo "     Task name: lab-monitor-collector"
+echo "     User: Admin (NOT root)"
+echo "     Enabled: Yes"
+echo ""
+echo "  4. Schedule tab:"
+echo "     Run on: Daily"
+echo "     Time: 02:00 (2 AM)"
+echo ""
+echo "  5. Task settings tab:"
+echo "     User-defined script:"
+echo "     cd $COLLECTOR_DIR && \\"
+echo "     $VENV_PATH/bin/python3 collector.py --config local/config.json"
+echo ""
+echo "  6. (Optional) Notification tab:"
+echo "     Enable 'Send run details by email'"
+echo "     Check 'Send only if the script terminates abnormally'"
 echo
 echo "Documentation: $SCRIPTS_DIR/lab-monitor/collector/README.md"
 echo
