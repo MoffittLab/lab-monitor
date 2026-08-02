@@ -24,7 +24,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
 from disk_usage import measure_all_folders, discover_folders, discover_volumes
-from queue import enqueue_report, read_queue, clear_queue, archive_queue
+from queue_manager import enqueue_report, read_queue, clear_queue, archive_queue
 from reporter import flush_queue, is_manager_reachable
 
 
