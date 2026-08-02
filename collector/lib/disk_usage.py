@@ -199,6 +199,11 @@ def discover_folders(volumes: List[str], exclude: List[str] = None, timeout: int
                 if not os.path.isdir(full_path):
                     continue
                 
+                # Skip Synology system directories (start with @)
+                if entry.startswith('@'):
+                    logger.debug(f"Excluding {full_path} (Synology system directory)")
+                    continue
+                
                 # Skip if in exclude list (case-insensitive)
                 if entry.lower() in exclude_lower:
                     logger.debug(f"Excluding {full_path} (in exclude list)")

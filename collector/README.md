@@ -434,6 +434,35 @@ You can still override this by explicitly setting `volumes` in config:
 }
 ```
 
+### Synology System Directories (Auto-Excluded)
+
+The collector **automatically skips all directories starting with `@`**, which are Synology system directories:
+
+- `@appstore` — Package Center apps
+- `@eadir` — Thumbnails/metadata
+- `@tmp` — Temporary files
+- `@home` — User home directories (system-managed)
+- Any other `@*` directories
+
+These are filtered out **natively by the collector** — no configuration needed. This prevents measuring system overhead and keeps reports focused on user data.
+
+**Example discovery on Synology:**
+```
+/volume1/
+├── @appstore/      ← AUTO-EXCLUDED (starts with @)
+├── @eadir/         ← AUTO-EXCLUDED (starts with @)
+├── shared/         ← MEASURED (user folder)
+├── media/          ← MEASURED (user folder)
+└── backup/         ← MEASURED (user folder)
+```
+
+You can add **additional** folders to exclude via config:
+```json
+{
+  "exclude_folders": ["lost+found", ".ds_store", "cache"]
+}
+```
+
 ### How It Works
 
 Given this configuration:
@@ -491,20 +520,27 @@ tail -f /volume1/lab-monitor/data/lab-monitor-collector.log
 
 ### Customize Excludes
 
-Common system folders to exclude:
+**Note:** Synology `@*` directories are **automatically excluded** by the collector. You only need to add custom excludes for other folders.
 
-**Synology:**
-- `@appstore` — Package Center apps
-- `@eadir` — Thumbnails/metadata
-- `@tmp` — Temporary files
+Additional system folders you may want to exclude:
+
+**Synology (optional — @* already excluded natively):**
 - `lost+found` — Filesystem recovery
 - `.ds_store` — macOS junk
+- `cache` — Local cache files (if not measuring)
 
 **Windows:**
 - `$RECYCLE.BIN` — Recycle bin
 - `System Volume Information` — System metadata
 - `pagefile.sys` — Virtual memory
 - `hiberfil.sys` — Hibernation file
+
+**Example config with custom excludes:**
+```json
+{
+  "exclude_folders": ["lost+found", ".ds_store", "cache"]
+}
+```
 
 ---
 
