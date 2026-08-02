@@ -123,3 +123,51 @@ def backup_queue(queue_path: str, backup_dir: str = None) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to backup queue: {e}")
         return None
+
+
+def archive_queue(queue_path: str, archive_dir: str = None) -> bool:
+    """
+    Archive queue to monthly file (YYYY-MM.jsonl) and clear queue.
+    
+    Args:
+        queue_path: Path to queue.jsonl
+        archive_dir: Directory for archives; if None, use queue parent dir + /archive
+    
+    Returns: True if archived successfully
+    """
+    if not os.path.exists(queue_path):
+        logger.info("Queue is empty, nothing to archive")
+        return True
+    
+    if archive_dir is None:
+        archive_dir = os.path.join(os.path.dirname(queue_path), 'archive')
+    
+    try:
+        # Ensure archive directory exists
+        os.makedirs(archive_dir, exist_ok=True)
+        
+        # Get current month in YYYY-MM format
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        archive_path = os.path.join(archive_dir, f"{current_month}.jsonl")
+        
+        # Read all reports from queue
+        reports = read_queue(queue_path)
+        
+        if reports:
+            # Append all reports to monthly archive file
+            with open(archive_path, 'a') as archive_file:
+                for report in reports:
+                    archive_file.write(json.dumps(report) + '\n')
+            
+            logger.info(f"Archived {len(reports)} report(s) to {archive_path}")
+        
+        # Clear the queue file
+        with open(queue_path, 'w') as f:
+            pass  # Truncate file
+        
+        logger.info(f"Queue cleared")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Failed to archive queue: {e}")
+        return False

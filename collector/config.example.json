@@ -4,5 +4,6 @@
   "log_level": "INFO",
   "timeout_seconds": 300,
   "retry_attempts": 3,
-  "retry_delay_seconds": 10
+  "retry_delay_seconds": 10,
+  "archive_dir": null
 }

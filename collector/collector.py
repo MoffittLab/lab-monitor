@@ -23,7 +23,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
 from disk_usage import measure_all_folders, discover_folders, discover_volumes
-from queue import enqueue_report, read_queue, clear_queue
+from queue import enqueue_report, read_queue, clear_queue, archive_queue
 from reporter import flush_queue, is_manager_reachable
 
 
@@ -124,6 +124,7 @@ def main():
     manager_url = config.get("manager_url")
     manager_token = config.get("manager_token")
     queue_path = config.get("queue_path", "/volume1/lab-monitor/data/queue.jsonl")
+    archive_dir = config.get("archive_dir")  # If None, archive_queue will use queue parent + /archive
     timeout_seconds = config.get("timeout_seconds", 300)
     retry_attempts = config.get("retry_attempts", 3)
     retry_delay = config.get("retry_delay_seconds", 10)
@@ -195,13 +196,13 @@ def main():
     )
     
     if success:
-        # Step 5: Clear queue on success
-        logger.info("Step 5: Clearing queue...")
-        if clear_queue(queue_path):
+        # Step 5: Archive queue on success
+        logger.info("Step 5: Archiving queue...")
+        if archive_queue(queue_path, archive_dir):
             logger.info("Collector completed successfully")
             return True
         else:
-            logger.error("Failed to clear queue after successful flush")
+            logger.error("Failed to archive queue after successful flush")
             return False
     else:
         logger.warning("Failed to flush queue, keeping reports for next run")

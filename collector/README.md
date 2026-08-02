@@ -10,7 +10,7 @@ The collector:
 3. **Measures** remaining folders daily
 4. **Queues locally** (survives Manager downtime)
 5. **Posts to Manager** with authentication
-6. **Deletes queue** only on successful handshake
+6. **Archives queue** to monthly files on successful handshake (records retained indefinitely)
 
 ---
 
@@ -367,6 +367,7 @@ Volumes and queue path are auto-discovered/auto-defaulted. All optional fields m
 | `nas_id` | Same as `nas_name` | Unique identifier (defaults to nas_name if omitted) |
 | `volumes` | Auto-discovered | Root volumes to scan; auto-discovered from system mounts if omitted |
 | `queue_path` | `/volume1/lab-monitor/data/queue.jsonl` | Local queue file path |
+| `archive_dir` | `{queue_path parent}/archive` | Directory for monthly archive files (YYYY-MM.jsonl); created automatically |
 | `exclude_folders` | `[]` | Folders to skip when auto-discovering (case-insensitive) |
 | `log_file` | stdout only | Log file path |
 | `log_level` | `"INFO"` | Logging level (DEBUG, INFO, WARNING, ERROR) |
@@ -462,6 +463,65 @@ Common system folders to exclude:
 
 ---
 
+## Archive Behavior
+
+### How It Works
+
+When reports are successfully posted to the Manager, the collector **archives them to monthly files** instead of deleting them:
+
+1. **Daily measurement** → Enqueue to `queue.jsonl`
+2. **POST to Manager** → On success, append queue contents to `archive/YYYY-MM.jsonl`
+3. **Clear queue** → Queue file is truncated for the next day
+
+### Directory Structure
+
+```
+/volume1/lab-monitor/data/
+├── queue.jsonl              # Current day's working queue (cleared after success)
+├── lab-monitor-collector.log
+└── archive/
+    ├── 2026-07.jsonl       # All July measurements (one JSON per line)
+    ├── 2026-08.jsonl       # All August measurements
+    └── 2026-09.jsonl       # All September measurements
+```
+
+### Monthly Files
+
+Each month file (`YYYY-MM.jsonl`) is:
+- **Append-only**: New measurements are added to the end
+- **JSONL format**: One complete JSON report per line
+- **Queryable**: Each line is valid JSON
+- **Retained indefinitely**: No automatic cleanup
+
+Example lines from `2026-08.jsonl`:
+
+```json
+{"nas_name": "nas-01", "nas_id": "synology_01", "timestamp": "2026-08-01T02:00:00Z", "folders": [...] }
+{"nas_name": "nas-01", "nas_id": "synology_01", "timestamp": "2026-08-02T02:00:00Z", "folders": [...] }
+```
+
+### Customizing Archive Location
+
+To store archives in a different location, set `archive_dir` in config:
+
+**Synology example:**
+```json
+{
+  "archive_dir": "/volume1/lab-monitor/data/archive"
+}
+```
+
+**Windows example:**
+```json
+{
+  "archive_dir": "C:\\lab-monitor\\data\\archive"
+}
+```
+
+If omitted, archives are stored alongside the queue file in an `archive/` subdirectory.
+
+---
+
 ## Troubleshooting
 
 ### Script fails: "Manager not reachable"
@@ -500,5 +560,6 @@ Common system folders to exclude:
 
 - The script is designed to run daily (once per day is typical)
 - Offline resilience: If Manager is down, reports stay in queue and retry next run
-- No data is ever lost locally until successfully posted to Manager
+- **Data retention**: Local monthly archives retain all reports indefinitely (never deleted automatically)
 - Logs are appended (grow over time; consider rotation if running for months)
+- Archives are one file per calendar month; files grow continuously as new measurements are added
