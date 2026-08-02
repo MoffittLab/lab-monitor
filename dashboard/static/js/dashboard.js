@@ -40,7 +40,7 @@ function loadData() {
             console.error('Error loading data:', error);
             updateStatus('error');
             document.getElementById('nasGrid').innerHTML = 
-                `<div class="loading">⚠️ Error loading data: ${error.message}</div>`;
+                `<div class="loading">⚠️ Unable to reach Manager. Retrying...</div>`;
         });
 }
 
@@ -91,9 +91,16 @@ function createNasCard(nasName, nas) {
     const card = document.createElement('div');
     card.className = 'nas-card';
     
-    const timestamp = nas.timestamp ? new Date(nas.timestamp).toLocaleString() : 'Unknown';
+    // Safely parse timestamp
+    let timestamp = 'Unknown';
+    try {
+        if (nas.timestamp) {
+            timestamp = new Date(nas.timestamp).toLocaleString();
+        }
+    } catch (e) {
+        console.warn(`Invalid timestamp for ${nasName}: ${nas.timestamp}`);
+    }
     
-    // Estimate percentage (simplified - would need capacity info for real %)
     const totalBytes = nas.total_usage_bytes || 0;
     
     // Create folder list
@@ -102,8 +109,8 @@ function createNasCard(nasName, nas) {
         for (const folder of nas.folders.slice(0, 5)) { // Show top 5
             folderHtml += `
                 <div class="folder-item">
-                    <span class="folder-path">${folder.path}</span>
-                    <span class="folder-size">${folder.usage_formatted}</span>
+                    <span class="folder-path">${escapeHtml(folder.path)}</span>
+                    <span class="folder-size">${escapeHtml(folder.usage_formatted)}</span>
                 </div>
             `;
         }
@@ -116,26 +123,34 @@ function createNasCard(nasName, nas) {
         }
     }
     
+    // Calculate usage percentage (estimate based on typical capacities)
+    // This is a rough estimate; for real capacity tracking, Manager would need to provide capacity info
+    let usagePercent = 0;
+    const estimatedCapacity = 100 * 1024 * 1024 * 1024 * 1024; // 100 TB estimate
+    if (totalBytes > 0) {
+        usagePercent = Math.min((totalBytes / estimatedCapacity) * 100, 100);
+    }
+    
     card.innerHTML = `
         <div class="nas-card-header">
             <div>
-                <div class="nas-name">${nasName}</div>
-                <div class="nas-id">${nas.nas_id || 'N/A'}</div>
+                <div class="nas-name">${escapeHtml(nasName)}</div>
+                <div class="nas-id">${escapeHtml(nas.nas_id || 'N/A')}</div>
             </div>
-            <div class="timestamp">${timestamp}</div>
+            <div class="timestamp">${escapeHtml(timestamp)}</div>
         </div>
         
         <div class="usage-stats">
             <span>Total Usage</span>
-            <span class="usage-value">${nas.total_usage_formatted}</span>
+            <span class="usage-value">${escapeHtml(nas.total_usage_formatted)}</span>
         </div>
         
         <div class="usage-bar">
-            <div class="usage-fill" style="width: 45%;"></div>
+            <div class="usage-fill" style="width: ${usagePercent.toFixed(1)}%;"></div>
         </div>
         
         <div class="folder-list">
-            ${folderHtml || '<div class="folder-item">No folders</div>'}
+            ${folderHtml ? `<div>${folderHtml}</div>` : '<div class="folder-item">No folders</div>'}
         </div>
     `;
     
@@ -150,7 +165,7 @@ function createNasCard(nasName, nas) {
  */
 function showNasDetail(nasName, nas) {
     const modal = document.getElementById('detailModal');
-    document.getElementById('modalNasName').textContent = nasName;
+    document.getElementById('modalNasName').textContent = escapeHtml(nasName);
     
     let folderHtml = '<h3>Folders</h3>';
     if (nas.folders && nas.folders.length > 0) {
@@ -158,19 +173,28 @@ function showNasDetail(nasName, nas) {
         for (const folder of nas.folders) {
             folderHtml += `
                 <tr style="border-bottom:1px solid #ddd;">
-                    <td style="padding:8px;">${folder.path}</td>
-                    <td style="padding:8px;text-align:right;font-weight:bold;">${folder.usage_formatted}</td>
+                    <td style="padding:8px;">${escapeHtml(folder.path)}</td>
+                    <td style="padding:8px;text-align:right;font-weight:bold;">${escapeHtml(folder.usage_formatted)}</td>
                 </tr>
             `;
         }
         folderHtml += '</table>';
     }
     
-    const timestamp = nas.timestamp ? new Date(nas.timestamp).toLocaleString() : 'Unknown';
+    // Safely parse timestamp
+    let timestamp = 'Unknown';
+    try {
+        if (nas.timestamp) {
+            timestamp = new Date(nas.timestamp).toLocaleString();
+        }
+    } catch (e) {
+        console.warn(`Invalid timestamp: ${nas.timestamp}`);
+    }
+    
     document.getElementById('modalContent').innerHTML = `
-        <p><strong>NAS ID:</strong> ${nas.nas_id || 'N/A'}</p>
-        <p><strong>Last Update:</strong> ${timestamp}</p>
-        <p><strong>Total Usage:</strong> ${nas.total_usage_formatted}</p>
+        <p><strong>NAS ID:</strong> ${escapeHtml(nas.nas_id || 'N/A')}</p>
+        <p><strong>Last Update:</strong> ${escapeHtml(timestamp)}</p>
+        <p><strong>Total Usage:</strong> ${escapeHtml(nas.total_usage_formatted)}</p>
         ${folderHtml}
     `;
     
@@ -208,8 +232,12 @@ function updateStatus(status) {
  * Format bytes to human-readable
  */
 function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) {
+        return '0 B';
+    }
+    
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let size = bytes;
+    let size = Math.max(0, bytes);
     
     for (let unit of units) {
         if (size < 1024) {
@@ -219,4 +247,14 @@ function formatBytes(bytes) {
     }
     
     return `${size.toFixed(2)} PB`;
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }

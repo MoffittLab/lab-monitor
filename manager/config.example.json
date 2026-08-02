@@ -3,7 +3,9 @@
   "port": 5000,
   "data_dir": "/var/lib/lab-monitor/data",
   "auth_tokens": ["change-me-token-1", "change-me-token-2"],
+  "cors_origins": ["http://localhost:5001", "http://dashboard.internal:5001"],
   "log_file": "/var/log/lab-monitor-manager.log",
   "log_level": "INFO",
-  "retention_days": 90
+  "retention_days": 90,
+  "debug": false
 }

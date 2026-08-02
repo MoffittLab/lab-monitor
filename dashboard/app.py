@@ -77,18 +77,27 @@ def format_bytes(bytes_value: int) -> str:
 
 
 def get_manager_data() -> dict:
-    """Fetch latest data from Manager API"""
+    """Fetch latest data from Manager API with authentication"""
     try:
         manager_url = _config.get("manager_url", "http://localhost:5000")
+        manager_token = _config.get("manager_token", "")
         timeout = _config.get("manager_timeout_seconds", 5)
+        
+        headers = {}
+        if manager_token:
+            headers["Authorization"] = f"Bearer {manager_token}"
         
         response = requests.get(
             f"{manager_url}/api/usage/all",
+            headers=headers,
             timeout=timeout
         )
         
         if response.status_code == 200:
             return response.json()
+        elif response.status_code == 401:
+            _logger.warning("Invalid token for Manager")
+            return {}
         else:
             _logger.warning(f"Manager returned {response.status_code}")
             return {}
@@ -103,29 +112,45 @@ def get_manager_data() -> dict:
 
 def process_nas_data(nas_data: dict) -> dict:
     """Process raw NAS data for display"""
-    processed = {
-        "nas_name": nas_data.get("nas_name", "Unknown"),
-        "nas_id": nas_data.get("nas_id"),
-        "timestamp": nas_data.get("timestamp"),
-        "folders": [],
-        "total_usage_bytes": 0,
-        "total_usage_formatted": "0 B"
-    }
-    
-    for folder in nas_data.get("folders", []):
-        path = folder.get("path")
-        usage = folder.get("usage_bytes", 0)
+    try:
+        processed = {
+            "nas_name": nas_data.get("nas_name", "Unknown"),
+            "nas_id": nas_data.get("nas_id"),
+            "timestamp": nas_data.get("timestamp"),
+            "folders": [],
+            "total_usage_bytes": 0,
+            "total_usage_formatted": "0 B"
+        }
         
-        processed["folders"].append({
-            "path": path,
-            "usage_bytes": usage,
-            "usage_formatted": format_bytes(usage)
-        })
+        for folder in nas_data.get("folders", []):
+            path = folder.get("path")
+            usage = folder.get("usage_bytes", 0)
+            
+            # Validate folder data
+            if not path or not isinstance(usage, int):
+                _logger.warning(f"Invalid folder data: {folder}")
+                continue
+            
+            processed["folders"].append({
+                "path": path,
+                "usage_bytes": usage,
+                "usage_formatted": format_bytes(usage)
+            })
+            
+            processed["total_usage_bytes"] += usage
         
-        processed["total_usage_bytes"] += usage
+        processed["total_usage_formatted"] = format_bytes(processed["total_usage_bytes"])
+        return processed
     
-    processed["total_usage_formatted"] = format_bytes(processed["total_usage_bytes"])
-    return processed
+    except Exception as e:
+        _logger.error(f"Error processing NAS data: {e}")
+        return {
+            "nas_name": "Error",
+            "timestamp": None,
+            "folders": [],
+            "total_usage_bytes": 0,
+            "total_usage_formatted": "Error"
+        }
 
 
 # Routes
@@ -165,20 +190,33 @@ def get_history(nas_name):
     """Get historical data for a NAS"""
     try:
         manager_url = _config.get("manager_url", "http://localhost:5000")
-        days = request.args.get('days', 30)
+        manager_token = _config.get("manager_token", "")
+        days = request.args.get('days', 30, type=int)
+        
+        # Validate days parameter
+        if days < 1 or days > 365:
+            return jsonify({"error": "Days must be between 1 and 365"}), 400
+        
+        headers = {}
+        if manager_token:
+            headers["Authorization"] = f"Bearer {manager_token}"
         
         response = requests.get(
             f"{manager_url}/api/usage/history/{nas_name}?days={days}",
+            headers=headers,
             timeout=5
         )
         
         if response.status_code == 200:
             return jsonify(response.json())
+        elif response.status_code == 401:
+            return jsonify({"error": "Invalid token"}), 401
         else:
             return jsonify({"error": "Not found"}), 404
     
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        _logger.error(f"Error fetching history: {e}")
+        return jsonify({"error": "Internal error"}), 500
 
 
 def main():
