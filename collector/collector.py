@@ -93,7 +93,7 @@ def get_git_version() -> tuple:
 
 def build_report(nas_name: str, nas_id: str, folders_usage: dict, execution_time: float = None) -> dict:
     """
-    Build a usage report dict.
+    Build a usage report dict with summary statistics.
     
     Args:
         nas_name: Human-readable NAS name
@@ -101,8 +101,21 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict, execution_time
         folders_usage: Dict of {path: size_bytes}
         execution_time: Total execution time in seconds (optional)
     
-    Returns: Report dict
+    Returns: Report dict with folder details and summary stats
     """
+    # Calculate volume totals
+    volume_totals = {}
+    total_usage = 0
+    
+    for path, size in folders_usage.items():
+        # Extract volume from path (e.g., '/volume1' from '/volume1/shared')
+        parts = path.split('/')
+        if len(parts) >= 2 and parts[1]:  # Handle paths like '/volume1/shared'
+            volume = '/' + parts[1]  # e.g., '/volume1'
+            volume_totals[volume] = volume_totals.get(volume, 0) + size
+        
+        total_usage += size
+    
     report = {
         "nas_name": nas_name,
         "nas_id": nas_id,
@@ -110,7 +123,9 @@ def build_report(nas_name: str, nas_id: str, folders_usage: dict, execution_time
         "folders": [
             {"path": path, "usage_bytes": size}
             for path, size in folders_usage.items()
-        ]
+        ],
+        "volume_totals": volume_totals,
+        "total_usage_bytes": total_usage
     }
     
     # Add execution time if provided

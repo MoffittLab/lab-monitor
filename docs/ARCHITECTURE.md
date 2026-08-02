@@ -54,15 +54,35 @@ Three-service distributed system for tracking NAS usage:
   "nas_name": "nas-01",
   "nas_id": "synology_01",
   "timestamp": "2026-07-29T02:00:00Z",
-  "execution_time_seconds": 1285.47,
-  "collector_version": "v0.0.8",
-  "collector_commit": "8f93b23",
   "folders": [
     {"path": "/volume1/shared", "usage_bytes": 5368709120},
-    {"path": "/volume1/media", "usage_bytes": 1099511627776}
-  ]
+    {"path": "/volume1/media", "usage_bytes": 1099511627776},
+    {"path": "/volume2/backup", "usage_bytes": 2199023255552}
+  ],
+  "volume_totals": {
+    "/volume1": 1104880336896,
+    "/volume2": 2199023255552
+  },
+  "total_usage_bytes": 3303903592448,
+  "execution_time_seconds": 1285.47,
+  "collector_version": "v0.0.9",
+  "collector_commit": "358f94e"
 }
 ```
+
+**Payload Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `nas_name` | Human-readable NAS name (auto-discovered from hostname) |
+| `nas_id` | Stable unique identifier (auto-discovered from boot_id) |
+| `timestamp` | ISO-8601 UTC when measurement completed |
+| `folders` | Array of measured directories with sizes in bytes |
+| `volume_totals` | Sum of usage for each volume (e.g., "/volume1": 1.0 TB) |
+| `total_usage_bytes` | Grand total usage across all volumes |
+| `execution_time_seconds` | Total time for collector to run (useful for performance tracking) |
+| `collector_version` | Git tag of collector version |
+| `collector_commit` | Git commit hash of collector |
 
 ### 2. Manager (Central Service)
 

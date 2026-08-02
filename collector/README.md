@@ -8,9 +8,10 @@ The collector:
 1. **Auto-discovers** folders (one level deep from configured volumes)
 2. **Excludes** specified folders (e.g., system directories, cache)
 3. **Measures** remaining folders daily
-4. **Queues locally** (survives Manager downtime)
-5. **Posts to Manager** with authentication
-6. **Archives queue** to monthly files on successful handshake (records retained indefinitely)
+4. **Calculates summary stats** (totals per volume + grand total)
+5. **Queues locally** (survives Manager downtime)
+6. **Posts to Manager** with authentication
+7. **Archives queue** to monthly files on successful handshake (records retained indefinitely)
 
 ---
 
@@ -504,6 +505,41 @@ Common system folders to exclude:
 - `System Volume Information` — System metadata
 - `pagefile.sys` — Virtual memory
 - `hiberfil.sys` — Hibernation file
+
+---
+
+## Summary Statistics
+
+### Volume and Usage Totals
+
+Each report includes automatic summary statistics:
+
+**`volume_totals`** — Sum of all measured folders per volume
+- Example: `/volume1: 1.0 TB` (sum of all folders in /volume1)
+- Example: `/volume2: 2.1 TB` (sum of all folders in /volume2)
+
+**`total_usage_bytes`** — Grand total of all measured folders
+- Sum across all volumes
+- Useful for tracking overall NAS capacity usage
+
+**Example report excerpt:**
+```json
+{
+  "folders": [
+    {"path": "/volume1/shared", "usage_bytes": 5368709120},
+    {"path": "/volume1/media", "usage_bytes": 1099511627776}
+  ],
+  "volume_totals": {
+    "/volume1": 1104880336896
+  },
+  "total_usage_bytes": 1104880336896
+}
+```
+
+These stats are automatically included in each report sent to Manager, making it easy to track:
+- Per-volume capacity usage
+- Overall system utilization over time
+- Trends in storage growth
 
 ---
 
