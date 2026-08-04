@@ -156,6 +156,14 @@ if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}ERROR: Manager URL cannot be empty${NC}"
         exit 1
     fi
+    if echo "$MANAGER_URL" | grep -q '^https://'; then
+        echo -e "${YELLOW}Warning: URL starts with https:// but the Manager runs plain HTTP. Did you mean http://?${NC}"
+        read -p "Continue with https:// anyway? [y/N]: " CONFIRM_HTTPS
+        if [ "$CONFIRM_HTTPS" != "y" ] && [ "$CONFIRM_HTTPS" != "Y" ]; then
+            echo "Please re-run and enter the correct URL."
+            exit 1
+        fi
+    fi
 
     # Prompt for Manager Token
     read -p "Enter Manager Token (from Manager config): " MANAGER_TOKEN
