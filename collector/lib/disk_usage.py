@@ -67,9 +67,12 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
                     if entry.is_symlink():
                         continue
 
-                    # Skip Synology system directories at every level
+                    # Skip Synology system directories and backup vaults at every level
                     name = entry.name
                     if name.startswith('@') or name == '#recycle' or name.startswith('.@'):
+                        continue
+                    # Skip Hyper Backup vault packages (.hbk are directories, not files)
+                    if name.endswith('.hbk'):
                         continue
 
                     if entry.is_file(follow_symlinks=False):
