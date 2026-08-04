@@ -156,12 +156,22 @@ if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}ERROR: Manager URL cannot be empty${NC}"
         exit 1
     fi
-    
+
     # Prompt for Manager Token
     read -p "Enter Manager Token (from Manager config): " MANAGER_TOKEN
     if [ -z "$MANAGER_TOKEN" ]; then
         echo -e "${RED}ERROR: Manager Token cannot be empty${NC}"
         exit 1
+    fi
+
+    # Prompt for Device Type
+    read -p "Enter Device Type [NAS/Server]: " DEVICE_TYPE
+    if [ -z "$DEVICE_TYPE" ]; then
+        echo -e "${RED}ERROR: Device Type cannot be empty${NC}"
+        exit 1
+    fi
+    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Server" ]; then
+        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS or Server). Continuing anyway.${NC}"
     fi
     
     echo ""
@@ -169,6 +179,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 {
   "name": "${NAS_HOSTNAME}",
   "id": "${NAS_ID}",
+  "device_type": "${DEVICE_TYPE}",
   "manager_url": "${MANAGER_URL}",
   "manager_token": "${MANAGER_TOKEN}",
   "volumes": ["/volume1"],
@@ -181,7 +192,8 @@ EOF
     echo "[OK] Config file created at $CONFIG_FILE"
     echo ""
     echo "Configuration saved with:"
-    echo "  - Manager URL: $MANAGER_URL"
+    echo "  - Device Type:  $DEVICE_TYPE"
+    echo "  - Manager URL:  $MANAGER_URL"
     echo "  - Manager Token: (set)"
     echo ""
     echo "To modify later:"
