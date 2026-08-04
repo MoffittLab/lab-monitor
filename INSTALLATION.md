@@ -22,17 +22,20 @@ Three automated installation scripts are provided for quick deployment.
 
 ```powershell
 # Clone the repository
+mkdir -p E:\Users\lab-monitor
 cd E:\Users\lab-monitor
 git clone https://github.com/MoffittLab/lab-monitor.git
 cd lab-monitor
+
+# Allow script execution for this session
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 
 # Generate secure token for authentication
 $Token = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((New-Guid).ToString())) -replace '=', ''
 $Token = $Token.Substring(0, 32)
 Write-Host "Your Manager Token: $Token"
 
-# Run installation
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+# Run installation from the repo
 .\install-manager-dashboard-taskscheduler.ps1 -ManagerToken $Token
 ```
 
@@ -136,6 +139,7 @@ ssh your-admin-user@nas.local
   # or ssh john@nas.local
 
 # Clone the repository and run the installation script
+cd /tmp
 git clone https://github.com/MoffittLab/lab-monitor.git
 cd lab-monitor
 ./install-collector-synology.sh
@@ -144,30 +148,39 @@ cd lab-monitor
 **What it does:**
 - Creates directory structure (`/volume1/lab-monitor/data`, `logs`, `scripts`)
 - Creates Python virtual environment
-- Clones lab-monitor repository
+- Clones lab-monitor repository to `/volume1/lab-monitor/scripts/lab-monitor`
 - Installs dependencies (requests, psutil)
+- **Prompts for configuration interactively** (Manager URL, token, device type, scan depth, volumes)
 - Creates collector config (`collector/local/config.json`)
-- Tests disk collection
+- Tests metrics collection
 
-**Configuration (required):**
+**Configuration (interactive during install):**
 
-After installation, edit the config:
+The installer will prompt you for:
+- **Manager URL** (e.g., `http://atlantis.med.harvard.edu:5000`)
+- **Manager Token** (copy from your Manager config)
+- **Device Type** (`NAS`, `NAS-Instrument`, `NAS-Backup`, or `Server`)
+- **Scan Depth** (1, 2, or 3 — auto-suggested based on device type)
+- **Volumes** (auto-detected; defaults shown, press Enter to accept)
+
+After installation, the config is at:
+```bash
+/volume1/lab-monitor/scripts/lab-monitor/collector/local/config.json
+```
+
+To edit later:
 ```bash
 nano /volume1/lab-monitor/scripts/lab-monitor/collector/local/config.json
 ```
 
-Change:
-- `"name"`: Your NAS name (e.g., "Triton", "nas-01")
-- `"id"`: Unique identifier (e.g., "synology-triton")
-- `"manager_token"`: Copy from Manager config (same for all collectors!)
-- `"volumes"`: List volumes to monitor (e.g., `["/volume1", "/volume2"]`)
-
 **Schedule jobs (Synology Control Panel):**
+
+After the installer completes, set up two scheduled tasks:
 
 1. **Control Panel → Task Scheduler**
 2. **Create → Scheduled Task → Custom Script**
 
-**Job 1: Disk Collection (Daily)**
+**Job 1: Disk Collection (Daily at 2 AM)**
 - Task name: `Lab Monitor - Disk Collection`
 - User: Your admin user (same one you SSH as)
 - Schedule: Daily, 02:00 (2 AM)
@@ -204,45 +217,47 @@ curl -H "Authorization: Bearer YOUR-TOKEN" http://atlantis.med.harvard.edu:5000/
 **Prerequisites:**
 - Windows Server 2019 or later
 - Administrator access
-- Python environment created (see Manager installation above, or create separate Conda env)
+- Python 3 (or Miniconda: https://docs.conda.io/projects/miniconda/en/latest/)
 - Git installed
 
 **Installation (run as Administrator):**
 
 ```powershell
 # Clone the repository
-cd E:\Users\lab-monitor
+mkdir -p E:\Temp
+cd E:\Temp
 git clone https://github.com/MoffittLab/lab-monitor.git
 cd lab-monitor
 
-# Run installation
+# Allow script execution for this session
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
-.\install-collector-windows.ps1 -ManagerToken "YOUR-MANAGER-TOKEN"
+
+# Run installation from the repo
+.\install-collector-windows.ps1
 ```
 
 **What it does:**
-- Creates directory structure (if not already present)
-- Creates Python virtual environment
-- Clones lab-monitor repository
+- Creates directory structure at `E:\Users\lab-monitor`
+- Auto-detects Python (Conda or system)
+- Clones lab-monitor repository to `E:\Users\lab-monitor\scripts\lab-monitor`
 - Installs dependencies (requests, psutil)
-- Creates collector config (`collector/local/config.json`)
-- Tests disk collection
-- Registers two Task Scheduler jobs (disk daily, metrics every 5 min)
+- **Prompts for configuration interactively** (Manager URL, token, device type, scan depth, volumes)
+- Tests metrics collection
+- Registers two Task Scheduler jobs (disk daily at 2 AM, metrics every 5 min)
 
-**Configuration (required):**
+**Configuration (interactive during install):**
 
-After installation, edit the config:
+The installer will prompt you for:
+- **Manager URL** (e.g., `http://atlantis.med.harvard.edu:5000`)
+- **Manager Token** (copy from your Manager config)
+- **Device Type** (`NAS`, `NAS-Instrument`, `NAS-Backup`, or `Server`)
+- **Scan Depth** (1, 2, or 3 — auto-suggested based on device type)
+- **Volumes** (e.g., `E:`, `F:`, `G:`, etc.)
+
+If you need to edit later:
 ```powershell
 notepad E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json
 ```
-
-Change:
-- `"name"`: Server name (e.g., "compute-01", "fileserver")
-- `"id"`: Unique identifier (e.g., "windows-compute-01")
-- `"device_type"`: Set to `"windows"`
-- `"manager_url"`: URL of your Manager (e.g., `"http://manager-host:5000"`)
-- `"manager_token"`: Copy from Manager config
-- `"volumes"`: Drives to monitor (e.g., `["E:", "F:"]`)
 
 **Verify:**
 ```powershell
