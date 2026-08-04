@@ -41,7 +41,7 @@ from pathlib import Path
 # Add lib directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-from disk_usage import measure_all_folders, discover_volumes, measure_volume_capacity
+from disk_usage import measure_all_folders, discover_volumes, measure_volume_capacity, discover_at_depth
 
 
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
@@ -199,22 +199,31 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 logger.warning("No volumes discovered. Specify 'volumes' in config.json")
                 return False
 
+        # Default scan_depth by device_type if not explicitly set in config
+        _depth_defaults = {'NAS-Backup': 1, 'Instrument-NAS': 3, 'NAS': 2, 'Server': 2}
+        scan_depth = config.get('scan_depth', _depth_defaults.get(device_type, 2))
+        logger.info(f"scan_depth={scan_depth}")
+
+        # Volume capacity via shutil for all modes (no folder scan needed)
+        volume_capacity = {}
+        for vol in volumes:
+            cap = measure_volume_capacity(vol)
+            if cap:
+                volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
+                volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
+                logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
+
         # -------------------------------------------------------------------
-        # NAS-Backup mode: volume-level stats only, no folder scan
-        # Uses shutil.disk_usage() — safe for backup vaults (.hbk etc.)
+        # scan_depth == 1: volume-level only via shutil (fast, no folder scan)
         # -------------------------------------------------------------------
-        if device_type == 'NAS-Backup':
-            logger.info("NAS-Backup mode: reporting volume capacity only (no folder scan)")
-            volume_sums     = {}
-            volume_capacity = {}
+        if scan_depth == 1:
+            logger.info("scan_depth=1: volume-level stats only (no folder scan)")
+            volume_sums = {}
             for vol in volumes:
                 cap = measure_volume_capacity(vol)
                 if cap:
-                    used = cap['total_bytes'] - cap['free_bytes']
-                    volume_sums[vol]                      = used
-                    volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
-                    volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
-                    logger.info(f"{vol}: used={used}, total={cap['total_bytes']}, free={cap['free_bytes']}")
+                    volume_sums[vol] = cap['total_bytes'] - cap['free_bytes']
+                    logger.info(f"{vol}: used={volume_sums[vol]}")
 
             total_usage = sum(volume_sums.values())
             entry = {
@@ -228,46 +237,41 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
             }
 
         # -------------------------------------------------------------------
-        # Normal mode: full folder scan
+        # scan_depth >= 2: folder scan at the requested depth
+        # depth=2 → volume/Folder (standard NAS)
+        # depth=3 → volume/Folder/SubFolder (Instrument-NAS)
         # -------------------------------------------------------------------
         else:
-            # Measure all configured folders
-            folders = measure_all_folders(volumes, timeout=timeout)
+            nas_type = 'synology' if sys.platform != 'win32' else 'windows'
+            leaf_folders = []
+            for vol in volumes:
+                leaf_folders.extend(discover_at_depth(vol, scan_depth - 1, nas_type))
+            logger.info(f"Discovered {len(leaf_folders)} folders at depth {scan_depth}")
+
+            folders = measure_all_folders(leaf_folders, timeout=timeout)
             logger.info(f"Measured {len(folders)} folders")
 
-            # Build flat folder dict: path -> usage_bytes
             folder_data = {f['path']: f['usage_bytes'] for f in folders}
 
-            # Per-volume sums: group by immediate parent (e.g. /volume1, E:)
+            # Sum folders under their immediate parent
             volume_sums = {}
             for path, usage in folder_data.items():
-                root = os.path.dirname(path)
-                if root:
-                    volume_sums[root] = volume_sums.get(root, 0) + usage
+                parent = os.path.dirname(path)
+                if parent:
+                    volume_sums[parent] = volume_sums.get(parent, 0) + usage
 
-            # Grand total across all folders
             total_usage = sum(folder_data.values())
-
-            # Volume capacity: total and free bytes for each configured volume
-            volume_capacity = {}
-            for vol in volumes:
-                cap = measure_volume_capacity(vol)
-                if cap:
-                    volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
-                    volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
-                    logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
 
             entry = {
                 'header': build_header(name, system_id, device_type),
                 'data': {
                     'data_type':   'folder_usage',
-                    **folder_data,        # /volume1/JeffMoffitt: 4832847265792, ...
-                    **volume_sums,        # /volume1: 19075694489064, ...
-                    **volume_capacity,    # /volume1_total_bytes, /volume1_free_bytes, ...
+                    **folder_data,     # /volume1/Folder(/SubFolder): bytes, ...
+                    **volume_sums,     # /volume1(/Folder): summed bytes, ...
+                    **volume_capacity, # /volume1_total_bytes, /volume1_free_bytes, ...
                     'total_usage': total_usage,
                 }
             }
-        
         # Append to local archive
         archive_path = get_archive_path(config, name)
         append_to_archive(archive_path, entry, logger)

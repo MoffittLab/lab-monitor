@@ -205,6 +205,32 @@ def discover_folders(volume_path: str, nas_type: str = "synology") -> List[str]:
     return folders
 
 
+def discover_at_depth(root: str, depth: int, nas_type: str = None) -> List[str]:
+    """
+    Discover folders at exactly 'depth' levels below root.
+
+    depth=1: immediate subdirectories of root  (e.g. /volume1/SharedFolder)
+    depth=2: subdirectories of those           (e.g. /volume1/SharedFolder/Project)
+
+    Args:
+        root:     Starting path (e.g. /volume1)
+        depth:    How many levels to descend
+        nas_type: 'synology', 'windows', or None (auto-detect)
+
+    Returns: List of leaf folder paths at the requested depth
+    """
+    if nas_type is None:
+        nas_type = "windows" if sys.platform == "win32" else "synology"
+
+    if depth == 1:
+        return discover_folders(root, nas_type)
+
+    leaf_folders = []
+    for folder in discover_folders(root, nas_type):
+        leaf_folders.extend(discover_at_depth(folder, depth - 1, nas_type))
+    return leaf_folders
+
+
 def measure_volume_capacity(volume_path: str) -> dict:
     """
     Get total and free bytes for a volume (cross-platform).

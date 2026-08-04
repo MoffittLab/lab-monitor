@@ -173,17 +173,36 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 
     # Prompt for Device Type
-    read -p "Enter Device Type [NAS/Server/NAS-Backup]: " DEVICE_TYPE
+    read -p "Enter Device Type [NAS/Instrument-NAS/Server/NAS-Backup]: " DEVICE_TYPE
     if [ -z "$DEVICE_TYPE" ]; then
         echo -e "${RED}ERROR: Device Type cannot be empty${NC}"
         exit 1
     fi
-    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Server" ] && [ "$DEVICE_TYPE" != "NAS-Backup" ]; then
-        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, Server, or NAS-Backup). Continuing anyway.${NC}"
+    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Instrument-NAS" ] && [ "$DEVICE_TYPE" != "Server" ] && [ "$DEVICE_TYPE" != "NAS-Backup" ]; then
+        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, Instrument-NAS, Server, or NAS-Backup). Continuing anyway.${NC}"
     fi
+
+    # Suggest a default scan_depth based on device type
     if [ "$DEVICE_TYPE" = "NAS-Backup" ]; then
-        echo "[OK] NAS-Backup mode: disk collection will report volume-level stats only (no folder scan)"
+        DEFAULT_DEPTH=1
+    elif [ "$DEVICE_TYPE" = "Instrument-NAS" ]; then
+        DEFAULT_DEPTH=3
+    else
+        DEFAULT_DEPTH=2
     fi
+
+    echo ""
+    echo "Scan depth controls how many folder levels the disk collector measures:"
+    echo "  1 = Volume only        (fast, filesystem stats  -- recommended for NAS-Backup)"
+    echo "  2 = Volume/Folder      (standard                -- recommended for NAS and Server)"
+    echo "  3 = Volume/Folder/Sub  (one level deeper        -- recommended for Instrument-NAS)"
+    read -p "Enter Scan Depth [1/2/3] (default: $DEFAULT_DEPTH): " SCAN_DEPTH
+    SCAN_DEPTH=${SCAN_DEPTH:-$DEFAULT_DEPTH}
+    if ! echo "$SCAN_DEPTH" | grep -qE '^[1-9][0-9]*$'; then
+        echo -e "${RED}ERROR: Scan Depth must be a positive integer${NC}"
+        exit 1
+    fi
+    echo "[OK] Scan depth: $SCAN_DEPTH"
     
     # Auto-detect volumes present on this NAS
     VOLUMES_JSON=""
@@ -204,6 +223,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "manager_url": "${MANAGER_URL}",
   "manager_token": "${MANAGER_TOKEN}",
   "volumes": [${VOLUMES_JSON}],
+  "scan_depth": ${SCAN_DEPTH},
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
   "log_level": "INFO",
@@ -215,6 +235,7 @@ EOF
     echo ""
     echo "Configuration saved with:"
     echo "  - Device Type:   $DEVICE_TYPE"
+    echo "  - Scan Depth:    $SCAN_DEPTH"
     echo "  - Volumes:       $VOLUMES_JSON"
     echo "  - Manager URL:   $MANAGER_URL"
     echo "  - Manager Token: (set)"
