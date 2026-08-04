@@ -173,13 +173,16 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 
     # Prompt for Device Type
-    read -p "Enter Device Type [NAS/Server]: " DEVICE_TYPE
+    read -p "Enter Device Type [NAS/Server/NAS-Backup]: " DEVICE_TYPE
     if [ -z "$DEVICE_TYPE" ]; then
         echo -e "${RED}ERROR: Device Type cannot be empty${NC}"
         exit 1
     fi
-    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Server" ]; then
-        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS or Server). Continuing anyway.${NC}"
+    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Server" ] && [ "$DEVICE_TYPE" != "NAS-Backup" ]; then
+        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, Server, or NAS-Backup). Continuing anyway.${NC}"
+    fi
+    if [ "$DEVICE_TYPE" = "NAS-Backup" ]; then
+        echo "[OK] NAS-Backup mode: disk collection will report volume-level stats only (no folder scan)"
     fi
     
     # Auto-detect volumes present on this NAS

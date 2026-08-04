@@ -186,8 +186,8 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     timeout = config.get('timeout_seconds', 3600)
     
     try:
-        logger.info(f"Measuring disk usage for {name}")
-        
+        logger.info(f"Measuring disk usage for {name} (device_type={device_type})")
+
         # Auto-discover volumes if not specified in config
         if not volumes:
             logger.info("No volumes specified in config, auto-discovering...")
@@ -198,44 +198,75 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
             else:
                 logger.warning("No volumes discovered. Specify 'volumes' in config.json")
                 return False
-        
-        # Measure all configured folders
-        folders = measure_all_folders(volumes, timeout=timeout)
-        logger.info(f"Measured {len(folders)} folders")
-        
-        # Build flat folder dict: path -> usage_bytes
-        folder_data = {f['path']: f['usage_bytes'] for f in folders}
 
-        # Per-volume sums: group by immediate parent (e.g. /volume1, E:)
-        volume_sums = {}
-        for path, usage in folder_data.items():
-            root = os.path.dirname(path)
-            if root:
-                volume_sums[root] = volume_sums.get(root, 0) + usage
+        # -------------------------------------------------------------------
+        # NAS-Backup mode: volume-level stats only, no folder scan
+        # Uses shutil.disk_usage() — safe for backup vaults (.hbk etc.)
+        # -------------------------------------------------------------------
+        if device_type == 'NAS-Backup':
+            logger.info("NAS-Backup mode: reporting volume capacity only (no folder scan)")
+            volume_sums     = {}
+            volume_capacity = {}
+            for vol in volumes:
+                cap = measure_volume_capacity(vol)
+                if cap:
+                    used = cap['total_bytes'] - cap['free_bytes']
+                    volume_sums[vol]                      = used
+                    volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
+                    volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
+                    logger.info(f"{vol}: used={used}, total={cap['total_bytes']}, free={cap['free_bytes']}")
 
-        # Grand total across all folders
-        total_usage = sum(folder_data.values())
-
-        # Volume capacity: total and free bytes for each configured volume
-        volume_capacity = {}
-        for vol in volumes:
-            cap = measure_volume_capacity(vol)
-            if cap:
-                volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
-                volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
-                logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
-
-        # Create message (header + data)
-        entry = {
-            'header': build_header(name, system_id, device_type),
-            'data': {
-                'data_type':   'folder_usage',
-                **folder_data,        # /volume1/JeffMoffitt: 4832847265792, ...
-                **volume_sums,        # /volume1: 19075694489064, ...
-                **volume_capacity,    # /volume1_total_bytes: 21990232555520, /volume1_free_bytes: 5113563332608, ...
-                'total_usage': total_usage,
+            total_usage = sum(volume_sums.values())
+            entry = {
+                'header': build_header(name, system_id, device_type),
+                'data': {
+                    'data_type':   'folder_usage',
+                    **volume_sums,      # /volume1: used_bytes, ...
+                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes, ...
+                    'total_usage': total_usage,
+                }
             }
-        }
+
+        # -------------------------------------------------------------------
+        # Normal mode: full folder scan
+        # -------------------------------------------------------------------
+        else:
+            # Measure all configured folders
+            folders = measure_all_folders(volumes, timeout=timeout)
+            logger.info(f"Measured {len(folders)} folders")
+
+            # Build flat folder dict: path -> usage_bytes
+            folder_data = {f['path']: f['usage_bytes'] for f in folders}
+
+            # Per-volume sums: group by immediate parent (e.g. /volume1, E:)
+            volume_sums = {}
+            for path, usage in folder_data.items():
+                root = os.path.dirname(path)
+                if root:
+                    volume_sums[root] = volume_sums.get(root, 0) + usage
+
+            # Grand total across all folders
+            total_usage = sum(folder_data.values())
+
+            # Volume capacity: total and free bytes for each configured volume
+            volume_capacity = {}
+            for vol in volumes:
+                cap = measure_volume_capacity(vol)
+                if cap:
+                    volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
+                    volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
+                    logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
+
+            entry = {
+                'header': build_header(name, system_id, device_type),
+                'data': {
+                    'data_type':   'folder_usage',
+                    **folder_data,        # /volume1/JeffMoffitt: 4832847265792, ...
+                    **volume_sums,        # /volume1: 19075694489064, ...
+                    **volume_capacity,    # /volume1_total_bytes, /volume1_free_bytes, ...
+                    'total_usage': total_usage,
+                }
+            }
         
         # Append to local archive
         archive_path = get_archive_path(config, name)
