@@ -14,9 +14,26 @@
 # 6. Tests both collection modes
 #
 
+# Check if running from Anaconda Prompt (CONDA_DEFAULT_ENV set)
+if (-not $env:CONDA_DEFAULT_ENV) {
+    Write-Host "ERROR: This script must be run from an Anaconda Prompt" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "How to launch:" -ForegroundColor Yellow
+    Write-Host "  1. Open Anaconda Prompt (or Anaconda PowerShell Prompt)" -ForegroundColor Yellow
+    Write-Host "  2. (Optional) Create a conda environment:" -ForegroundColor Yellow
+    Write-Host "       conda create -n lab-monitor python=3.11" -ForegroundColor Yellow
+    Write-Host "  3. (Optional) Activate it:" -ForegroundColor Yellow
+    Write-Host "       conda activate lab-monitor" -ForegroundColor Yellow
+    Write-Host "  4. Run this script:" -ForegroundColor Yellow
+    Write-Host "       .\install-collector-windows.ps1" -ForegroundColor Yellow
+    exit 1
+}
+
 # Check if running as Administrator
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ERROR: This script must be run as Administrator" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "Right-click on Anaconda Prompt and select 'Run as Administrator'" -ForegroundColor Yellow
     exit 1
 }
 
@@ -30,11 +47,11 @@ $RootDir = "E:\Users\lab-monitor"
 $DataDir = "$RootDir\data"
 $LogsDir = "$RootDir\logs"
 $ScriptsDir = "$RootDir\scripts"
-$VenvDir = "$RootDir\lab-monitor-env"
 $RepoUrl = "https://github.com/MoffittLab/lab-monitor.git"
 $CollectorDir = "$ScriptsDir\lab-monitor\collector"
 $ConfigFile = "$CollectorDir\local\config.json"
-$PythonExe = "$VenvDir\Scripts\python.exe"
+$CondaEnv = $env:CONDA_DEFAULT_ENV
+$PythonExe = (Get-Command python.exe).Source  # Use conda env's python
 
 function Write-Step {
     param([string]$Message)
@@ -59,52 +76,20 @@ if (-not (Test-Path $ScriptsDir)) { New-Item -ItemType Directory -Path $ScriptsD
 Write-Success "Directories created at $RootDir"
 Write-Host ""
 
-# Step 2: Check Python installation
-Write-Step "Step 2: Checking Python installation"
-$PythonFound = $false
-$PythonPath = ""
-
-# Try conda environment first (preferred)
-if (Get-Command conda -ErrorAction SilentlyContinue) {
-    Write-Host "Conda detected. Checking for lab-monitor environment..."
-    $CondaEnv = & conda info --envs 2>$null | Select-String "lab-monitor"
-    if ($CondaEnv) {
-        # Get the actual path from conda
-        $PythonPath = & conda run -n lab-monitor python.exe -c "import sys; print(sys.executable)" 2>$null
-        if ($PythonPath -and (Test-Path $PythonPath)) {
-            $PythonFound = $true
-            Write-Success "Found conda environment lab-monitor"
-        }
-    }
-}
-
-# Fallback: system Python
-if (-not $PythonFound) {
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $PythonPath = (Get-Command python).Source
-        $PythonFound = $true
-        Write-Success "Found system Python: $PythonPath"
-    } elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
-        $PythonPath = (Get-Command python3).Source
-        $PythonFound = $true
-        Write-Success "Found system Python: $PythonPath"
-    }
-}
-
-if (-not $PythonFound) {
-    Write-Error-Custom "Python not found. Install Python 3 or Miniconda first."
+# Step 2: Verify Python (conda environment)
+Write-Step "Step 2: Verifying Python from conda environment"
+if (-not $PythonExe) {
+    Write-Error-Custom "Python not found in conda environment PATH"
     Write-Host ""
-    Write-Host "Option 1: Install Miniconda (recommended)"
-    Write-Host "  https://docs.conda.io/projects/miniconda/en/latest/"
-    Write-Host "  Then create: conda create -n lab-monitor python=3.11"
-    Write-Host ""
-    Write-Host "Option 2: Install Python directly"
-    Write-Host "  https://www.python.org/"
+    Write-Host "Make sure you:"
+    Write-Host "  1. Opened an Anaconda Prompt (not regular cmd/PowerShell)"
+    Write-Host "  2. (Optional) Activated a conda environment: conda activate lab-monitor"
     Write-Host ""
     exit 1
 }
 
-$PythonVersion = & $PythonPath --version 2>&1
+$PythonVersion = & $PythonExe --version 2>&1
+Write-Success "Using Python from conda: $CondaEnv"
 Write-Host "  $PythonVersion"
 Write-Host ""
 
@@ -129,33 +114,18 @@ if ($LASTEXITCODE -eq 0 -or (Test-Path "$ScriptsDir\lab-monitor\collector\collec
 }
 Write-Host ""
 
-# Step 4: Create/use virtual environment
-Write-Step "Step 4: Setting up Python environment"
-if ($PythonPath -like "*conda*" -or $PythonPath -like "*miniconda*") {
-    Write-Success "Using conda environment (no local venv needed)"
-} else {
-    if (-not (Test-Path $VenvDir)) {
-        Write-Host "Creating local virtual environment..."
-        & $PythonPath -m venv $VenvDir 2>&1 | Out-Null
-        if (Test-Path $VenvDir) {
-            Write-Success "Virtual environment created at $VenvDir"
-            $PythonExe = "$VenvDir\Scripts\python.exe"
-        } else {
-            Write-Error-Custom "Could not create virtual environment"
-            exit 1
-        }
-    } else {
-        Write-Success "Virtual environment already exists"
-    }
-}
+# Step 4: Conda environment info
+Write-Step "Step 4: Using conda environment"
+Write-Success "Conda environment: $CondaEnv"
+Write-Host "  Python: $PythonExe"
 Write-Host ""
 
 # Step 5: Install dependencies
 Write-Step "Step 5: Installing dependencies"
+Write-Host "Installing from requirements.txt..."
+& $PythonExe -m pip install --upgrade pip 2>&1 | Out-Null
 Push-Location $CollectorDir
-$PipCmd = if ($PythonPath -like "*conda*") { "pip" } else { "$VenvDir\Scripts\pip.exe" }
-& $PythonPath -m pip install --upgrade pip 2>&1 | Out-Null
-& $PythonPath -m pip install -r requirements.txt 2>&1 | Out-Null
+& $PythonExe -m pip install -r requirements.txt 2>&1 | Out-Null
 Pop-Location
 if ($LASTEXITCODE -eq 0) {
     Write-Success "Dependencies installed"
@@ -284,7 +254,7 @@ Write-Host ""
 Write-Step "Step 7: Testing collector (metrics mode)"
 Write-Host "Testing metrics collection..."
 Push-Location $CollectorDir
-& $PythonPath collector.py --config local\config.json --mode metrics 2>&1 | Out-Null
+& $PythonExe collector.py --config local\config.json --mode metrics 2>&1 | Out-Null
 $TestResult = $LASTEXITCODE
 Pop-Location
 if ($TestResult -eq 0) {

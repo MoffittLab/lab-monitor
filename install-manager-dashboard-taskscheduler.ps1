@@ -25,9 +25,22 @@ param(
     [string]$DashboardPort = "5001"
 )
 
+# Check if running from Anaconda Prompt
+if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
+    Write-Host "ERROR: This script must be run from an Anaconda Prompt" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "How to launch:" -ForegroundColor Yellow
+    Write-Host "  1. Open Anaconda Prompt (or Anaconda PowerShell Prompt)" -ForegroundColor Yellow
+    Write-Host "  2. Run this script:" -ForegroundColor Yellow
+    Write-Host "       .\install-manager-dashboard-taskscheduler.ps1 -ManagerToken \"your-secure-token\"" -ForegroundColor Yellow
+    exit 1
+}
+
 # Check if running as Administrator
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ERROR: This script must be run as Administrator" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "Right-click on Anaconda Prompt and select 'Run as Administrator'" -ForegroundColor Yellow
     exit 1
 }
 
@@ -71,12 +84,6 @@ Write-Host ""
 # Step 2: Verify Conda is on PATH
 Write-Step "Step 2: Checking Conda availability"
 $CondaCheck = conda --version 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Error-Custom "Conda not found on PATH"
-    Write-Host "Please run this script from an Anaconda PowerShell prompt"
-    Write-Host "Or activate conda with: conda init powershell"
-    exit 1
-}
 Write-Success "Conda available: $CondaCheck"
 Write-Host ""
 
