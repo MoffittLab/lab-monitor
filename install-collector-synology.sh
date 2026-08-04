@@ -182,7 +182,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS or Server). Continuing anyway.${NC}"
     fi
     
+    # Auto-detect volumes present on this NAS
+    VOLUMES_JSON=""
+    for vol in /volume*; do
+        if [ -d "$vol" ]; then
+            [ -n "$VOLUMES_JSON" ] && VOLUMES_JSON="$VOLUMES_JSON, "
+            VOLUMES_JSON="$VOLUMES_JSON\"$vol\""
+        fi
+    done
+    echo "Auto-detected volumes: $VOLUMES_JSON"
     echo ""
+
     cat > "$CONFIG_FILE" << EOF
 {
   "name": "${NAS_HOSTNAME}",
@@ -190,7 +200,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "device_type": "${DEVICE_TYPE}",
   "manager_url": "${MANAGER_URL}",
   "manager_token": "${MANAGER_TOKEN}",
-  "volumes": ["/volume1"],
+  "volumes": [${VOLUMES_JSON}],
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
   "log_level": "INFO",
@@ -201,8 +211,9 @@ EOF
     echo "[OK] Config file created at $CONFIG_FILE"
     echo ""
     echo "Configuration saved with:"
-    echo "  - Device Type:  $DEVICE_TYPE"
-    echo "  - Manager URL:  $MANAGER_URL"
+    echo "  - Device Type:   $DEVICE_TYPE"
+    echo "  - Volumes:       $VOLUMES_JSON"
+    echo "  - Manager URL:   $MANAGER_URL"
     echo "  - Manager Token: (set)"
     echo ""
     echo "To modify later:"
