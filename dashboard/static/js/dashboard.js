@@ -56,12 +56,24 @@ function updateDashboard(data) {
         return;
     }
 
-    // Device type counts (still local — not in global_totals)
+    // Device type counts
     const deviceTypeCounts = {};
     for (const sys of Object.values(systems)) {
         const dt = sys.device_type || 'unknown';
         deviceTypeCounts[dt] = (deviceTypeCounts[dt] || 0) + 1;
     }
+
+    // Total storage: sum used and capacity across all volumes on all systems
+    let totalStorageUsed     = 0;
+    let totalStorageCapacity = 0;
+    for (const sys of Object.values(systems)) {
+        for (const vol of ((sys.disk || {}).volumes || [])) {
+            totalStorageUsed     += (vol.usage_bytes  || 0);
+            totalStorageCapacity += (vol.total_bytes  || 0);
+        }
+    }
+    globalTotals.total_storage_used     = totalStorageUsed;
+    globalTotals.total_storage_capacity = totalStorageCapacity;
 
     updateSummary(deviceTypeCounts, globalTotals);
 
@@ -86,8 +98,13 @@ function updateSummary(deviceTypeCounts, globalTotals) {
     tableDiv.innerHTML = html;
 
     // Global totals come from server-side accumulation (survives reboots)
-    document.getElementById('totalDataIn').textContent  = formatBytes(globalTotals.total_bytes_in  || 0);
-    document.getElementById('totalDataOut').textContent = formatBytes(globalTotals.total_bytes_out || 0);
+    document.getElementById('lifetimeTransferIn').innerHTML  = formatBytes(globalTotals.total_bytes_in  || 0) + ' <span class="transfer-label">in</span>';
+    document.getElementById('lifetimeTransferOut').innerHTML = formatBytes(globalTotals.total_bytes_out || 0) + ' <span class="transfer-label">out</span>';
+
+    const storageUsed = globalTotals.total_storage_used     || 0;
+    const storageCap  = globalTotals.total_storage_capacity || 0;
+    document.getElementById('totalStorage').textContent =
+        storageCap > 0 ? `${formatBytes(storageUsed)} of ${formatBytes(storageCap)}` : '—';
 }
 
 // -------------------------------------------------------------------------

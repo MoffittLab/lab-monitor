@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lab Monitor Dashboard</title>
+    <title>Moffitt Laboratory Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -11,7 +11,7 @@
     <div class="container">
         <!-- Header -->
         <header class="header">
-            <h1>🔬 Lab Monitor</h1>
+            <h1>🔬 Moffitt Laboratory Dashboard</h1>
             <div class="header-info">
                 <span class="last-update" id="lastUpdate">Last updated: --</span>
                 <span class="status" id="status">Connecting...</span>
@@ -25,12 +25,13 @@
                 <div id="deviceTypeTable"></div>
             </div>
             <div class="summary-card">
-                <h3>Total Data In</h3>
-                <p class="summary-value" id="totalDataIn">0 B</p>
+                <h3>Lifetime Transfer</h3>
+                <p class="summary-value" id="lifetimeTransferIn">0 B <span class="transfer-label">in</span></p>
+                <p class="summary-value" id="lifetimeTransferOut">0 B <span class="transfer-label">out</span></p>
             </div>
             <div class="summary-card">
-                <h3>Total Data Out</h3>
-                <p class="summary-value" id="totalDataOut">0 B</p>
+                <h3>Total Storage</h3>
+                <p class="summary-value" id="totalStorage">—</p>
             </div>
 
         </section>
