@@ -1,136 +1,213 @@
-# Lab Monitor - Architecture
+# Architecture
 
-## System Overview
+## Overview
 
-Three-service distributed system for tracking NAS usage:
+Lab Monitor is a distributed monitoring platform. Collectors run on each system, generate messages, queue them locally, and POST them to a central Manager. The Manager stores full history per system and maintains a fast-access summary database for the Dashboard.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        NAS Systems                            │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐        │
-│  │  NAS-01     │   │  NAS-02     │   │  NAS-03     │        │
-│  │ (Collector) │   │ (Collector) │   │ (Collector) │        │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘        │
-└─────────┼────────────────┼────────────────┼────────────────┘
-          │                │                │
-          │ Daily Report   │                │ (HTTP POST)
-          │ (JSON)         │                │
-          └────────────────┼────────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │   Manager    │
-                    │   Service    │
-                    │ (Flask API)  │
-                    └──────┬───────┘
-                           │
-                      ┌────┴─────┐
-                      │           │
-                   ┌──▼──┐   ┌───▼───┐
-                   │Data │   │  API  │
-                   │Store│   │Points │
-                   └─────┘   └───┬───┘
-                                 │
-                          ┌──────▼──────┐
-                          │  Dashboard  │
-                          │  (Web UI)   │
-                          └─────────────┘
+┌─────────────────────────────────────────────────────┐
+│                   Systems (Collectors)               │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐        │
+│  │  Triton  │   │  Atlas   │   │  Other   │        │
+│  │ Synology │   │ Windows  │   │   ...    │        │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘        │
+└───────┼──────────────┼──────────────┼───────────────┘
+        │              │              │
+        │   POST /api/data/queue (Bearer token auth)
+        └──────────────┼──────────────┘
+                       │
+              ┌────────▼────────┐
+              │    Manager      │
+              │  (Flask API)    │
+              ├─────────────────┤
+              │ Central DB      │  ← devices, snapshots, totals
+              │ Per-system DBs  │  ← full typed history
+              └────────┬────────┘
+                       │  REST API
+              ┌────────▼────────┐
+              │   Dashboard     │
+              │   (Web UI)      │
+              └─────────────────┘
 ```
 
-## Services
+---
 
-### 1. Collector (NAS-side)
+## Collector
 
-**Location:** Each Synology NAS
-**Language:** Python 3
-**Schedule:** Daily (configurable)
-**Task:** 
-- Measure disk usage of configured folders
-- POST usage data to Manager API
-- Handle errors gracefully (retry logic)
+Runs on each system. Two modes, invoked on separate schedules:
 
-**Payload:**
+| Mode | Flag | Schedule | What it measures |
+|------|------|----------|-----------------|
+| Disk | `--mode disk` | Daily (2 AM) | Folder sizes by path, per-volume totals, grand total |
+| Metrics | `--mode metrics` | Every 5 min | CPU%, RAM%, uptime, network bandwidth |
+
+### Local storage
+
+```
+data/<name>/
+├── YYYY-MM.jsonl        ← append-only archive (one message per line)
+└── queue.json           ← unsent messages (deleted after ACK)
+```
+
+Both the archive and the queue store messages in the same format.
+
+### Message format
+
+Every message has a standard header and a data payload:
+
 ```json
 {
-  "nas_name": "nas-01",
-  "nas_id": "synology_01",
-  "timestamp": "2026-07-29T02:00:00Z",
-  "folders": [
-    {"path": "/volume1/shared", "usage_bytes": 5368709120},
-    {"path": "/volume1/media", "usage_bytes": 1099511627776}
-  ]
+  "header": {
+    "device_name": "Triton",
+    "device_id":   "synology-triton",
+    "device_type": "synology",
+    "timestamp":   "2026-08-04T07:00:00Z"
+  },
+  "data": {
+    "data_type": "folder_usage",
+    "...": "..."
+  }
 }
 ```
 
-### 2. Manager (Central Service)
+`data_type` tells the Manager how to store the payload. If absent, data goes to a `not_specified` table.
 
-**Location:** Central server on intranet
-**Language:** Python 3 + Flask
-**Task:**
-- Receive usage reports from collectors
-- Store reports in append-only log (JSONL)
-- Provide REST API for dashboard queries
-- Manage authentication
+**Disk message (`data_type: folder_usage`):**
+```json
+{
+  "data_type":             "folder_usage",
+  "/volume1/JeffMoffitt":  4832847265792,
+  "/volume1/LabData":      12043821957120,
+  "/volume2/Archive":      8000000000000,
+  "/volume1":              16876669222912,
+  "/volume2":              8000000000000,
+  "total_usage":           24876669222912
+}
+```
+Each folder path is a key, usage in bytes is the value. Volume-level sums and a grand total are added automatically.
 
-**Data Storage:**
+**Metrics message (`data_type: system_metrics`):**
+```json
+{
+  "data_type":                  "system_metrics",
+  "cpu_percent":                18.4,
+  "ram_percent":                61.2,
+  "uptime_seconds":             863492,
+  "uptime_formatted":           "9d 23h",
+  "network_bytes_in":           847392719104,
+  "network_bytes_out":          123847392012,
+  "network_bandwidth_in_mbps":  3.84,
+  "network_bandwidth_out_mbps": 0.21
+}
+```
+
+### Queue and handshake
+
+1. Collector measures data and writes a message to the local archive (JSONL, append-only)
+2. Appends the same message to `queue.json`
+3. POSTs the queue to the Manager
+4. Manager responds `{"status": "ok", "queue_id": "..."}` — echoing the same `queue_id`
+5. Collector verifies the echoed `queue_id` matches, then deletes `queue.json`
+6. If the POST fails or the `queue_id` doesn't match, the queue persists and is retried next run
+
+The archive is never deleted — it is a permanent local record regardless of whether the Manager ever receives the data.
+
+---
+
+## Manager
+
+Central Flask service. Receives queues from collectors, stores data in two layers, and serves a REST API to the Dashboard.
+
+### Ingest endpoint
+
+`POST /api/data/queue` accepts:
+
+```json
+{
+  "queue_id": "Triton-2026-08-04-07-00-00",
+  "name":     "Triton",
+  "id":       "synology-triton",
+  "messages": [ { "header": {...}, "data": {...} }, ... ]
+}
+```
+
+Backward-compatible with the legacy `entries` format from older collectors.
+
+### Storage — two layers
+
+**Layer 1: Per-system typed history (`TypedDataStore`)**
+
 ```
 data/
-├── nas-01/
-│   └── usage.jsonl
-├── nas-02/
-│   └── usage.jsonl
-└── nas-03/
-    └── usage.jsonl
+└── triton/
+    └── data.db
+        ├── folder_usage    ← one row per disk collection run
+        ├── system_metrics  ← one row per metrics run
+        └── not_specified   ← fallback for untyped messages
 ```
 
-Each line in `usage.jsonl` is a complete JSON report with timestamp.
+Each `data_type` gets its own SQLite table. Column names are the exact keys from the data payload — folder paths like `/volume1/JeffMoffitt` become literal column names (quoted SQLite identifiers).
 
-**API Endpoints:**
-- `POST /api/usage/report` - Ingest data from collectors
-- `GET /api/usage/all` - Get current state of all NAS
-- `GET /api/usage/nas/<name>` - Get latest for one NAS
-- `GET /api/usage/history/<name>?days=30` - Get history
+Schema evolution is automatic: when a message arrives with a key the table has never seen, the Manager adds the column and backfills prior rows with `NaN`. This makes "we didn't measure this yet" unambiguous vs. a measured value of zero.
 
-### 3. Dashboard (Web UI)
+**Layer 2: Central summary (`metrics.db`, three tables)**
 
-**Location:** Web server on intranet
-**Language:** Python 3 + Flask + HTML/JS
-**Task:**
-- Query Manager API every 30 seconds
-- Display usage in real-time
-- Show trends/historical data
-- Render charts and alerts
+| Table | Purpose | Key |
+|-------|---------|-----|
+| `devices` | Device registry — name, id, type, first/last seen | `name` |
+| `device_snapshot` | Latest metrics + disk state per device | `name` |
+| `device_totals` | Cumulative network bytes (survives reboots) + current disk total | `name` |
 
-**Features:**
-- NAS status cards (current usage + trend)
-- Folder breakdown per NAS
-- Capacity warnings (threshold-based)
-- 30-day historical graphs
+`device_totals` accumulates network bytes as deltas (`max(0, current − last_seen)`) so counter resets on reboot don't corrupt the lifetime total. The Dashboard reads from these three tables for fast current-state queries.
 
-## Data Flow
+### API endpoints
 
-1. **Daily Collection**: Collector runs on schedule, measures folders
-2. **Transmission**: Collector POSTs to Manager API with auth token
-3. **Storage**: Manager appends to NAS-specific JSONL log
-4. **Serving**: Dashboard polls Manager API every 30s
-5. **Display**: Dashboard renders current state + historical trend
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/data/queue` | Ingest queue from collector |
+| GET | `/health` | Health check |
+| GET | `/api/devices` | Device registry |
+| GET | `/api/totals` | Per-device and global running totals |
+| GET | `/api/systems` | List of known system names |
+| GET | `/api/metrics/all` | Latest system_metrics snapshot, all systems |
+| GET | `/api/metrics/nas/<name>` | Latest system_metrics, one system |
+| GET | `/api/usage/all` | Latest folder_usage snapshot, all systems |
+| GET | `/api/usage/nas/<name>` | Latest folder_usage, one system |
+| GET | `/api/usage/history/<name>` | Disk usage history |
+| GET | `/api/data/<system>` | List data_types present for a system |
+| GET | `/api/data/<system>/<data_type>` | Typed history rows |
+
+All endpoints except `/health` require `Authorization: Bearer <token>`.
+
+---
+
+## Dashboard
+
+Read-only Flask web app. Polls the Manager API on a configurable interval (default 30 s).
+
+- Reads device registry, snapshots, and global totals from Manager
+- Displays one card per system showing both metrics and disk state
+- Disk cards show per-folder usage, per-volume totals, and grand total
+- Summary header shows lifetime network totals (from `device_totals`)
+- Detail modal shows first-seen date, system ID, and running totals
+
+The Dashboard owns no data. All state lives in the Manager.
+
+---
 
 ## Security
 
-- Collectors authenticate with Manager via bearer token
-- Manager validates token on every ingest request
-- All communication over HTTP (assume intranet is trusted)
-- No external internet exposure required
+- Bearer token authentication on all Manager API endpoints
+- Configurable CORS origin whitelist (Dashboard URL)
+- Tokens stored in `config.json` (excluded from git via `.gitignore`)
+- Communication over HTTP — assumed intranet deployment
 
-## Scalability Notes
+---
 
-- Each NAS is independent; adding new collectors is trivial
-- Manager storage: JSONL files (append-only, efficient)
-- Dashboard: Stateless, can be multi-instance if needed
-- Typical data growth: ~1KB per NAS per day
+## Adding a new system
 
-## Future Extensions
-
-- Metrics: Transfer speed, temperature, S.M.A.R.T. stats
-- Alerts: Email/Slack when thresholds crossed
-- Retention policies: Auto-cleanup old data
-- Multi-tenancy: Support multiple lab groups
+1. Install the collector on the new system (see INSTALLATION.md)
+2. Configure `name`, `id`, `device_type`, `manager_url`, `manager_token`
+3. Schedule disk and metrics collection jobs
+4. The Manager auto-creates `data/<name>/data.db` on first message
+5. The device appears in the Dashboard on next refresh

@@ -1,0 +1,344 @@
+/* Lab Monitor Dashboard Styles */
+
+:root {
+    --primary: #2c3e50;
+    --secondary: #3498db;
+    --success: #27ae60;
+    --warning: #f39c12;
+    --danger: #e74c3c;
+    --light: #ecf0f1;
+    --dark: #2c3e50;
+    --border: #bdc3c7;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: var(--dark);
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+/* Header */
+.header {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 30px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header h1 {
+    font-size: 28px;
+    color: var(--primary);
+}
+
+.header-info {
+    display: flex;
+    gap: 20px;
+    font-size: 14px;
+}
+
+.last-update, .status {
+    padding: 5px 10px;
+    background: var(--light);
+    border-radius: 4px;
+}
+
+.status.connected {
+    background: #d4edda;
+    color: #155724;
+}
+
+.status.error {
+    background: #f8d7da;
+    color: #721c24;
+}
+
+/* Summary Section */
+.summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+    margin-bottom: 30px;
+}
+
+.summary-card {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    text-align: center;
+}
+
+.summary-card h3 {
+    font-size: 14px;
+    color: var(--border);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+}
+
+.summary-value {
+    font-size: 28px;
+    font-weight: bold;
+    color: var(--primary);
+}
+
+/* NAS Grid */
+.nas-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 20px;
+}
+
+.nas-card {
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.nas-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.nas-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: start;
+    margin-bottom: 15px;
+    border-bottom: 1px solid var(--light);
+    padding-bottom: 10px;
+}
+
+.nas-name {
+    font-size: 18px;
+    font-weight: bold;
+    color: var(--primary);
+}
+
+.nas-id {
+    font-size: 12px;
+    color: #95a5a6;
+}
+
+.device-type {
+    font-size: 11px;
+    color: white;
+    background: var(--secondary);
+    padding: 2px 8px;
+    border-radius: 3px;
+    display: inline-block;
+    margin-top: 4px;
+}
+
+.timestamp {
+    font-size: 12px;
+    color: #95a5a6;
+}
+
+.usage-bar {
+    width: 100%;
+    height: 8px;
+    background: var(--light);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 10px;
+}
+
+.usage-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--secondary), var(--secondary));
+    border-radius: 4px;
+}
+
+.usage-bar.warning .usage-fill {
+    background: linear-gradient(90deg, var(--warning), var(--warning));
+}
+
+.usage-bar.danger .usage-fill {
+    background: linear-gradient(90deg, var(--danger), var(--danger));
+}
+
+.usage-stats {
+    display: flex;
+    justify-content: space-between;
+    font-size: 14px;
+    margin-bottom: 15px;
+    color: var(--dark);
+}
+
+.usage-value {
+    font-weight: bold;
+}
+
+.folder-list {
+    background: var(--light);
+    border-radius: 4px;
+    padding: 10px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.folder-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px;
+    font-size: 12px;
+    border-bottom: 1px solid white;
+}
+
+.folder-item:last-child {
+    border-bottom: none;
+}
+
+.folder-path {
+    font-weight: 500;
+    color: var(--primary);
+}
+
+.folder-size {
+    color: #95a5a6;
+}
+
+/* Metrics Display */
+.metrics-stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin: 15px 0;
+}
+
+.metric-item {
+    background: var(--light);
+    border-radius: 4px;
+    padding: 12px;
+    text-align: center;
+}
+
+.metric-label {
+    display: block;
+    font-size: 12px;
+    color: #95a5a6;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+}
+
+.metric-value {
+    display: block;
+    font-size: 18px;
+    font-weight: bold;
+    color: var(--secondary);
+}
+
+/* Loading */
+.loading {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 40px;
+    background: white;
+    border-radius: 8px;
+    color: #95a5a6;
+}
+
+/* Modal */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.4);
+}
+
+.modal-content {
+    background: white;
+    margin: 5% auto;
+    padding: 30px;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 600px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.close {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.close:hover {
+    color: var(--dark);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .header {
+        flex-direction: column;
+        text-align: center;
+        gap: 10px;
+    }
+
+    .header-info {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .nas-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .summary {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Card sections (metrics + disk within a single card) */
+.card-section {
+    margin-top: 12px;
+    border-top: 1px solid #e9ecef;
+    padding-top: 8px;
+}
+
+.section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6c757d;
+    margin-bottom: 6px;
+}
+
+/* Indent sub-folders under volume rows */
+.folder-item.subfolder {
+    padding-left: 16px;
+    font-size: 12px;
+    color: #555;
+}
+
+.folder-item.subfolder .folder-path {
+    font-size: 11px;
+}

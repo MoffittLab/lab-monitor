@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,8 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -23,17 +24,26 @@ wheels/
 venv/
 env/
 ENV/
+.conda/
 
-# IDE
+# IDE & Editor
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-workspace
 
-# Config
+# Config (user-local, not tracked)
+/local/
+*/local/
 config.json
+manager/config.json
+dashboard/config.json
+collector/config.json
+collector/local/
 *.local.json
 
-# Data
+# Data & Logs
 data/
+logs/
 *.log

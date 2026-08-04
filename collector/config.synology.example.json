@@ -3,7 +3,7 @@
   "id": "synology-triton",
   "device_type": "NAS",
   "manager_url": "http://atlantis.med.harvard.edu:5000",
-  "manager_token": "SAME-TOKEN-FROM-MANAGER-CONFIG",
+  "manager_token": "YOUR-BEARER-TOKEN-HERE",
   "volumes": ["/volume1"],
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",

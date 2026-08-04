@@ -1,8 +1,11 @@
 {
   "host": "0.0.0.0",
   "port": 5001,
-  "manager_url": "http://manager.internal:5000",
+  "manager_url": "http://localhost:5000",
+  "manager_token": "SAME-AS-ONE-OF-MANAGER-TOKENS",
   "refresh_interval_seconds": 30,
-  "log_file": "/var/log/lab-monitor-dashboard.log",
-  "log_level": "INFO"
+  "manager_timeout_seconds": 5,
+  "log_file": "E:\\Users\\lab-monitor\\logs\\dashboard.log",
+  "log_level": "INFO",
+  "debug": false
 }

@@ -1,43 +1,85 @@
 # Dashboard
 
-Web interface for viewing NAS usage statistics and trends.
+Web interface for viewing system usage statistics (disk, CPU, RAM, network) and trends.
 
-## Installation
+## Installation & Setup
 
-1. Install dependencies: `pip install -r requirements.txt`
-2. Copy `config.example.json` to `config.json` and customize
-3. Run: `python3 app.py`
-4. Open `http://localhost:5001` in your browser
+**See [INSTALLATION.md](../INSTALLATION.md) for complete setup instructions.**
+
+Run: `install-manager-dashboard.ps1` on Windows Server atlantis.
+
+---
 
 ## Configuration
 
-Edit `config.json`:
+Dashboard reads `config.json` in its directory:
+
 ```json
 {
   "host": "0.0.0.0",
   "port": 5001,
-  "manager_url": "http://manager.internal:5000",
+  "manager_url": "http://localhost:5000",
+  "manager_token": "SAME-AS-ONE-OF-MANAGER-TOKENS",
   "refresh_interval_seconds": 30,
-  "log_file": "/var/log/lab-monitor-dashboard.log"
+  "manager_timeout_seconds": 5,
+  "log_file": "E:\\Users\\lab-monitor\\logs\\dashboard.log",
+  "log_level": "INFO",
+  "debug": false
 }
 ```
 
-## Features
+**Key fields:**
+- `manager_url` - URL to Manager service (e.g., `http://atlantis.med.harvard.edu:5000`)
+- `manager_token` - Bearer token (must match one of Manager's `auth_tokens`)
+- `refresh_interval_seconds` - How often to poll Manager (default: 30 seconds)
 
-- Real-time NAS usage display
-- Historical usage trends (30-day graph)
-- Capacity warnings (customizable thresholds)
-- Per-folder breakdown
+---
 
-## UI Components
+## Usage
 
-- Header: System health summary
-- Main grid: Per-NAS cards with current usage + sparkline
-- Detail view: Folder-level breakdown and historical graph
+1. **Start the service** (or verify it's running via Task Scheduler)
+2. **Open in browser:** `http://atlantis.med.harvard.edu:5001`
+3. **View:**
+   - Real-time metrics (CPU%, RAM%, network) - updates every 30 seconds
+   - Disk usage by system and folder
+   - Historical trends
 
-## Development
+---
 
-Static files in `static/` (CSS, JS)
-Templates in `templates/` (HTML)
+## Troubleshooting
 
-Refresh interval: 30 seconds (configurable)
+**"Unable to reach Manager":**
+- Verify Manager is running: `tasklist | findstr manager`
+- Check Manager URL in config matches actual address
+- Verify network connectivity: `ping atlantis.med.harvard.edu`
+
+**"Authentication failed":**
+- Verify `manager_token` in Dashboard config matches one in Manager's `auth_tokens`
+- No leading/trailing spaces
+
+**Dashboard doesn't update:**
+- Check `refresh_interval_seconds` (should be 30 or less)
+- Verify Manager is responding: visit `http://atlantis.med.harvard.edu:5000/health`
+
+See [INSTALLATION.md](../INSTALLATION.md) troubleshooting section for more.
+
+---
+
+## Note on UI Improvements
+
+Dashboard UI is minimal (functional). Future iterations will add:
+- Charts and visualizations
+- Historical trends
+- Per-system breakdowns
+- Alerts
+
+These will be added once data collection and storage is stable and running smoothly.
+
+---
+
+## See Also
+
+- [INSTALLATION.md](../INSTALLATION.md) - Complete installation guide
+- [METRICS.md](../METRICS.md) - Metrics collection system
+- [CONFIG.md](../CONFIG.md) - Configuration management
+- [ARCHITECTURE.md](../docs/ARCHITECTURE.md) - System design
