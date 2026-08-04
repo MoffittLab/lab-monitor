@@ -255,22 +255,33 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
 
             folder_data = {f['path']: f['usage_bytes'] for f in folders}
 
-            # Sum folders under their immediate parent
-            volume_sums = {}
+            # Compute sums for ALL ancestor levels up to and including the volume root.
+            # scan_depth=2: leaf=/volume1/tier2    → sums /volume1
+            # scan_depth=3: leaf=/volume1/tier2/tier3 → sums /volume1/tier2 AND /volume1
+            volume_set = set(volumes)
+            ancestor_sums = {}
             for path, usage in folder_data.items():
-                parent = os.path.dirname(path)
-                if parent:
-                    volume_sums[parent] = volume_sums.get(parent, 0) + usage
+                current = os.path.dirname(path)
+                while current:
+                    ancestor_sums[current] = ancestor_sums.get(current, 0) + usage
+                    if current in volume_set:
+                        break  # reached the volume root, stop
+                    parent = os.path.dirname(current)
+                    if parent == current:
+                        break  # hit filesystem root
+                    current = parent
 
-            total_usage = sum(folder_data.values())
+            # total_usage = sum of volume-level sums (not leaf sums, which may miss
+            # tier2 folders that have no subfolders in a scan_depth=3 scan)
+            total_usage = sum(ancestor_sums.get(vol, 0) for vol in volumes)
 
             entry = {
                 'header': build_header(name, system_id, device_type),
                 'data': {
                     'data_type':   'folder_usage',
-                    **folder_data,     # /volume1/Folder(/SubFolder): bytes, ...
-                    **volume_sums,     # /volume1(/Folder): summed bytes, ...
-                    **volume_capacity, # /volume1_total_bytes, /volume1_free_bytes, ...
+                    **folder_data,      # /volume1/tier2(/tier3): bytes per leaf
+                    **ancestor_sums,    # /volume1/tier2: tier2 sums, /volume1: volume sums
+                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes, ...
                     'total_usage': total_usage,
                 }
             }
