@@ -340,7 +340,7 @@ def sync_queue_to_manager(config: dict, name: str, system_id: str, queue_path: s
         # Post to Manager
         manager_url = config.get('manager_url')
         manager_token = config.get('manager_token')
-        timeout = config.get('timeout_seconds', 30)
+        timeout = config.get('request_timeout_seconds', 30)
         
         logger.info(f"Posting queue to Manager ({len(entries)} entries)")
         

@@ -186,7 +186,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
   "log_level": "INFO",
-  "timeout_seconds": 3600
+  "timeout_seconds": 3600,
+  "request_timeout_seconds": 30
 }
 EOF
     echo "[OK] Config file created at $CONFIG_FILE"
