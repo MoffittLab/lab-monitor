@@ -109,11 +109,11 @@ function createSystemCard(systemName, sys) {
             <div class="card-section">
                 <div class="section-label">System</div>
                 <div class="metrics-stats">
-                    <div class="metric-item">
+                    <div class="metric-item ${metricClass(m.cpu_percent, 50, 75)}">
                         <span class="metric-label">CPU</span>
                         <span class="metric-value">${safeFixed(m.cpu_percent, 1)}%</span>
                     </div>
-                    <div class="metric-item">
+                    <div class="metric-item ${metricClass(m.ram_percent, 50, 75)}">
                         <span class="metric-label">RAM</span>
                         <span class="metric-value">${safeFixed(m.ram_percent, 1)}%</span>
                     </div>
@@ -147,7 +147,7 @@ function createSystemCard(systemName, sys) {
             const volLabel = vol.path.replace(/^\//, '');  // strip leading slash
             if (vol.total_bytes) {
                 const pct      = Math.min(100, Math.round((vol.usage_bytes / vol.total_bytes) * 100));
-                const barClass = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
+                const barClass = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : '';
                 volHtml += `
                     <div class="volume-btn">
                         <div class="volume-btn-label">
@@ -319,6 +319,12 @@ function setupModal() {
 // -------------------------------------------------------------------------
 // Utilities
 // -------------------------------------------------------------------------
+
+function metricClass(value, warnAt, dangerAt) {
+    if (value > dangerAt) return 'danger';
+    if (value > warnAt)   return 'warning';
+    return '';
+}
 
 function updateStatus(status) {
     const el = document.getElementById('status');

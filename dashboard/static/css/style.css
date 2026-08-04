@@ -248,6 +248,14 @@ body {
     color: var(--secondary);
 }
 
+.metric-item.warning .metric-value {
+    color: var(--warning);
+}
+
+.metric-item.danger .metric-value {
+    color: var(--danger);
+}
+
 /* Loading */
 .loading {
     grid-column: 1 / -1;
