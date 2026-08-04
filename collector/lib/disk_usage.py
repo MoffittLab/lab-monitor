@@ -41,8 +41,8 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
         path: Folder path to measure
         timeout: Max seconds to spend measuring this folder
     
-    Returns: Total bytes used by folder and contents
-    
+    Returns: Tuple of (total_bytes, files_counted)
+
     Raises: TimeoutError if measurement exceeds timeout
     """
     total_bytes = 0
@@ -90,14 +90,13 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
             return 0
         
         total_bytes = _scan(path)
-        logger.info(f"Measured {path}: {total_bytes} bytes ({files_counted} files)")
-        return total_bytes
-    
+        return total_bytes, files_counted
+
     except TimeoutError:
         raise
     except Exception as e:
         logger.error(f"Error measuring {path}: {e}")
-        return 0
+        return 0, 0
 
 
 def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
@@ -297,25 +296,28 @@ def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
                     logger.warning(f"Overall timeout ({timeout}s) reached, stopping measurements")
                     break
                 
+                # Announce before starting — lets you see what's in progress
+                logger.info(f"Measuring ... {folder_path}")
+                folder_start = time.time()
+
                 # Measure this subdirectory (including all nested contents)
-                bytes_used = measure_folder_recursive(folder_path, timeout=timeout)
-                
+                bytes_used, files_counted = measure_folder_recursive(folder_path, timeout=timeout)
+
                 results.append({
                     'path': folder_path,
                     'usage_bytes': bytes_used
                 })
-                
-                # Format bytes nicely for logging
+
+                # Format bytes nicely for completion log
                 if bytes_used > 1024**3:
                     size_str = f"{bytes_used / (1024**3):.2f} GB"
                 elif bytes_used > 1024**2:
                     size_str = f"{bytes_used / (1024**2):.2f} MB"
                 else:
                     size_str = f"{bytes_used / 1024:.2f} KB"
-                
-                # Log progress with readable size
-                elapsed = time.time() - start_time
-                logger.info(f"[{elapsed:.1f}s] {folder_path}: {size_str}")
+
+                folder_elapsed = time.time() - folder_start
+                logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {size_str} ({files_counted:,} files)")
             
             except TimeoutError as e:
                 logger.warning(f"Timeout measuring {folder_path}: {e}")
