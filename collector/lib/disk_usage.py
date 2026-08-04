@@ -19,6 +19,7 @@ Cross-platform approach:
 - Works on Windows, Linux, and Synology NAS
 """
 import os
+import shutil
 import logging
 import time
 import re
@@ -192,6 +193,29 @@ def discover_folders(volume_path: str, nas_type: str = "synology") -> List[str]:
         logger.debug(f"Cannot read {volume_path}: {e}")
     
     return folders
+
+
+def measure_volume_capacity(volume_path: str) -> dict:
+    """
+    Get total and free bytes for a volume (cross-platform).
+
+    Uses shutil.disk_usage which works on Synology (/volume1) and
+    Windows (E:) with no platform branching required.
+
+    Args:
+        volume_path: Volume root path (e.g. /volume1 or E:)
+
+    Returns: dict with 'total_bytes' and 'free_bytes', or empty dict on error
+    """
+    try:
+        usage = shutil.disk_usage(volume_path)
+        return {
+            'total_bytes': usage.total,
+            'free_bytes':  usage.free,
+        }
+    except Exception as e:
+        logger.warning(f"Could not get capacity for {volume_path}: {e}")
+        return {}
 
 
 def discover_volumes(nas_type: str = None) -> List[str]:

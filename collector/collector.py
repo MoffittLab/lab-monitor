@@ -40,7 +40,7 @@ from pathlib import Path
 # Add lib directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-from disk_usage import measure_all_folders, discover_volumes
+from disk_usage import measure_all_folders, discover_volumes, measure_volume_capacity
 
 
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
@@ -183,6 +183,15 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         # Grand total across all folders
         total_usage = sum(folder_data.values())
 
+        # Volume capacity: total and free bytes for each configured volume
+        volume_capacity = {}
+        for vol in volumes:
+            cap = measure_volume_capacity(vol)
+            if cap:
+                volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
+                volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
+                logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
+
         # Create message (header + data)
         timestamp = datetime.utcnow().isoformat() + 'Z'
         entry = {
@@ -196,6 +205,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 'data_type':   'folder_usage',
                 **folder_data,        # /volume1/JeffMoffitt: 4832847265792, ...
                 **volume_sums,        # /volume1: 19075694489064, ...
+                **volume_capacity,    # /volume1_total_bytes: 21990232555520, /volume1_free_bytes: 5113563332608, ...
                 'total_usage': total_usage,
             }
         }
