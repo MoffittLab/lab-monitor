@@ -121,7 +121,7 @@ def parse_folder_usage(raw: dict) -> dict:
             total_usage_formatted: str
         }
     """
-    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp'}
+    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp', 'total_disk_bytes'}
 
     folders  = {}
     volumes  = {}
