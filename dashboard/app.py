@@ -123,9 +123,10 @@ def parse_folder_usage(raw: dict) -> dict:
     """
     METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp'}
 
-    folders = {}
-    volumes = {}
-    total   = 0
+    folders  = {}
+    volumes  = {}
+    capacity = {}   # vol_path -> {'total_bytes': int, 'free_bytes': int}
+    total    = 0
 
     for key, val in raw.items():
         if key in METADATA:
@@ -137,31 +138,58 @@ def parse_folder_usage(raw: dict) -> dict:
                 pass
             continue
 
-        # Must be numeric and not NaN
-        try:
-            v = float(val)
-            if v != v:
-                continue
-            v = int(v)
-        except (TypeError, ValueError):
-            continue
-
-        # Classify: split on forward slash (normalise backslash too)
-        parts = [p for p in key.replace('\\', '/').split('/') if p]
-        if len(parts) <= 1:
-            volumes[key] = v   # e.g. /volume1  or  E:
+        # Capacity keys: /volume1_total_bytes, /volume1_free_bytes
+        # Must be checked before generic depth classification
+        for suffix, cap_key in (('_total_bytes', 'total_bytes'), ('_free_bytes', 'free_bytes')):
+            if key.endswith(suffix):
+                vol_path = key[:-len(suffix)]
+                try:
+                    v = float(val)
+                    if v == v:   # NaN guard
+                        capacity.setdefault(vol_path, {})[cap_key] = int(v)
+                except (TypeError, ValueError):
+                    pass
+                break
         else:
-            folders[key] = v   # e.g. /volume1/JeffMoffitt
+            # Not a capacity key — must be numeric and not NaN
+            try:
+                v = float(val)
+                if v != v:
+                    continue
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+
+            # Classify: split on forward slash (normalise backslash too)
+            parts = [p for p in key.replace('\\', '/').split('/') if p]
+            if len(parts) <= 1:
+                volumes[key] = v   # e.g. /volume1  or  E:
+            else:
+                folders[key] = v   # e.g. /volume1/JeffMoffitt
+
+    # Build volume list, attaching capacity data where available
+    vol_list = []
+    for k, v in sorted(volumes.items()):
+        cap   = capacity.get(k, {})
+        entry = {
+            'path':            k,
+            'usage_bytes':     v,
+            'usage_formatted': format_bytes(v),
+        }
+        if 'total_bytes' in cap:
+            entry['total_bytes']     = cap['total_bytes']
+            entry['total_formatted'] = format_bytes(cap['total_bytes'])
+        if 'free_bytes' in cap:
+            entry['free_bytes']     = cap['free_bytes']
+            entry['free_formatted'] = format_bytes(cap['free_bytes'])
+        vol_list.append(entry)
 
     return {
         'folders': [
             {'path': k, 'usage_bytes': v, 'usage_formatted': format_bytes(v)}
             for k, v in sorted(folders.items())
         ],
-        'volumes': [
-            {'path': k, 'usage_bytes': v, 'usage_formatted': format_bytes(v)}
-            for k, v in sorted(volumes.items())
-        ],
+        'volumes':               vol_list,
         'total_usage_bytes':     total,
         'total_usage_formatted': format_bytes(total),
     }

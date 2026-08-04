@@ -342,3 +342,30 @@ body {
 .folder-item.subfolder .folder-path {
     font-size: 11px;
 }
+
+/* Volume capacity button */
+.volume-btn {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+}
+
+.volume-btn-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.volume-btn-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--primary);
+}
+
+.volume-btn-usage {
+    font-size: 12px;
+    color: #555;
+}

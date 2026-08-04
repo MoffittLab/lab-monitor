@@ -139,14 +139,31 @@ function createSystemCard(systemName, sys) {
     if (sys.disk) {
         const d = sys.disk;
 
-        // Volume summary rows
+        // Volume buttons — show "volume1: XX of YY" with progress bar if capacity known
         let volHtml = '';
         for (const vol of (d.volumes || [])) {
-            volHtml += `
-                <div class="folder-item">
-                    <span class="folder-path">${escapeHtml(vol.path)}</span>
-                    <span class="folder-size">${escapeHtml(vol.usage_formatted)}</span>
-                </div>`;
+            const volLabel = vol.path.replace(/^\//, '');  // strip leading slash
+            if (vol.total_bytes) {
+                const pct      = Math.min(100, Math.round((vol.usage_bytes / vol.total_bytes) * 100));
+                const barClass = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
+                volHtml += `
+                    <div class="volume-btn">
+                        <div class="volume-btn-label">
+                            <span class="volume-btn-name">${escapeHtml(volLabel)}</span>
+                            <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)} of ${escapeHtml(vol.total_formatted)}</span>
+                        </div>
+                        <div class="usage-bar ${barClass}">
+                            <div class="usage-fill" style="width:${pct}%"></div>
+                        </div>
+                    </div>`;
+            } else {
+                // Fallback: no capacity data yet (older collector)
+                volHtml += `
+                    <div class="folder-item">
+                        <span class="folder-path">${escapeHtml(vol.path)}</span>
+                        <span class="folder-size">${escapeHtml(vol.usage_formatted)}</span>
+                    </div>`;
+            }
         }
 
         // Folder rows (top 5)
@@ -241,7 +258,13 @@ function showSystemDetail(systemName, sys) {
             html += `<h4 style="margin:16px 0 6px;">By Volume</h4>
                      <table style="width:100%;border-collapse:collapse;">`;
             for (const vol of d.volumes) {
-                html += metricRow(escapeHtml(vol.path), escapeHtml(vol.usage_formatted));
+                html += metricRow(escapeHtml(vol.path) + ' (used)', escapeHtml(vol.usage_formatted));
+                if (vol.total_bytes) {
+                    const pct = Math.min(100, Math.round((vol.usage_bytes / vol.total_bytes) * 100));
+                    html += metricRow('&nbsp;&nbsp;Total capacity', escapeHtml(vol.total_formatted));
+                    html += metricRow('&nbsp;&nbsp;Free',           escapeHtml(vol.free_formatted));
+                    html += metricRow('&nbsp;&nbsp;Used %',         `${pct}%`);
+                }
             }
             html += '</table>';
         }
