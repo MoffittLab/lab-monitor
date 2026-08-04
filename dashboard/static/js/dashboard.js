@@ -134,12 +134,15 @@ function createSystemCard(systemName, sys) {
             </div>`;
     }
 
-    // --- Disk section ---
+    // --- Storage Overview section (volume buttons) ---
+    let storageOverviewHtml = '';
+    // --- Storage section (shared folders only, sorted largest to smallest) ---
     let diskHtml = '';
+
     if (sys.disk) {
         const d = sys.disk;
 
-        // Volume buttons — show "volume1: XX of YY" with progress bar if capacity known
+        // Volume buttons — one per volume, "volume1: XX of YY" + progress bar
         let volHtml = '';
         for (const vol of (d.volumes || [])) {
             const volLabel = vol.path.replace(/^\//, '');  // strip leading slash
@@ -166,34 +169,34 @@ function createSystemCard(systemName, sys) {
             }
         }
 
-        // Folder rows (top 5)
+        if (volHtml) {
+            storageOverviewHtml = `
+                <div class="card-section">
+                    <div class="section-label">Storage Overview</div>
+                    ${volHtml}
+                </div>`;
+        }
+
+        // Shared folders only — sorted largest to smallest, all shown
+        const folders = [...(d.folders || [])].sort((a, b) => b.usage_bytes - a.usage_bytes);
         let folderHtml = '';
-        const folders = d.folders || [];
-        for (const f of folders.slice(0, 5)) {
+        for (const f of folders) {
             folderHtml += `
-                <div class="folder-item subfolder">
+                <div class="folder-item">
                     <span class="folder-path">${escapeHtml(f.path)}</span>
                     <span class="folder-size">${escapeHtml(f.usage_formatted)}</span>
                 </div>`;
         }
-        if (folders.length > 5) {
-            folderHtml += `<div class="folder-item subfolder">
-                <span class="folder-path">… and ${folders.length - 5} more</span>
-            </div>`;
-        }
 
-        diskHtml = `
-            <div class="card-section">
-                <div class="section-label">Storage</div>
-                <div class="usage-stats">
-                    <span>Total</span>
-                    <span class="usage-value">${escapeHtml(d.total_usage_formatted)}</span>
-                </div>
-                <div class="folder-list">
-                    ${volHtml}
-                    ${folderHtml}
-                </div>
-            </div>`;
+        if (folderHtml) {
+            diskHtml = `
+                <div class="card-section">
+                    <div class="section-label">Storage</div>
+                    <div class="folder-list">
+                        ${folderHtml}
+                    </div>
+                </div>`;
+        }
     }
 
     card.innerHTML = `
@@ -205,6 +208,7 @@ function createSystemCard(systemName, sys) {
             <div class="timestamp">${escapeHtml(timestamp)}</div>
         </div>
         ${metricsHtml}
+        ${storageOverviewHtml}
         ${diskHtml}
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
