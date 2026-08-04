@@ -173,19 +173,19 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 
     # Prompt for Device Type
-    read -p "Enter Device Type [NAS/Instrument-NAS/Server/NAS-Backup]: " DEVICE_TYPE
+    read -p "Enter Device Type [NAS/NAS-Instrument/Server/NAS-Backup]: " DEVICE_TYPE
     if [ -z "$DEVICE_TYPE" ]; then
         echo -e "${RED}ERROR: Device Type cannot be empty${NC}"
         exit 1
     fi
-    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "Instrument-NAS" ] && [ "$DEVICE_TYPE" != "Server" ] && [ "$DEVICE_TYPE" != "NAS-Backup" ]; then
-        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, Instrument-NAS, Server, or NAS-Backup). Continuing anyway.${NC}"
+    if [ "$DEVICE_TYPE" != "NAS" ] && [ "$DEVICE_TYPE" != "NAS-Instrument" ] && [ "$DEVICE_TYPE" != "Server" ] && [ "$DEVICE_TYPE" != "NAS-Backup" ]; then
+        echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, NAS-Instrument, Server, or NAS-Backup). Continuing anyway.${NC}"
     fi
 
     # Suggest a default scan_depth based on device type
     if [ "$DEVICE_TYPE" = "NAS-Backup" ]; then
         DEFAULT_DEPTH=1
-    elif [ "$DEVICE_TYPE" = "Instrument-NAS" ]; then
+    elif [ "$DEVICE_TYPE" = "NAS-Instrument" ]; then
         DEFAULT_DEPTH=3
     else
         DEFAULT_DEPTH=2
@@ -195,7 +195,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     echo "Scan depth controls how many folder levels the disk collector measures:"
     echo "  1 = Volume only        (fast, filesystem stats  -- recommended for NAS-Backup)"
     echo "  2 = Volume/Folder      (standard                -- recommended for NAS and Server)"
-    echo "  3 = Volume/Folder/Sub  (one level deeper        -- recommended for Instrument-NAS)"
+    echo "  3 = Volume/Folder/Sub  (one level deeper        -- recommended for NAS-Instrument)"
     read -p "Enter Scan Depth [1/2/3] (default: $DEFAULT_DEPTH): " SCAN_DEPTH
     SCAN_DEPTH=${SCAN_DEPTH:-$DEFAULT_DEPTH}
     if ! echo "$SCAN_DEPTH" | grep -qE '^[1-9][0-9]*$'; then

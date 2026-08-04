@@ -200,7 +200,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 return False
 
         # Default scan_depth by device_type if not explicitly set in config
-        _depth_defaults = {'NAS-Backup': 1, 'Instrument-NAS': 3, 'NAS': 2, 'Server': 2}
+        _depth_defaults = {'NAS-Backup': 1, 'NAS-Instrument': 3, 'NAS': 2, 'Server': 2}
         scan_depth = config.get('scan_depth', _depth_defaults.get(device_type, 2))
         logger.info(f"scan_depth={scan_depth}")
 
@@ -239,7 +239,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         # -------------------------------------------------------------------
         # scan_depth >= 2: folder scan at the requested depth
         # depth=2 → volume/Folder (standard NAS)
-        # depth=3 → volume/Folder/SubFolder (Instrument-NAS)
+        # depth=3 → volume/Folder/SubFolder (NAS-Instrument)
         # -------------------------------------------------------------------
         else:
             nas_type = 'synology' if sys.platform != 'win32' else 'windows'
