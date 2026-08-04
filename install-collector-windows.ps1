@@ -49,7 +49,7 @@ function Write-Step {
 
 function Write-Success {
     param([string]$Message)
-    Write-Host "✓ $Message" -ForegroundColor Green
+    Write-Host "[OK] $Message" -ForegroundColor Green
 }
 
 function Write-Error-Custom {
@@ -234,7 +234,7 @@ try {
 Write-Host ""
 
 Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "✓ Windows Collector Installation Complete" -ForegroundColor Green
+Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan

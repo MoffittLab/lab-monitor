@@ -45,7 +45,7 @@ DATA_DIR="$LAB_MONITOR_DIR/data"
 LOGS_DIR="$LAB_MONITOR_DIR/logs"
 REPO_URL="https://github.com/MoffittLab/lab-monitor.git"
 
-# Check if user has write permission to /volume1 (admin users do)
+# Check if user has write permission to /volume1/lab-monitor (admin users do)
 CURRENT_USER=$(whoami)
 if [ "$CURRENT_USER" = "root" ]; then
     echo -e "${RED}ERROR: This script must NOT be run as root${NC}"
@@ -53,14 +53,22 @@ if [ "$CURRENT_USER" = "root" ]; then
     exit 1
 fi
 
-# Verify write permission to /volume1
-if ! touch "$VOLUME/.test-write" 2>/dev/null; then
-    echo -e "${RED}ERROR: User '$CURRENT_USER' does not have write permission to $VOLUME${NC}"
-    echo "This script must be run as an admin user with access to $VOLUME"
+# Create lab-monitor base directory and verify write permission
+mkdir -p "$LAB_MONITOR_DIR" 2>/dev/null || {
+    echo -e "${RED}ERROR: Could not create or access $LAB_MONITOR_DIR${NC}"
+    echo "User '$CURRENT_USER' does not have write permission"
+    echo "Ensure your user has 'Read & Write' permissions via Control Panel → Shared Folder → lab-monitor"
+    exit 1
+}
+
+# Verify write permission to lab-monitor directory
+if ! touch "$LAB_MONITOR_DIR/.test-write" 2>/dev/null; then
+    echo -e "${RED}ERROR: User '$CURRENT_USER' does not have write permission to $LAB_MONITOR_DIR${NC}"
+    echo "This script must be run as an admin user with access to $LAB_MONITOR_DIR"
     echo "Ensure your user has 'Read & Write' permissions via Control Panel → Shared Folder → lab-monitor"
     exit 1
 fi
-rm -f "$VOLUME/.test-write"
+rm -f "$LAB_MONITOR_DIR/.test-write"
 
 echo -e "${GREEN}Running as user: $CURRENT_USER${NC}"
 
@@ -68,7 +76,7 @@ echo -e "${YELLOW}Step 1: Creating directory structure${NC}"
 mkdir -p "$DATA_DIR"
 mkdir -p "$LOGS_DIR"
 mkdir -p "$SCRIPTS_DIR"
-echo "✓ Directories created"
+echo "[OK] Directories created"
 echo ""
 
 echo -e "${YELLOW}Step 2: Checking Python installation${NC}"
@@ -78,7 +86,7 @@ if ! python3 --version > /dev/null 2>&1; then
     exit 1
 fi
 PYTHON_VERSION=$(python3 --version 2>&1)
-echo "✓ $PYTHON_VERSION found"
+echo "[OK] $PYTHON_VERSION found"
 echo ""
 
 echo -e "${YELLOW}Step 3: Cloning/updating lab-monitor repository${NC}"
@@ -94,7 +102,7 @@ else
         exit 1
     }
 fi
-echo "✓ Repository ready at $SCRIPTS_DIR/lab-monitor"
+echo "[OK] Repository ready at $SCRIPTS_DIR/lab-monitor"
 echo ""
 
 echo -e "${YELLOW}Step 4: Creating Python virtual environment${NC}"
@@ -103,9 +111,9 @@ if [ ! -d "$VENV_DIR" ]; then
         echo -e "${RED}ERROR: Could not create virtual environment${NC}"
         exit 1
     }
-    echo "✓ Virtual environment created"
+    echo "[OK] Virtual environment created"
 else
-    echo "✓ Virtual environment already exists"
+    echo "[OK] Virtual environment already exists"
 fi
 echo ""
 
@@ -123,7 +131,7 @@ pip install -r requirements.txt > /dev/null 2>&1 || {
     deactivate
     exit 1
 }
-echo "✓ Dependencies installed (requests, psutil)"
+echo "[OK] Dependencies installed (requests, psutil)"
 
 deactivate
 echo ""
@@ -150,7 +158,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "timeout_seconds": 3600
 }
 EOF
-    echo "✓ Config file created at $CONFIG_FILE"
+    echo "[OK] Config file created at $CONFIG_FILE"
     echo ""
     echo -e "${YELLOW}⚠️  IMPORTANT: Edit the configuration:${NC}"
     echo "   nano $CONFIG_FILE"
@@ -166,7 +174,7 @@ EOF
     echo "   - \"volumes\": Add additional volumes if needed (e.g., ['/volume1', '/volume2'])"
     echo ""
 else
-    echo "✓ Config file already exists at $CONFIG_FILE"
+    echo "[OK] Config file already exists at $CONFIG_FILE"
     echo "   (Edit manually if needed: nano $CONFIG_FILE)"
 fi
 echo ""
@@ -176,7 +184,7 @@ cd "$SCRIPTS_DIR/lab-monitor/collector"
 echo "Testing disk collection (this may take a minute)..."
 source "$VENV_DIR/bin/activate"
 if $VENV_DIR/bin/python3 collector.py --config local/config.json --mode disk > /tmp/collector-test.log 2>&1; then
-    echo "✓ Disk collection test passed"
+    echo "[OK] Disk collection test passed"
 else
     echo -e "${RED}⚠️  Disk collection test failed${NC}"
     echo "Log: /tmp/collector-test.log"
@@ -186,26 +194,31 @@ deactivate
 echo ""
 
 echo "=========================================="
-echo -e "${GREEN}✓ Synology Collector Installation Complete${NC}"
+echo -e "${GREEN}[OK] Synology Collector Installation Complete${NC}"
 echo "=========================================="
 echo ""
 echo "Next steps:"
+echo ""
 echo "1. Edit configuration:"
 echo "   nano $CONFIG_FILE"
 echo ""
 echo "2. Schedule jobs via Synology Control Panel:"
-echo "   - Control Panel → Task Scheduler"
-echo "   - Create → Scheduled Task → Custom Script"
 echo ""
-echo "   Job 1: Disk Collection (Daily at 2 AM)"
-echo "   ├─ General: name='Lab Monitor - Disk', user='Admin'"
-echo "   ├─ Schedule: Daily, 02:00"
-echo "   └─ Task: cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode disk"
+echo "   Control Panel → Task Scheduler → Create → Scheduled Task → User-defined Script"
 echo ""
-echo "   Job 2: Metrics Collection (Every 5 minutes)"
-echo "   ├─ General: name='Lab Monitor - Metrics', user='Admin'"
-echo "   ├─ Schedule: Daily, 00:00, repeat every 5 minutes"
-echo "   └─ Task: cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode metrics"
+echo "   Task 1: Lab Monitor - Disk Collection"
+echo "   - Task name: 'Lab Monitor - Disk Collection'"
+echo "   - User: your admin user (e.g., 'jeff')"
+echo "   - Schedule: Daily at 02:00 (2 AM)"
+echo "   - User-defined script:"
+echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode disk"
+echo ""
+echo "   Task 2: Lab Monitor - Metrics Collection"
+echo "   - Task name: 'Lab Monitor - Metrics Collection'"
+echo "   - User: your admin user (e.g., 'jeff')"
+echo "   - Schedule: Daily at 00:00, repeat every 5 minutes"
+echo "   - User-defined script:"
+echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode metrics"
 echo ""
 echo "3. Verify jobs run:"
 echo "   tail -f $LOGS_DIR/collector.log"

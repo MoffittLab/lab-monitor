@@ -52,7 +52,7 @@ mkdir -p "$DATA_DIR"
 mkdir -p "$ARCHIVE_DIR"
 chmod 755 "$SCRIPTS_DIR"
 chmod 755 "$DATA_DIR"
-echo -e "${GREEN}✓ Directories created${NC}"
+echo -e "${GREEN}[OK] Directories created${NC}"
 echo
 
 echo -e "${YELLOW}Step 2: Detecting NAS configuration...${NC}"
@@ -63,14 +63,14 @@ echo "   NAS Name (hostname): $NAS_NAME"
 # Auto-detect boot_id as nas_id
 NAS_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "synology_unknown")
 echo "   NAS ID (boot_id): $NAS_ID"
-echo -e "${GREEN}✓ NAS configuration detected${NC}"
+echo -e "${GREEN}[OK] NAS configuration detected${NC}"
 echo
 
 echo -e "${YELLOW}Step 3: Verifying folder permissions...${NC}"
 echo "   Note: Lab Monitor folder uses Synology ACL (Access Control Lists)"
 echo "   You've already configured GUI permissions for Admin user"
 echo "   These will be preserved across Synology updates"
-echo -e "${GREEN}✓ Folder permissions verified (ACL-based)${NC}"
+echo -e "${GREEN}[OK] Folder permissions verified (ACL-based)${NC}"
 echo
 
 echo -e "${YELLOW}Step 4: Creating Python virtual environment...${NC}"
@@ -81,7 +81,7 @@ if [ -d "$VENV_PATH" ]; then
     echo "   Virtual environment already exists at $VENV_PATH"
 else
     python3 -m venv "$VENV_PATH"
-    echo -e "${GREEN}✓ Virtual environment created at $VENV_PATH${NC}"
+    echo -e "${GREEN}[OK] Virtual environment created at $VENV_PATH${NC}"
 fi
 echo
 
@@ -93,7 +93,7 @@ if [ -d "$SCRIPTS_DIR/lab-monitor" ]; then
 else
     cd "$SCRIPTS_DIR"
     git clone https://github.com/MoffittLab/lab-monitor.git
-    echo -e "${GREEN}✓ Repository cloned${NC}"
+    echo -e "${GREEN}[OK] Repository cloned${NC}"
 fi
 echo
 
@@ -104,7 +104,7 @@ cd "$COLLECTOR_DIR"
 pip install --upgrade pip > /dev/null 2>&1
 pip install -q -r requirements.txt
 deactivate
-echo -e "${GREEN}✓ Dependencies installed${NC}"
+echo -e "${GREEN}[OK] Dependencies installed${NC}"
 echo
 
 echo -e "${YELLOW}Step 7: Prompting for Manager configuration...${NC}"
@@ -141,7 +141,7 @@ cat > "$CONFIG_PATH" << EOF
 EOF
 
 chmod 600 "$CONFIG_PATH"
-echo -e "${GREEN}✓ Configuration file created at $CONFIG_PATH${NC}"
+echo -e "${GREEN}[OK] Configuration file created at $CONFIG_PATH${NC}"
 echo
 
 echo -e "${YELLOW}Step 9: Testing the installation...${NC}"
