@@ -48,40 +48,48 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
     total_bytes = 0
     start_time = time.time()
     files_counted = 0
-    
+    visited_inodes = set()   # track (dev, ino) to skip hard-link duplicates
+
     def _scan(dir_path: str) -> int:
         """Recursive scan helper"""
         nonlocal total_bytes, files_counted
-        
+
         # Check timeout
         if time.time() - start_time > timeout:
             raise TimeoutError(f"Measurement of {path} exceeded {timeout}s")
-        
+
         dir_size = 0
-        
+
         try:
             for entry in os.scandir(dir_path):
                 try:
+                    # Skip symlinks to avoid loops
                     if entry.is_symlink():
-                        # Skip symlinks to avoid loops
                         continue
-                    elif entry.is_file(follow_symlinks=False):
+
+                    # Skip Synology system directories at every level
+                    name = entry.name
+                    if name.startswith('@') or name == '#recycle' or name.startswith('.@'):
+                        continue
+
+                    if entry.is_file(follow_symlinks=False):
                         try:
-                            size = entry.stat(follow_symlinks=False).st_size
-                            dir_size += size
+                            st = entry.stat(follow_symlinks=False)
+                            inode_key = (st.st_dev, st.st_ino)
+                            if inode_key in visited_inodes:
+                                continue   # hard-link already counted
+                            visited_inodes.add(inode_key)
+                            dir_size += st.st_size
                             files_counted += 1
                         except OSError:
-                            # File may have been deleted or access denied
                             pass
                     elif entry.is_dir(follow_symlinks=False):
-                        # Recurse into subdirectory
                         dir_size += _scan(entry.path)
                 except (OSError, PermissionError):
-                    # Permission denied, skip this entry
                     continue
         except (OSError, PermissionError) as e:
             logger.warning(f"Cannot access {dir_path}: {e}")
-        
+
         return dir_size
     
     try:
