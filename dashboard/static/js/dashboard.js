@@ -152,7 +152,7 @@ function createSystemCard(systemName, sys) {
                     <div class="volume-btn">
                         <div class="volume-btn-label">
                             <span class="volume-btn-name">${escapeHtml(volLabel)}</span>
-                            <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)} of ${escapeHtml(vol.total_formatted)}</span>
+                            <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)}</span>
                         </div>
                         <div class="usage-bar ${barClass}">
                             <div class="usage-fill" style="width:${pct}%"></div>
