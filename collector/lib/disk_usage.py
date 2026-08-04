@@ -288,6 +288,62 @@ def discover_volumes(nas_type: str = None) -> List[str]:
     return volumes
 
 
+def measure_leaf_folders(leaf_folders: List[str], timeout: int = 3600) -> List[Dict]:
+    """
+    Measure usage for a pre-discovered list of leaf folders.
+    
+    Does NOT discover subdirectories — measures each folder as-is.
+    Use when you have already discovered the exact folders to measure via discover_at_depth.
+    
+    Args:
+        leaf_folders: List of folder paths already discovered (e.g., from discover_at_depth)
+        timeout: Max seconds per folder measurement
+    
+    Returns: List of folder reports with path and usage_bytes
+    """
+    results = []
+    start_time = time.time()
+    
+    for folder_path in leaf_folders:
+        if not os.path.exists(folder_path):
+            logger.warning(f"Folder does not exist: {folder_path}")
+            continue
+        
+        try:
+            # Check overall timeout
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                logger.warning(f"Overall timeout ({timeout}s) reached, stopping measurements")
+                break
+            
+            logger.info(f"Measuring ... {folder_path}")
+            folder_start = time.time()
+            
+            bytes_used, files_counted = measure_folder_recursive(folder_path, timeout=timeout)
+            
+            results.append({
+                'path': folder_path,
+                'usage_bytes': bytes_used
+            })
+            
+            # Format bytes nicely for completion log
+            if bytes_used > 1024**3:
+                size_str = f"{bytes_used / (1024**3):.2f} GB"
+            elif bytes_used > 1024**2:
+                size_str = f"{bytes_used / (1024**2):.2f} MB"
+            else:
+                size_str = f"{bytes_used / 1024:.2f} KB"
+            
+            folder_elapsed = time.time() - folder_start
+            logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {size_str} ({files_counted} files)")
+        
+        except Exception as e:
+            logger.error(f"Failed to measure {folder_path}: {e}")
+            continue
+    
+    return results
+
+
 def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
     """
     Measure usage for all immediate subdirectories on given volumes.

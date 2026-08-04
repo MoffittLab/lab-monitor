@@ -41,7 +41,7 @@ from pathlib import Path
 # Add lib directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-from disk_usage import measure_all_folders, discover_volumes, measure_volume_capacity, discover_at_depth
+from disk_usage import measure_all_folders, measure_leaf_folders, discover_volumes, measure_volume_capacity, discover_at_depth
 
 
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
@@ -248,7 +248,9 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 leaf_folders.extend(discover_at_depth(vol, scan_depth - 1, nas_type))
             logger.info(f"Discovered {len(leaf_folders)} folders at depth {scan_depth}")
 
-            folders = measure_all_folders(leaf_folders, timeout=timeout)
+            # Use measure_leaf_folders (not measure_all_folders) to measure pre-discovered leaf folders
+            # without re-discovering their subdirectories
+            folders = measure_leaf_folders(leaf_folders, timeout=timeout)
             logger.info(f"Measured {len(folders)} folders")
 
             folder_data = {f['path']: f['usage_bytes'] for f in folders}
