@@ -47,3 +47,6 @@ collector/local/
 data/
 logs/
 *.log
+
+# Deployment credentials — never commit
+tools/collectors.csv

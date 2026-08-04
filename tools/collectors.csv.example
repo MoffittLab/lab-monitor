@@ -1,0 +1,4 @@
+ip,username,password,git_path
+192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor
+192.168.1.43,john,secret456,/volume1/lab-monitor/scripts/lab-monitor
+atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor
