@@ -86,9 +86,8 @@ function updateSummary(deviceTypeCounts, globalTotals) {
     tableDiv.innerHTML = html;
 
     // Global totals come from server-side accumulation (survives reboots)
-    document.getElementById('totalDataIn').textContent  = formatBytes(globalTotals.total_bytes_in   || 0);
-    document.getElementById('totalDataOut').textContent = formatBytes(globalTotals.total_bytes_out  || 0);
-    document.getElementById('totalUsage').textContent   = formatBytes(globalTotals.total_disk_bytes || 0);
+    document.getElementById('totalDataIn').textContent  = formatBytes(globalTotals.total_bytes_in  || 0);
+    document.getElementById('totalDataOut').textContent = formatBytes(globalTotals.total_bytes_out || 0);
 }
 
 // -------------------------------------------------------------------------
