@@ -152,7 +152,7 @@ function createSystemCard(systemName, sys) {
                     <div class="volume-btn">
                         <div class="volume-btn-label">
                             <span class="volume-btn-name">${escapeHtml(volLabel)}</span>
-                            <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)}</span>
+                            <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)} of ${escapeHtml(vol.total_formatted)}</span>
                         </div>
                         <div class="usage-bar ${barClass}">
                             <div class="usage-fill" style="width:${pct}%"></div>
@@ -251,11 +251,7 @@ function showSystemDetail(systemName, sys) {
     // --- Disk detail ---
     if (sys.disk) {
         const d = sys.disk;
-        html += `
-            <h3 style="margin-top:20px;">Storage</h3>
-            <table style="width:100%;border-collapse:collapse;">
-                ${metricRow('Total usage', escapeHtml(d.total_usage_formatted))}
-            </table>`;
+        html += `<h3 style="margin-top:20px;">Storage</h3>`;
 
         if ((d.volumes || []).length > 0) {
             html += `<h4 style="margin:16px 0 6px;">By Volume</h4>
