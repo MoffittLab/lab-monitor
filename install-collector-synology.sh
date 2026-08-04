@@ -136,7 +136,7 @@ echo "[OK] Dependencies installed (requests, psutil)"
 deactivate
 echo ""
 
-echo -e "${YELLOW}Step 6: Creating configuration${NC}"
+echo -e "${YELLOW}Step 6: Gathering configuration${NC}"
 mkdir -p "$SCRIPTS_DIR/lab-monitor/collector/local"
 CONFIG_FILE="$SCRIPTS_DIR/lab-monitor/collector/local/config.json"
 
@@ -145,12 +145,32 @@ if [ ! -f "$CONFIG_FILE" ]; then
     NAS_HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
     NAS_ID="synology-${NAS_HOSTNAME}"
     
+    echo "Auto-detected values:"
+    echo "  - NAS name: $NAS_HOSTNAME"
+    echo "  - NAS id: $NAS_ID"
+    echo ""
+    
+    # Prompt for Manager URL
+    read -p "Enter Manager URL (e.g., http://atlantis.med.harvard.edu:5000): " MANAGER_URL
+    if [ -z "$MANAGER_URL" ]; then
+        echo -e "${RED}ERROR: Manager URL cannot be empty${NC}"
+        exit 1
+    fi
+    
+    # Prompt for Manager Token
+    read -p "Enter Manager Token (from Manager config): " MANAGER_TOKEN
+    if [ -z "$MANAGER_TOKEN" ]; then
+        echo -e "${RED}ERROR: Manager Token cannot be empty${NC}"
+        exit 1
+    fi
+    
+    echo ""
     cat > "$CONFIG_FILE" << EOF
 {
   "name": "${NAS_HOSTNAME}",
   "id": "${NAS_ID}",
-  "manager_url": "http://atlantis.med.harvard.edu:5000",
-  "manager_token": "CHANGE-ME-TO-MANAGER-TOKEN",
+  "manager_url": "${MANAGER_URL}",
+  "manager_token": "${MANAGER_TOKEN}",
   "volumes": ["/volume1"],
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
@@ -160,18 +180,12 @@ if [ ! -f "$CONFIG_FILE" ]; then
 EOF
     echo "[OK] Config file created at $CONFIG_FILE"
     echo ""
-    echo -e "${YELLOW}⚠️  IMPORTANT: Edit the configuration:${NC}"
-    echo "   nano $CONFIG_FILE"
+    echo "Configuration saved with:"
+    echo "  - Manager URL: $MANAGER_URL"
+    echo "  - Manager Token: (set)"
     echo ""
-    echo "   Auto-detected values:"
-    echo "   - \"name\": $NAS_HOSTNAME (auto-detected from hostname)"
-    echo "   - \"id\": $NAS_ID (auto-generated)"
-    echo ""
-    echo "   REQUIRED changes:"
-    echo "   - \"manager_token\": Copy from your Manager config (same for all collectors)"
-    echo ""
-    echo "   OPTIONAL changes:"
-    echo "   - \"volumes\": Add additional volumes if needed (e.g., ['/volume1', '/volume2'])"
+    echo "To modify later:"
+    echo "  nano $CONFIG_FILE"
     echo ""
 else
     echo "[OK] Config file already exists at $CONFIG_FILE"
@@ -179,14 +193,14 @@ else
 fi
 echo ""
 
-echo -e "${YELLOW}Step 7: Testing collector (disk mode)${NC}"
+echo -e "${YELLOW}Step 7: Testing collector (metrics mode)${NC}"
 cd "$SCRIPTS_DIR/lab-monitor/collector"
-echo "Testing disk collection (this may take a minute)..."
+echo "Testing metrics collection..."
 source "$VENV_DIR/bin/activate"
-if $VENV_DIR/bin/python3 collector.py --config local/config.json --mode disk > /tmp/collector-test.log 2>&1; then
-    echo "[OK] Disk collection test passed"
+if $VENV_DIR/bin/python3 collector.py --config local/config.json --mode metrics > /tmp/collector-test.log 2>&1; then
+    echo "[OK] Metrics collection test passed"
 else
-    echo -e "${RED}⚠️  Disk collection test failed${NC}"
+    echo -e "${RED}⚠️  Metrics collection test failed${NC}"
     echo "Log: /tmp/collector-test.log"
     echo "This may be normal if Manager isn't running yet"
 fi
