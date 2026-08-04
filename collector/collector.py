@@ -33,6 +33,7 @@ import json
 import logging
 import argparse
 import subprocess
+import socket
 import time
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,38 @@ def setup_logging(log_file: str = None, log_level: str = "INFO"):
         logger.addHandler(file_handler)
     
     return logger
+
+
+def get_local_ip() -> str:
+    """Detect the primary outbound IP address (cross-platform).
+
+    Opens a UDP socket toward an external address to identify which
+    local interface would be used. No data is actually sent.
+    Falls back to hostname resolution, then 'unknown' on failure.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return 'unknown'
+
+
+def build_header(name: str, system_id: str, device_type: str) -> dict:
+    """Build standard message header including timestamp and IP address."""
+    return {
+        'device_name': name,
+        'device_id':   system_id,
+        'device_type': device_type,
+        'ip_address':  get_local_ip(),
+        'timestamp':   datetime.utcnow().isoformat() + 'Z',
+    }
 
 
 def get_data_dir(config: dict) -> str:
@@ -193,14 +226,8 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
 
         # Create message (header + data)
-        timestamp = datetime.utcnow().isoformat() + 'Z'
         entry = {
-            'header': {
-                'device_name': name,
-                'device_id':   system_id,
-                'device_type': device_type,
-                'timestamp':   timestamp,
-            },
+            'header': build_header(name, system_id, device_type),
             'data': {
                 'data_type':   'folder_usage',
                 **folder_data,        # /volume1/JeffMoffitt: 4832847265792, ...
@@ -253,14 +280,8 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         logger.info(f"CPU: {cpu_percent}% | RAM: {ram_percent}% | Uptime: {uptime_formatted} | Network: {network_stats}")
         
         # Create message (header + data)
-        timestamp = datetime.utcnow().isoformat() + 'Z'
         entry = {
-            'header': {
-                'device_name': name,
-                'device_id':   system_id,
-                'device_type': device_type,
-                'timestamp':   timestamp,
-            },
+            'header': build_header(name, system_id, device_type),
             'data': {
                 'data_type':                    'system_metrics',
                 'cpu_percent':                  cpu_percent,
