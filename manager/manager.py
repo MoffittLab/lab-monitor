@@ -764,6 +764,67 @@ def get_totals():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/history/<system_name>/<data_type>/<field>', methods=['GET'])
+@require_auth
+def get_metric_history(system_name: str, data_type: str, field: str):
+    """
+    Fetch time-series data for a specific field within a system's data_type table.
+    
+    Args:
+        system_name: System name (e.g., "triton5")
+        data_type:   Table name (e.g., "system_metrics")
+        field:       Column name (e.g., "cpu_percent", "ram_percent")
+    
+    Optional query params:
+        ?limit=100   Return last N records (default 100)
+    
+    Returns:
+        {
+            "system_name": "triton5",
+            "data_type": "system_metrics",
+            "field": "cpu_percent",
+            "data": [
+                {"timestamp": "2026-08-04T18:30:00", "value": 45.2},
+                {"timestamp": "2026-08-04T18:35:00", "value": 48.1},
+                ...
+            ]
+        }
+    """
+    limit = request.args.get('limit', default=100, type=int)
+    limit = min(limit, 500)  # cap at 500 to prevent abuse
+    
+    try:
+        records = _data_store.get_recent(system_name, data_type, limit=limit)
+        
+        # Extract timestamps and the requested field
+        data = []
+        for record in reversed(records):  # oldest first
+            ts = record.get('timestamp')
+            val = record.get(field)
+            if ts is not None and val is not None:
+                # Handle stored values (might be JSON strings for complex types)
+                if isinstance(val, str):
+                    try:
+                        val = float(val)
+                    except (ValueError, TypeError):
+                        continue
+                data.append({
+                    'timestamp': ts,
+                    'value': float(val) if val is not None else None
+                })
+        
+        return jsonify({
+            'system_name': system_name,
+            'data_type': data_type,
+            'field': field,
+            'data': data
+        }), 200
+    
+    except Exception as e:
+        _logger.error(f"Error fetching history for {system_name}/{data_type}/{field}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/system/<name>', methods=['DELETE'])
 @require_auth
 def delete_system(name: str):

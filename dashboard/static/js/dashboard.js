@@ -8,11 +8,24 @@ let refreshInterval = 30000;
 // Init
 // -------------------------------------------------------------------------
 
+let metricChart = null;  // Global Chart.js instance
+
 function initDashboard(config) {
     refreshInterval = config.refreshInterval || 30000;
+    setupChartCallout();
     loadData();
     setInterval(loadData, refreshInterval);
     console.log(`Dashboard initialized. Refresh: ${refreshInterval}ms`);
+}
+
+function setupChartCallout() {
+    const callout = document.getElementById('chartCallout');
+    const closeBtn = document.querySelector('.chart-close');
+    
+    closeBtn.onclick = () => { callout.classList.remove('active'); };
+    callout.onclick = (e) => {
+        if (e.target === callout) callout.classList.remove('active');
+    };
 }
 
 // -------------------------------------------------------------------------
@@ -106,23 +119,23 @@ function createSystemCard(systemName, sys) {
             <div class="card-section">
                 <div class="section-label">System</div>
                 <div class="metrics-stats">
-                    <div class="metric-item ${metricClass(m.cpu_percent, 50, 75)}">
+                    <div class="metric-item ${metricClass(m.cpu_percent, 50, 75)}" data-metric="cpu_percent" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">CPU</span>
                         <span class="metric-value">${safeFixed(m.cpu_percent, 1)}%</span>
                     </div>
-                    <div class="metric-item ${metricClass(m.ram_percent, 50, 75)}">
+                    <div class="metric-item ${metricClass(m.ram_percent, 50, 75)}" data-metric="ram_percent" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">RAM</span>
                         <span class="metric-value">${safeFixed(m.ram_percent, 1)}%</span>
                     </div>
-                    <div class="metric-item">
+                    <div class="metric-item" data-metric="uptime_seconds" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">Uptime</span>
                         <span class="metric-value">${escapeHtml(m.uptime_formatted || '0s')}</span>
                     </div>
-                    <div class="metric-item">
+                    <div class="metric-item" data-metric="network_bandwidth_in_mbps" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">↓</span>
                         <span class="metric-value">${safeFixed(m.network_bandwidth_in_mbps, 2)} Mbps</span>
                     </div>
-                    <div class="metric-item">
+                    <div class="metric-item" data-metric="network_bandwidth_out_mbps" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">↑</span>
                         <span class="metric-value">${safeFixed(m.network_bandwidth_out_mbps, 2)} Mbps</span>
                     </div>
@@ -208,8 +221,102 @@ function createSystemCard(systemName, sys) {
         ${diskHtml}
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
+    
+    // Attach click handlers to metric items
+    const metricItems = card.querySelectorAll('[data-metric]');
+    metricItems.forEach(item => {
+        item.addEventListener('click', () => {
+            const system = item.getAttribute('data-system');
+            const metric = item.getAttribute('data-metric');
+            const label = item.querySelector('.metric-label')?.textContent || metric;
+            showMetricChart(system, metric, label);
+        });
+    });
 
     return card;
+}
+
+// -------------------------------------------------------------------------
+// Metric Chart
+// -------------------------------------------------------------------------
+
+function showMetricChart(systemName, metricField, metricLabel) {
+    const callout = document.getElementById('chartCallout');
+    const title = document.getElementById('chartTitle');
+    title.textContent = `${systemName} — ${metricLabel}`;
+    
+    callout.classList.add('active');
+    
+    // Fetch historical data
+    fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?limit=200`)
+        .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+        })
+        .then(data => {
+            renderMetricChart(metricField, metricLabel, data.data);
+        })
+        .catch(err => {
+            console.error('Error fetching metric history:', err);
+            document.getElementById('metricChart').style.display = 'none';
+            const chartContainer = document.querySelector('.chart-container');
+            chartContainer.innerHTML = '<p style="color:#e74c3c;">Unable to load chart data</p>';
+        });
+}
+
+function renderMetricChart(metricField, metricLabel, data) {
+    const canvas = document.getElementById('metricChart');
+    const ctx = canvas.getContext('2d');
+    
+    // Destroy previous chart if it exists
+    if (metricChart) metricChart.destroy();
+    
+    const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+    const values = data.map(d => d.value);
+    
+    // Determine appropriate color based on metric
+    let color = '#3498db';
+    if (metricField === 'cpu_percent' || metricField === 'ram_percent') {
+        color = '#e74c3c';  // Red for percentages
+    } else if (metricField.includes('bandwidth')) {
+        color = '#27ae60';  // Green for network
+    }
+    
+    metricChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: metricLabel,
+                data: values,
+                borderColor: color,
+                backgroundColor: color + '22',  // Semi-transparent
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 2,
+                pointBackgroundColor: color,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: true, position: 'top' },
+                title: { display: false },
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: { display: true, text: metricLabel }
+                },
+                x: {
+                    display: true,
+                    ticks: { maxRotation: 45, minRotation: 0 }
+                }
+            }
+        }
+    });
 }
 
 // -------------------------------------------------------------------------

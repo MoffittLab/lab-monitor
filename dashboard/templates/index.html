@@ -36,6 +36,17 @@
         <section class="nas-grid" id="nasGrid">
             <div class="loading">Loading NAS data...</div>
         </section>
+
+        <!-- Metric Chart Callout -->
+        <div id="chartCallout" class="chart-callout">
+            <div class="chart-callout-content">
+                <span class="chart-close">&times;</span>
+                <h3 id="chartTitle"></h3>
+                <div class="chart-container">
+                    <canvas id="metricChart"></canvas>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
