@@ -118,7 +118,7 @@ def update_system(row: dict, dry_run: bool, timeout: int) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description='Update lab-monitor collectors via SSH')
-    parser.add_argument('--csv',     default='collectors.csv', help='Path to CSV file')
+    parser.add_argument('--csv',     required=True, metavar='PATH', help='Path to collectors.csv inventory file')
     parser.add_argument('--dry-run', action='store_true',      help='Print commands without running')
     parser.add_argument('--timeout', type=int, default=30,     help='SSH timeout in seconds (default 30)')
     args = parser.parse_args()
@@ -126,11 +126,6 @@ def main():
     csv_path = Path(args.csv)
     if not csv_path.exists():
         print(f"ERROR: CSV file not found: {csv_path}")
-        print()
-        print("Create a CSV file with columns: ip, username, password, git_path")
-        print("Example:")
-        print("  ip,username,password,git_path")
-        print("  192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor")
         sys.exit(1)
 
     # Read CSV

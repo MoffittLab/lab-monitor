@@ -46,10 +46,9 @@ atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/Prog
 
 **Usage:**
 ```bash
-python3 update_collectors.py                  # pull latest code
-python3 update_collectors.py --dry-run        # preview without running
-python3 update_collectors.py --csv /path/to/file.csv
-python3 update_collectors.py --timeout 60     # custom SSH timeout
+python3 update_collectors.py --csv collectors.csv
+python3 update_collectors.py --csv collectors.csv --dry-run
+python3 update_collectors.py --csv /path/to/collectors.csv --timeout 60
 ```
 
 **What it does:**
@@ -88,10 +87,10 @@ python3 update_collectors.py
 
 **Usage:**
 ```bash
-python3 toggle_collectors.py --mode off        # pause all
-python3 toggle_collectors.py --mode on         # resume all
-python3 toggle_collectors.py --mode off --dry-run
-python3 toggle_collectors.py --mode off --timeout 30
+python3 toggle_collectors.py --csv collectors.csv --mode off
+python3 toggle_collectors.py --csv collectors.csv --mode on
+python3 toggle_collectors.py --csv collectors.csv --mode off --dry-run
+python3 toggle_collectors.py --csv collectors.csv --mode off --timeout 30
 ```
 
 **What it does:**
@@ -138,10 +137,10 @@ python3 toggle_collectors.py --mode on
 
 **Usage:**
 ```bash
-python3 run_collectors.py --mode disk          # run disk collection
-python3 run_collectors.py --mode metrics       # run metrics collection
-python3 run_collectors.py --mode disk --dry-run
-python3 run_collectors.py --mode metrics --timeout 60
+python3 run_collectors.py --csv collectors.csv --mode disk
+python3 run_collectors.py --csv collectors.csv --mode metrics
+python3 run_collectors.py --csv collectors.csv --mode disk --dry-run
+python3 run_collectors.py --csv collectors.csv --mode metrics --timeout 60
 ```
 
 **What it does:**
@@ -216,26 +215,26 @@ python3 config_tool.py --config config.json set active true --json
 git add . && git commit -m "fix: network stats" && git push
 
 # 2. Update all collectors
-python3 update_collectors.py
+python3 update_collectors.py --csv collectors.csv
 
 # 3. Trigger a fresh collection to test the changes
-python3 run_collectors.py --mode metrics
+python3 run_collectors.py --csv collectors.csv --mode metrics
 ```
 
 ### Perform Lab Maintenance
 
 ```bash
 # 1. Pause all collectors (they stay on schedule, log that they ran, but collect nothing)
-python3 toggle_collectors.py --mode off
+python3 toggle_collectors.py --csv collectors.csv --mode off
 
 # 2. Do your maintenance (reconfigure storage, reboot systems, etc.)
 # ... maintenance work ...
 
 # 3. Resume collectors
-python3 toggle_collectors.py --mode on
+python3 toggle_collectors.py --csv collectors.csv --mode on
 
 # 4. Force an immediate collection to pick up any changes
-python3 run_collectors.py --mode disk
+python3 run_collectors.py --csv collectors.csv --mode disk
 ```
 
 ### Troubleshoot a Failing Collector
@@ -249,8 +248,8 @@ python3 config_tool.py --config /path/on/remote/config.json list --show-secrets
 python3 config_tool.py --config /path/on/remote/config.json set manager_url http://new.server:5000
 
 # 3. Test it
-cd ../..
-python3 tools/run_collectors.py --mode metrics  # will show collector output on next run
+cd ../tools/
+python3 run_collectors.py --csv collectors.csv --mode metrics
 ```
 
 ### Scale Up: Add a New Collector
@@ -260,10 +259,10 @@ python3 tools/run_collectors.py --mode metrics  # will show collector output on 
 # (manual: install miniconda, clone repo, create config.json)
 
 # 2. Add it to collectors.csv
-echo "192.168.1.99,operator,password123,/data/lab-monitor,/opt/miniconda/bin/python" >> tools/collectors.csv
+echo "192.168.1.99,operator,password123,/data/lab-monitor,/opt/miniconda/bin/python" >> collectors.csv
 
 # 3. Test it
-python3 tools/run_collectors.py --mode disk --csv tools/collectors.csv
+python3 run_collectors.py --csv collectors.csv --mode disk
 
 # 4. If it works, add it to update rotation
 # (next time you run update_collectors.py, it'll get the latest code)
@@ -325,19 +324,19 @@ Collection output goes to each collector's logs (e.g., `/volume1/lab-monitor/log
 cd tools/
 
 # Check what's coming
-python3 update_collectors.py --dry-run
+python3 update_collectors.py --csv collectors.csv --dry-run
 
 # Pause all collectors
-python3 toggle_collectors.py --mode off
+python3 toggle_collectors.py --csv collectors.csv --mode off
 
 # Pull latest code on all collectors
-python3 update_collectors.py
+python3 update_collectors.py --csv collectors.csv
 
 # Resume collectors
-python3 toggle_collectors.py --mode on
+python3 toggle_collectors.py --csv collectors.csv --mode on
 
 # Force a fresh collection to test everything
-python3 run_collectors.py --mode metrics
+python3 run_collectors.py --csv collectors.csv --mode metrics
 
 # Check the dashboard to confirm data is flowing
 ```

@@ -215,8 +215,8 @@ def main():
     )
     parser.add_argument('--mode', required=True, choices=['on', 'off'],
                         help='Toggle collectors on or off')
-    parser.add_argument('--csv', default='collectors.csv',
-                        help='Path to CSV file (default: collectors.csv)')
+    parser.add_argument('--csv', required=True, metavar='PATH',
+                        help='Path to collectors.csv inventory file')
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview without making changes')
     parser.add_argument('--timeout', type=int, default=30,
@@ -226,8 +226,6 @@ def main():
     csv_path = Path(args.csv)
     if not csv_path.exists():
         print(f"ERROR: CSV file not found: {csv_path}")
-        print()
-        print("Create a CSV file with columns: ip, username, password, git_path")
         sys.exit(1)
 
     # Read CSV
