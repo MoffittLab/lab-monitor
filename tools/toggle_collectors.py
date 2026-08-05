@@ -31,7 +31,6 @@ Note:
 import argparse
 import csv
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -71,30 +70,30 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 # Config management via config_tool.py
 # ---------------------------------------------------------------------------
 
-def get_config(client, config_path: str, timeout: int) -> dict:
+def get_config(client, git_path: str, timeout: int) -> dict:
     """
     Fetch full config via config_tool.py list --json.
     Returns dict or None on error.
     """
-    command = f'cd {os.path.dirname(config_path)} && python3 config_tool.py --config {os.path.basename(config_path)} list --json'
+    command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json list --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code == 0:
             result = json.loads(stdout)
             if result.get('status') == 'ok':
                 return result.get('config', {})
-    except Exception:
+    except Exception as e:
         pass
     return None
 
 
-def set_active(client, config_path: str, value: bool, timeout: int) -> bool:
+def set_active(client, git_path: str, value: bool, timeout: int) -> bool:
     """
     Set active field via config_tool.py set.
     Returns True on success.
     """
     value_str = 'true' if value else 'false'
-    command = f'cd {os.path.dirname(config_path)} && python3 config_tool.py --config {os.path.basename(config_path)} set active {value_str} --json'
+    command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json set active {value_str} --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code == 0:
@@ -118,9 +117,6 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     username = row['username'].strip()
     password = row.get('password', '').strip()
     git_path = row['git_path'].strip()
-    
-    # Construct config path (assume config.json in git_path)
-    config_path = f"{git_path}/collector/config.json"
 
     result = {
         'ip': ip,
@@ -144,7 +140,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         client = ssh_connect(ip, username, password, timeout)
         try:
             # Get before-state
-            config_before = get_config(client, config_path, timeout)
+            config_before = get_config(client, git_path, timeout)
             if config_before is None:
                 result['status'] = 'failed'
                 result['error'] = 'Could not fetch config before change'
@@ -154,14 +150,14 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
             result['config_before'] = config_before
 
             # Set active field
-            if not set_active(client, config_path, target_value, timeout):
+            if not set_active(client, git_path, target_value, timeout):
                 result['status'] = 'failed'
                 result['error'] = 'Could not set active field'
                 result['elapsed'] = time.time() - start
                 return result
 
             # Get after-state
-            config_after = get_config(client, config_path, timeout)
+            config_after = get_config(client, git_path, timeout)
             if config_after is None:
                 result['status'] = 'failed'
                 result['error'] = 'Could not fetch config after change'
