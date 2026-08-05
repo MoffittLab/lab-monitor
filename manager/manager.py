@@ -830,12 +830,19 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                 })
         
         _logger.info(f"Returning {len(data)} data points for {field}")
-        
+
+        # Return the unit stored alongside the field, if any.
+        # Collectors write a sibling {field}_unit column; we read it from the
+        # most recent record (records are DESC — newest first).
+        unit_field = f"{field}_unit"
+        unit = records[0].get(unit_field) if records else None
+
         return jsonify({
             'system_name': system_name,
-            'data_type': data_type,
-            'field': field,
-            'data': data
+            'data_type':   data_type,
+            'field':       field,
+            'unit':        unit,
+            'data':        data
         }), 200
     
     except Exception as e:

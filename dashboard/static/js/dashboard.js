@@ -10,7 +10,17 @@ let refreshInterval = 30000;
 
 let metricChart = null;  // Global Chart.js instance
 
-// Unit metadata for system_metrics fields — inferred from field names
+// Base-unit → display parameters.  The collector declares what unit it
+// measures in; this table says how to present that unit on a chart.
+// Falls back to METRIC_UNITS below for legacy/unknown fields.
+const BASE_UNIT_DISPLAY = {
+    '%':     { unit: '%',     scale: 1,             decimals: 1, beginAtZero: true  },
+    's':     { unit: ' h',    scale: 1 / 3600,      decimals: 1, beginAtZero: false },
+    'Mbps':  { unit: ' Mbps', scale: 1,             decimals: 2, beginAtZero: true  },
+    'bytes': { unit: ' GB',   scale: 1 / 1073741824,decimals: 2, beginAtZero: false },
+};
+
+// Field-name fallback for metrics that predate unit fields in the collector
 const METRIC_UNITS = {
     cpu_percent:                { yLabel: 'CPU Usage (%)',    unit: '%',     decimals: 1, scale: 1,             beginAtZero: true  },
     ram_percent:                { yLabel: 'RAM Usage (%)',    unit: '%',     decimals: 1, scale: 1,             beginAtZero: true  },
@@ -276,12 +286,17 @@ function showMetricChart(systemName, metricField, metricLabel) {
             return r.json();
         })
         .then(data => {
-            if (data.error) {
-                throw new Error(data.error);
-            }
+            if (data.error) throw new Error(data.error);
+
+            // Resolve display info: API unit takes priority, then field-name map
+            const base = data.unit && BASE_UNIT_DISPLAY[data.unit];
+            const info = base
+                ? { ...base, yLabel: `${metricLabel} (${base.unit.trim()})` }
+                : (METRIC_UNITS[metricField] || { yLabel: metricLabel, unit: '', decimals: 2, scale: 1, beginAtZero: true });
+
             const n = (data.data || []).length;
             title.textContent = `${systemName} — ${metricLabel} (${n} measurements)`;
-            renderMetricChart(metricField, metricLabel, data.data);
+            renderMetricChart(metricField, metricLabel, info, data.data);
         })
         .catch(err => {
             console.error('Error fetching metric history:', err);
@@ -292,13 +307,13 @@ function showMetricChart(systemName, metricField, metricLabel) {
         });
 }
 
-function renderMetricChart(metricField, metricLabel, data) {
+function renderMetricChart(metricField, metricLabel, info, data) {
+    // info is pre-resolved by the caller: BASE_UNIT_DISPLAY (from API unit)
+    // or METRIC_UNITS (field-name fallback for older data).
     const canvas = document.getElementById('metricChart');
     const ctx = canvas.getContext('2d');
 
     if (metricChart) metricChart.destroy();
-
-    const info = METRIC_UNITS[metricField] || { yLabel: metricLabel, unit: '', decimals: 2, scale: 1, beginAtZero: true };
 
     const labels = formatChartTimestamps(data);
     const values = data.map(d => (d.value != null) ? +(d.value * info.scale) : null);

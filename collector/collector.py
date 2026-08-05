@@ -227,10 +227,11 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
             entry = {
                 'header': build_header(name, system_id, device_type),
                 'data': {
-                    'data_type':   'folder_usage',
+                    'data_type':        'folder_usage',
                     **volume_used,      # /volume1: used_bytes (shutil)
                     **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes
-                    'total_usage': total_usage,
+                    'total_usage':      total_usage,
+                    'total_usage_unit': 'bytes',
                 }
             }
 
@@ -280,7 +281,8 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                     **intermediate_sums, # /volume/tier2: tier2 sums for scan_depth>=3 (from scan)
                     **volume_used,      # /volume: used bytes (shutil, authoritative)
                     **volume_capacity,  # /volume_total_bytes, /volume_free_bytes
-                    'total_usage': total_usage,
+                    'total_usage':      total_usage,
+                    'total_usage_unit': 'bytes',
                 }
             }
         # Append to local archive
@@ -325,19 +327,29 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         
         logger.info(f"CPU: {cpu_percent}% | RAM: {ram_percent}% | Uptime: {uptime_formatted} | Network: {network_stats}")
         
-        # Create message (header + data)
+        # Create message (header + data).
+        # Each numeric field is accompanied by a sibling *_unit field so any
+        # consumer (dashboard, downstream scripts) can interpret values
+        # correctly without hardcoding field-name→unit mappings.
         entry = {
             'header': build_header(name, system_id, device_type),
             'data': {
-                'data_type':                    'system_metrics',
-                'cpu_percent':                  cpu_percent,
-                'ram_percent':                  ram_percent,
-                'uptime_seconds':               uptime_seconds,
-                'uptime_formatted':             uptime_formatted,
-                'network_bytes_in':             network_stats.get('bytes_in', 0),
-                'network_bytes_out':            network_stats.get('bytes_out', 0),
-                'network_bandwidth_in_mbps':    network_stats.get('bandwidth_in_mbps', 0.0),
-                'network_bandwidth_out_mbps':   network_stats.get('bandwidth_out_mbps', 0.0),
+                'data_type':                        'system_metrics',
+                'cpu_percent':                      cpu_percent,
+                'cpu_percent_unit':                 '%',
+                'ram_percent':                      ram_percent,
+                'ram_percent_unit':                 '%',
+                'uptime_seconds':                   uptime_seconds,
+                'uptime_seconds_unit':              's',
+                'uptime_formatted':                 uptime_formatted,
+                'network_bytes_in':                 network_stats.get('bytes_in', 0),
+                'network_bytes_in_unit':            'bytes',
+                'network_bytes_out':                network_stats.get('bytes_out', 0),
+                'network_bytes_out_unit':           'bytes',
+                'network_bandwidth_in_mbps':        network_stats.get('bandwidth_in_mbps', 0.0),
+                'network_bandwidth_in_mbps_unit':   'Mbps',
+                'network_bandwidth_out_mbps':       network_stats.get('bandwidth_out_mbps', 0.0),
+                'network_bandwidth_out_mbps_unit':  'Mbps',
             }
         }
         
