@@ -108,7 +108,7 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
 
     # Construct the collection command
     # Format: cd {git_path} && {python_path} collector/collector.py --config collector/config.json --mode {mode}
-    command = f'cd "{git_path}" && "{python_path}" collector/collector.py --config collector/config.json --mode {mode}'
+    command = f'cd "{git_path}" && "{python_path}" collector/collector.py --config collector/local/config.json --mode {mode}'
 
     if dry_run:
         result['status'] = 'dry-run'

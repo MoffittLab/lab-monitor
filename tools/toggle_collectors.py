@@ -96,8 +96,8 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     Fetch full config via config_tool.py list --json.
     Returns (config_dict, None) on success, (None, error_str) on failure.
     """
-    vprint(f"Fetching config from {git_path}/collector/config.json")
-    command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json list --json'
+    vprint(f"Fetching config from {git_path}/collector/local/config.json")
+    command = f'cd "{git_path}/collector" && python3 config_tool.py --config local/config.json list --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code != 0:
@@ -118,9 +118,9 @@ def set_active(client, git_path: str, value: bool, timeout: int) -> tuple:
     Set active field via config_tool.py set.
     Returns (True, None) on success, (False, error_str) on failure.
     """
-    vprint(f"Setting active={value} on {git_path}/collector/config.json")
+    vprint(f"Setting active={value} on {git_path}/collector/local/config.json")
     value_str = 'true' if value else 'false'
-    command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json set active {value_str} --json'
+    command = f'cd "{git_path}/collector" && python3 config_tool.py --config local/config.json set active {value_str} --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code != 0:
