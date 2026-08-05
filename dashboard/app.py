@@ -121,7 +121,8 @@ def parse_folder_usage(raw: dict) -> dict:
             total_usage_formatted: str
         }
     """
-    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp', 'total_disk_bytes'}
+    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp', 'total_disk_bytes', '_unit'}
+    unit_default = raw.get('_unit')  # message-level unit default for all numeric fields
 
     folders  = {}
     volumes  = {}
@@ -192,6 +193,7 @@ def parse_folder_usage(raw: dict) -> dict:
         'volumes':               vol_list,
         'total_usage_bytes':     total,
         'total_usage_formatted': format_bytes(total),
+        'units':                 {'_unit': unit_default} if unit_default else {},
     }
 
 
@@ -247,6 +249,7 @@ def get_all_systems_data() -> tuple:
             'network_bytes_out':            data.get('network_bytes_out', 0),
             'network_bandwidth_in_mbps':    data.get('network_bandwidth_in_mbps', 0.0),
             'network_bandwidth_out_mbps':   data.get('network_bandwidth_out_mbps', 0.0),
+            'units':                        data.get('units', {}),
         }
 
     # --- disk snapshots ---

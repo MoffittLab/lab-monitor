@@ -77,9 +77,17 @@ class MetricsDB:
                 network_bandwidth_out_mbps  REAL    DEFAULT 0,
                 disk_timestamp              DATETIME,
                 total_disk_bytes            INTEGER DEFAULT 0,
-                folders_json                TEXT    DEFAULT '{}'
+                folders_json                TEXT    DEFAULT '{}',
+                metrics_json                TEXT    DEFAULT '{}'
             )
         ''')
+        # Migration: add metrics_json to existing databases that pre-date it
+        try:
+            self.db.execute("ALTER TABLE device_snapshot ADD COLUMN metrics_json TEXT DEFAULT '{}'")
+            self.db.commit()
+            logger.info("Migrated device_snapshot: added metrics_json column")
+        except Exception:
+            pass  # column already exists
 
         # ---- running cumulative counters ------------------------------ #
         self.db.execute('''
@@ -122,13 +130,28 @@ class MetricsDB:
     # Write — snapshot                                                     #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _extract_units(data: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Pull all unit fields out of a raw payload dict.
+        Captures both per-field siblings ({field}_unit) and the
+        message-level default (_unit).
+        """
+        return {k: v for k, v in data.items()
+                if k == '_unit' or k.endswith('_unit')}
+
     def update_snapshot_metrics(self, name: str, timestamp: str,
                                  data: Dict[str, Any]) -> bool:
         """
         Update the metrics columns of device_snapshot from a system_metrics payload.
+        Also stores the full raw payload as metrics_json so unit fields and any
+        future collector additions are preserved alongside the fast-access columns.
         Creates the row if it doesn't exist yet (disk columns default to empty).
         """
         try:
+            metrics_json = json.dumps(
+                {k: v for k, v in data.items() if k != 'data_type'}
+            )
             self.db.execute(
                 'INSERT OR IGNORE INTO device_snapshot (name) VALUES (?)', (name,)
             )
@@ -140,7 +163,8 @@ class MetricsDB:
                     uptime_seconds             = ?,
                     uptime_formatted           = ?,
                     network_bandwidth_in_mbps  = ?,
-                    network_bandwidth_out_mbps = ?
+                    network_bandwidth_out_mbps = ?,
+                    metrics_json               = ?
                 WHERE name = ?
             ''', (
                 timestamp,
@@ -150,6 +174,7 @@ class MetricsDB:
                 data.get('uptime_formatted', '0s'),
                 data.get('network_bandwidth_in_mbps', 0.0),
                 data.get('network_bandwidth_out_mbps', 0.0),
+                metrics_json,
                 name,
             ))
             self.db.commit()
@@ -335,6 +360,7 @@ class MetricsDB:
         """
         Latest system_metrics snapshot for every system.
         Shape compatible with /api/metrics/all dashboard calls.
+        Includes a 'units' dict extracted from metrics_json.
         """
         result = {}
         cursor = self.db.execute('''
@@ -344,6 +370,7 @@ class MetricsDB:
                    s.uptime_seconds, s.uptime_formatted,
                    s.network_bandwidth_in_mbps,
                    s.network_bandwidth_out_mbps,
+                   s.metrics_json,
                    t.last_bytes_in  AS network_bytes_in,
                    t.last_bytes_out AS network_bytes_out
             FROM devices d
@@ -354,6 +381,11 @@ class MetricsDB:
         ''')
         for row in cursor.fetchall():
             d = dict(row)
+            try:
+                raw = json.loads(d.pop('metrics_json') or '{}')
+            except Exception:
+                raw = {}
+            d['units'] = self._extract_units(raw)
             result[d['name']] = d
         return result
 

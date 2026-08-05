@@ -136,17 +136,18 @@ function createSystemCard(systemName, sys) {
     let metricsHtml = '';
     if (sys.metrics) {
         const m = sys.metrics;
+        const u = m.units || {};
         metricsHtml = `
             <div class="card-section">
                 <div class="section-label">System</div>
                 <div class="metrics-stats">
                     <div class="metric-item ${metricClass(m.cpu_percent, 50, 75)}" data-metric="cpu_percent" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">CPU</span>
-                        <span class="metric-value">${safeFixed(m.cpu_percent, 1)}%</span>
+                        <span class="metric-value">${safeFixed(m.cpu_percent, 1)}${unitSuffix(u.cpu_percent || '%')}</span>
                     </div>
                     <div class="metric-item ${metricClass(m.ram_percent, 50, 75)}" data-metric="ram_percent" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">RAM</span>
-                        <span class="metric-value">${safeFixed(m.ram_percent, 1)}%</span>
+                        <span class="metric-value">${safeFixed(m.ram_percent, 1)}${unitSuffix(u.ram_percent || '%')}</span>
                     </div>
                     <div class="metric-item" data-metric="uptime_seconds" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">Uptime</span>
@@ -154,11 +155,11 @@ function createSystemCard(systemName, sys) {
                     </div>
                     <div class="metric-item" data-metric="network_bandwidth_in_mbps" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">↓</span>
-                        <span class="metric-value">${safeFixed(m.network_bandwidth_in_mbps, 2)} Mbps</span>
+                        <span class="metric-value">${safeFixed(m.network_bandwidth_in_mbps, 2)}${unitSuffix(u.network_bandwidth_in_mbps || 'Mbps')}</span>
                     </div>
                     <div class="metric-item" data-metric="network_bandwidth_out_mbps" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <span class="metric-label">↑</span>
-                        <span class="metric-value">${safeFixed(m.network_bandwidth_out_mbps, 2)} Mbps</span>
+                        <span class="metric-value">${safeFixed(m.network_bandwidth_out_mbps, 2)}${unitSuffix(u.network_bandwidth_out_mbps || 'Mbps')}</span>
                     </div>
                 </div>
             </div>`;
@@ -498,6 +499,14 @@ function formatBytes(bytes) {
         v /= 1024;
     }
     return `${v.toFixed(2)} PB`;
+}
+
+// Resolve a display suffix from a raw unit string using BASE_UNIT_DISPLAY.
+// Falls back to ' {unit}' (with space) for unknown units, '' for null/undefined.
+function unitSuffix(unitStr) {
+    if (!unitStr) return '';
+    const base = BASE_UNIT_DISPLAY[unitStr];
+    return base ? base.unit : ` ${unitStr}`;
 }
 
 // Smart timestamp labels: date-only for multi-day spans (e.g. daily disk), time-only for intraday
