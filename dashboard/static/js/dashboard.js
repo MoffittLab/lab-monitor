@@ -1,5 +1,5 @@
 /**
- * Lab Monitor Dashboard — Frontend Logic
+ * Lab Monitor Dashboard - Frontend Logic
  */
 
 let refreshInterval = 30000;
@@ -21,7 +21,7 @@ function initDashboard(config) {
 function setupChartCallout() {
     const callout = document.getElementById('chartCallout');
     const closeBtn = document.querySelector('.chart-close');
-    
+
     closeBtn.onclick = () => { callout.classList.remove('active'); };
     callout.onclick = (e) => {
         if (e.target === callout) callout.classList.remove('active');
@@ -97,7 +97,7 @@ function updateSummary(globalTotals) {
     const storageUsed = globalTotals.total_storage_used     || 0;
     const storageCap  = globalTotals.total_storage_capacity || 0;
     document.getElementById('totalStorage').textContent =
-        storageCap > 0 ? `${formatBytes(storageUsed)} of ${formatBytes(storageCap)}` : '—';
+        storageCap > 0 ? `${formatBytes(storageUsed)} of ${formatBytes(storageCap)}` : '-';
 }
 
 // -------------------------------------------------------------------------
@@ -151,7 +151,7 @@ function createSystemCard(systemName, sys) {
     if (sys.disk) {
         const d = sys.disk;
 
-        // Volume buttons — one per volume, "volume1: XX of YY" + progress bar
+        // Volume buttons - one per volume, "volume1: XX of YY" + progress bar
         let volHtml = '';
         for (const vol of (d.volumes || [])) {
             const volLabel = vol.path.replace(/^\//, '');  // strip leading slash
@@ -159,7 +159,7 @@ function createSystemCard(systemName, sys) {
                 const pct      = Math.min(100, Math.round((vol.usage_bytes / vol.total_bytes) * 100));
                 const barClass = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : '';
                 volHtml += `
-                    <div class="volume-btn">
+                    <div class="volume-btn" data-volume="${escapeHtml(vol.path)}" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                         <div class="volume-btn-label">
                             <span class="volume-btn-name">${escapeHtml(volLabel)}</span>
                             <span class="volume-btn-usage">${escapeHtml(vol.usage_formatted)} of ${escapeHtml(vol.total_formatted)}</span>
@@ -186,7 +186,7 @@ function createSystemCard(systemName, sys) {
                 </div>`;
         }
 
-        // Shared folders only — sorted largest to smallest, all shown
+        // Shared folders only - sorted largest to smallest, all shown
         const folders = [...(d.folders || [])].sort((a, b) => b.usage_bytes - a.usage_bytes);
         let folderHtml = '';
         for (const f of folders) {
@@ -221,7 +221,7 @@ function createSystemCard(systemName, sys) {
         ${diskHtml}
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
-    
+
     // Attach click handlers to metric items
     const metricItems = card.querySelectorAll('[data-metric]');
     metricItems.forEach(item => {
@@ -230,6 +230,17 @@ function createSystemCard(systemName, sys) {
             const metric = item.getAttribute('data-metric');
             const label = item.querySelector('.metric-label')?.textContent || metric;
             showMetricChart(system, metric, label);
+        });
+    });
+
+    // Attach click handlers to volume buttons
+    const volumeButtons = card.querySelectorAll('[data-volume]');
+    volumeButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const system = btn.getAttribute('data-system');
+            const volume = btn.getAttribute('data-volume');
+            const label = btn.querySelector('.volume-btn-name')?.textContent || volume;
+            showVolumeChart(system, volume, label);
         });
     });
 
@@ -243,10 +254,10 @@ function createSystemCard(systemName, sys) {
 function showMetricChart(systemName, metricField, metricLabel) {
     const callout = document.getElementById('chartCallout');
     const title = document.getElementById('chartTitle');
-    title.textContent = `${systemName} — ${metricLabel}`;
-    
+    title.textContent = `${systemName} - ${metricLabel}`;
+
     callout.classList.add('active');
-    
+
     // Fetch historical data
     fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?limit=200`)
         .then(r => {
@@ -323,6 +334,81 @@ function renderMetricChart(metricField, metricLabel, data) {
     });
 }
 
+function showVolumeChart(systemName, volumePath, volumeLabel) {
+    const callout = document.getElementById('chartCallout');
+    const title = document.getElementById('chartTitle');
+    title.textContent = `${systemName} — ${volumeLabel} Usage`;
+    
+    callout.classList.add('active');
+    
+    // Fetch volume usage history from folder_usage table
+    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(volumePath)}?limit=200`)
+        .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+        })
+        .then(data => {
+            if (data.error) {
+                throw new Error(data.error);
+            }
+            renderVolumeChart(volumeLabel, data.data);
+        })
+        .catch(err => {
+            console.error('Error fetching volume history:', err);
+            const chartContainer = document.querySelector('.chart-container');
+            if (chartContainer) {
+                chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            }
+        });
+}
+
+function renderVolumeChart(volumeLabel, data) {
+    const canvas = document.getElementById('metricChart');
+    const ctx = canvas.getContext('2d');
+    
+    // Destroy previous chart if it exists
+    if (metricChart) metricChart.destroy();
+    
+    const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+    const usedValues = data.map(d => d.value / (1024 ** 3));  // Convert to GB
+    
+    metricChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: `${volumeLabel} Used`,
+                data: usedValues,
+                borderColor: '#3498db',
+                backgroundColor: '#3498db22',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 2,
+                pointBackgroundColor: '#3498db',
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: true, position: 'top' },
+                title: { display: false },
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Usage (GB)' }
+                },
+                x: {
+                    display: true,
+                    ticks: { maxRotation: 45, minRotation: 0 }
+                }
+            }
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Utilities
 // -------------------------------------------------------------------------
@@ -346,7 +432,7 @@ function formatTimestamp(ts) {
 
 function safeFixed(val, decimals) {
     const n = parseFloat(val);
-    return isNaN(n) ? '—' : n.toFixed(decimals);
+    return isNaN(n) ? '-' : n.toFixed(decimals);
 }
 
 function formatBytes(bytes) {
