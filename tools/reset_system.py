@@ -34,6 +34,7 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 try:
     import requests
@@ -57,7 +58,7 @@ def find_archives(data_dir: str, name: str) -> list:
     )
 
 
-def find_queue(data_dir: str, name: str) -> str | None:
+def find_queue(data_dir: str, name: str) -> Optional[str]:
     """Return queue.json path if it exists."""
     queue_path = os.path.join(data_dir, name, 'queue.json')
     return queue_path if os.path.exists(queue_path) else None
