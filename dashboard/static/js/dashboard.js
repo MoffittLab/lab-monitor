@@ -10,6 +10,17 @@ let refreshInterval = 30000;
 
 let metricChart = null;  // Global Chart.js instance
 
+// Unit metadata for system_metrics fields — inferred from field names
+const METRIC_UNITS = {
+    cpu_percent:                { yLabel: 'CPU Usage (%)',    unit: '%',     decimals: 1, scale: 1,             beginAtZero: true  },
+    ram_percent:                { yLabel: 'RAM Usage (%)',    unit: '%',     decimals: 1, scale: 1,             beginAtZero: true  },
+    uptime_seconds:             { yLabel: 'Uptime (hours)',   unit: ' h',    decimals: 1, scale: 1 / 3600,      beginAtZero: false },
+    network_bandwidth_in_mbps:  { yLabel: 'Download (Mbps)', unit: ' Mbps', decimals: 2, scale: 1,             beginAtZero: true  },
+    network_bandwidth_out_mbps: { yLabel: 'Upload (Mbps)',   unit: ' Mbps', decimals: 2, scale: 1,             beginAtZero: true  },
+    network_bytes_in:           { yLabel: 'Data In (GB)',     unit: ' GB',   decimals: 2, scale: 1 / 1073741824, beginAtZero: false },
+    network_bytes_out:          { yLabel: 'Data Out (GB)',    unit: ' GB',   decimals: 2, scale: 1 / 1073741824, beginAtZero: false },
+};
+
 function initDashboard(config) {
     refreshInterval = config.refreshInterval || 30000;
     setupChartCallout();
@@ -268,6 +279,8 @@ function showMetricChart(systemName, metricField, metricLabel) {
             if (data.error) {
                 throw new Error(data.error);
             }
+            const n = (data.data || []).length;
+            title.textContent = `${systemName} — ${metricLabel} (${n} measurements)`;
             renderMetricChart(metricField, metricLabel, data.data);
         })
         .catch(err => {
@@ -282,21 +295,22 @@ function showMetricChart(systemName, metricField, metricLabel) {
 function renderMetricChart(metricField, metricLabel, data) {
     const canvas = document.getElementById('metricChart');
     const ctx = canvas.getContext('2d');
-    
-    // Destroy previous chart if it exists
+
     if (metricChart) metricChart.destroy();
-    
-    const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
-    const values = data.map(d => d.value);
-    
-    // Determine appropriate color based on metric
+
+    const info = METRIC_UNITS[metricField] || { yLabel: metricLabel, unit: '', decimals: 2, scale: 1, beginAtZero: true };
+
+    const labels = formatChartTimestamps(data);
+    const values = data.map(d => (d.value != null) ? +(d.value * info.scale) : null);
+
+    // Color by metric type
     let color = '#3498db';
     if (metricField === 'cpu_percent' || metricField === 'ram_percent') {
-        color = '#e74c3c';  // Red for percentages
+        color = '#e74c3c';
     } else if (metricField.includes('bandwidth')) {
-        color = '#27ae60';  // Green for network
+        color = '#27ae60';
     }
-    
+
     metricChart = new Chart(ctx, {
         type: 'line',
         data: {
@@ -305,7 +319,7 @@ function renderMetricChart(metricField, metricLabel, data) {
                 label: metricLabel,
                 data: values,
                 borderColor: color,
-                backgroundColor: color + '22',  // Semi-transparent
+                backgroundColor: color + '22',
                 borderWidth: 2,
                 fill: true,
                 tension: 0.4,
@@ -318,12 +332,19 @@ function renderMetricChart(metricField, metricLabel, data) {
             maintainAspectRatio: false,
             plugins: {
                 legend: { display: true, position: 'top' },
-                title: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${(+ctx.parsed.y).toFixed(info.decimals)}${info.unit}`
+                    }
+                }
             },
             scales: {
                 y: {
-                    beginAtZero: true,
-                    title: { display: true, text: metricLabel }
+                    beginAtZero: info.beginAtZero,
+                    title: { display: true, text: info.yLabel },
+                    ticks: {
+                        callback: v => `${(+v).toFixed(info.decimals)}${info.unit}`
+                    }
                 },
                 x: {
                     display: true,
@@ -351,6 +372,8 @@ function showVolumeChart(systemName, volumePath, volumeLabel) {
             if (data.error) {
                 throw new Error(data.error);
             }
+            const n = (data.data || []).length;
+            title.textContent = `${systemName} — ${volumeLabel} Usage (${n} measurements)`;
             renderVolumeChart(volumeLabel, data.data);
         })
         .catch(err => {
@@ -365,20 +388,28 @@ function showVolumeChart(systemName, volumePath, volumeLabel) {
 function renderVolumeChart(volumeLabel, data) {
     const canvas = document.getElementById('metricChart');
     const ctx = canvas.getContext('2d');
-    
-    // Destroy previous chart if it exists
+
     if (metricChart) metricChart.destroy();
-    
-    const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
-    const usedValues = data.map(d => d.value / (1024 ** 3));  // Convert to GB
-    
+
+    const labels = formatChartTimestamps(data);
+
+    // Auto-scale: use TB if any value >= 1 TB, else GB
+    const rawValues = data.map(d => d.value || 0);
+    const maxBytes  = Math.max(...rawValues, 0);
+    const useTB     = maxBytes >= 1099511627776;  // 1 TiB
+    const divisor   = useTB ? 1099511627776 : 1073741824;
+    const unitStr   = useTB ? 'TB' : 'GB';
+    const decimals  = 2;
+
+    const scaledValues = rawValues.map(v => +(v / divisor).toFixed(decimals));
+
     metricChart = new Chart(ctx, {
         type: 'line',
         data: {
             labels: labels,
             datasets: [{
                 label: `${volumeLabel} Used`,
-                data: usedValues,
+                data: scaledValues,
                 borderColor: '#3498db',
                 backgroundColor: '#3498db22',
                 borderWidth: 2,
@@ -393,12 +424,19 @@ function renderVolumeChart(volumeLabel, data) {
             maintainAspectRatio: false,
             plugins: {
                 legend: { display: true, position: 'top' },
-                title: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${(+ctx.parsed.y).toFixed(decimals)} ${unitStr}`
+                    }
+                }
             },
             scales: {
                 y: {
-                    beginAtZero: true,
-                    title: { display: true, text: 'Usage (GB)' }
+                    beginAtZero: false,
+                    title: { display: true, text: `Usage (${unitStr})` },
+                    ticks: {
+                        callback: v => `${(+v).toFixed(decimals)} ${unitStr}`
+                    }
                 },
                 x: {
                     display: true,
@@ -445,6 +483,19 @@ function formatBytes(bytes) {
         v /= 1024;
     }
     return `${v.toFixed(2)} PB`;
+}
+
+// Smart timestamp labels: date-only for multi-day spans (e.g. daily disk), time-only for intraday
+function formatChartTimestamps(data) {
+    if (!data.length) return [];
+    const times  = data.map(d => new Date(d.timestamp));
+    const spanMs = times[times.length - 1] - times[0];
+    if (spanMs > 18 * 3600 * 1000) {
+        // Multi-day: show "Aug 4" style
+        return times.map(d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+    }
+    // Intraday: show HH:MM
+    return times.map(d => d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }));
 }
 
 function escapeHtml(text) {
