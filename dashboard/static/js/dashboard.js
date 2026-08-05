@@ -254,13 +254,16 @@ function showMetricChart(systemName, metricField, metricLabel) {
             return r.json();
         })
         .then(data => {
+            if (data.error) {
+                throw new Error(data.error);
+            }
             renderMetricChart(metricField, metricLabel, data.data);
         })
         .catch(err => {
             console.error('Error fetching metric history:', err);
             document.getElementById('metricChart').style.display = 'none';
             const chartContainer = document.querySelector('.chart-container');
-            chartContainer.innerHTML = '<p style="color:#e74c3c;">Unable to load chart data</p>';
+            chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
         });
 }
 

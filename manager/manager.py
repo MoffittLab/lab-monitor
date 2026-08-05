@@ -793,7 +793,24 @@ def get_metric_history(system_name: str, data_type: str, field: str):
     limit = min(limit, 500)  # cap at 500 to prevent abuse
     
     try:
+        if not _data_store:
+            return jsonify({'error': 'Data store not initialized'}), 500
+        
+        _logger.info(f"Fetching history: {system_name}/{data_type}/{field} (limit={limit})")
         records = _data_store.get_recent(system_name, data_type, limit=limit)
+        _logger.info(f"Got {len(records)} records for {system_name}/{data_type}")
+        
+        if not records:
+            _logger.warning(f"No records found for {system_name}/{data_type}")
+            return jsonify({
+                'system_name': system_name,
+                'data_type': data_type,
+                'field': field,
+                'data': []
+            }), 200
+        
+        # Log what fields are available
+        _logger.info(f"Available fields in first record: {list(records[0].keys())}")
         
         # Extract timestamps and the requested field
         data = []
@@ -812,6 +829,8 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                     'value': float(val) if val is not None else None
                 })
         
+        _logger.info(f"Returning {len(data)} data points for {field}")
+        
         return jsonify({
             'system_name': system_name,
             'data_type': data_type,
@@ -820,7 +839,7 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         }), 200
     
     except Exception as e:
-        _logger.error(f"Error fetching history for {system_name}/{data_type}/{field}: {e}")
+        _logger.error(f"Error fetching history for {system_name}/{data_type}/{field}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
