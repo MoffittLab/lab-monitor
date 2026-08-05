@@ -51,15 +51,8 @@ function updateDashboard(data) {
 
     if (names.length === 0) {
         nasGrid.innerHTML = '<div class="loading">No systems reporting yet</div>';
-        updateSummary({}, globalTotals);
+        updateSummary(globalTotals);
         return;
-    }
-
-    // Device type counts
-    const deviceTypeCounts = {};
-    for (const sys of Object.values(systems)) {
-        const dt = sys.device_type || 'unknown';
-        deviceTypeCounts[dt] = (deviceTypeCounts[dt] || 0) + 1;
     }
 
     // Total storage: sum used and capacity across all volumes on all systems
@@ -74,7 +67,7 @@ function updateDashboard(data) {
     globalTotals.total_storage_used     = totalStorageUsed;
     globalTotals.total_storage_capacity = totalStorageCapacity;
 
-    updateSummary(deviceTypeCounts, globalTotals);
+    updateSummary(globalTotals);
 
     // Render cards
     nasGrid.innerHTML = '';
@@ -83,19 +76,7 @@ function updateDashboard(data) {
     }
 }
 
-function updateSummary(deviceTypeCounts, globalTotals) {
-    // Device type table
-    const tableDiv = document.getElementById('deviceTypeTable');
-    let html = '<table style="width:100%;font-size:14px;border-collapse:collapse;">';
-    for (const [type, count] of Object.entries(deviceTypeCounts).sort()) {
-        html += `<tr style="border-bottom:1px solid #ddd;">
-                   <td style="padding:6px;">${escapeHtml(type)}</td>
-                   <td style="padding:6px;text-align:right;">${count}</td>
-                 </tr>`;
-    }
-    html += '</table>';
-    tableDiv.innerHTML = html;
-
+function updateSummary(globalTotals) {
     // Global totals come from server-side accumulation (survives reboots)
     document.getElementById('lifetimeTransferIn').innerHTML  = formatBytes(globalTotals.total_bytes_in  || 0) + ' <span class="transfer-label">in</span>';
     document.getElementById('lifetimeTransferOut').innerHTML = formatBytes(globalTotals.total_bytes_out || 0) + ' <span class="transfer-label">out</span>';
