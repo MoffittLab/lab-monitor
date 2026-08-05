@@ -38,11 +38,25 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Verbose logging
+# ---------------------------------------------------------------------------
+
+_verbose = False
+
+def vprint(msg: str):
+    """Print if verbose mode is enabled."""
+    if _verbose:
+        print(f"  [v] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
 def ssh_connect(ip: str, username: str, password: str, timeout: int):
     """Open an SSH connection. Uses key auth if password is blank."""
+    auth = 'password' if password else 'key/agent'
+    vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kwargs = dict(hostname=ip, username=username, timeout=timeout)
@@ -52,14 +66,21 @@ def ssh_connect(ip: str, username: str, password: str, timeout: int):
         kwargs['look_for_keys'] = True
         kwargs['allow_agent'] = True
     client.connect(**kwargs)
+    vprint(f"Connected to {ip}")
     return client
 
 
 def run_remote(client, command: str, timeout: int) -> tuple:
     """Run a command remotely. Returns (stdout, stderr, exit_code)."""
+    vprint(f"→ {command}")
     _, stdout, stderr = client.exec_command(command, timeout=timeout)
     exit_code = stdout.channel.recv_exit_status()
-    return stdout.read().decode().strip(), stderr.read().decode().strip(), exit_code
+    out = stdout.read().decode().strip()
+    err = stderr.read().decode().strip()
+    vprint(f"← exit {exit_code}")
+    if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
+    if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
+    return out, err, exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +117,8 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
 
     start = time.time()
     try:
+        vprint(f"--- {ip} ---")
+        vprint(f"Mode: {mode} | python: {python_path}")
         client = ssh_connect(ip, username, password, timeout)
         try:
             stdout, stderr, exit_code = run_remote(client, command, timeout)
@@ -142,7 +165,12 @@ def main():
                         help='Preview commands without running')
     parser.add_argument('--timeout', type=int, default=60,
                         help='SSH timeout in seconds (default: 60)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
+
+    global _verbose
+    _verbose = args.verbose
 
     csv_path = Path(args.csv)
     if not csv_path.exists():

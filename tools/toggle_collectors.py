@@ -42,11 +42,25 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Verbose logging
+# ---------------------------------------------------------------------------
+
+_verbose = False
+
+def vprint(msg: str):
+    """Print if verbose mode is enabled."""
+    if _verbose:
+        print(f"  [v] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
 def ssh_connect(ip: str, username: str, password: str, timeout: int):
     """Open an SSH connection. Uses key auth if password is blank."""
+    auth = 'password' if password else 'key/agent'
+    vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kwargs = dict(hostname=ip, username=username, timeout=timeout)
@@ -56,14 +70,21 @@ def ssh_connect(ip: str, username: str, password: str, timeout: int):
         kwargs['look_for_keys'] = True
         kwargs['allow_agent']   = True
     client.connect(**kwargs)
+    vprint(f"Connected to {ip}")
     return client
 
 
 def run_remote(client, command: str, timeout: int) -> tuple:
     """Run a command remotely. Returns (stdout, stderr, exit_code)."""
+    vprint(f"→ {command}")
     _, stdout, stderr = client.exec_command(command, timeout=timeout)
     exit_code = stdout.channel.recv_exit_status()
-    return stdout.read().decode().strip(), stderr.read().decode().strip(), exit_code
+    out = stdout.read().decode().strip()
+    err = stderr.read().decode().strip()
+    vprint(f"← exit {exit_code}")
+    if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
+    if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
+    return out, err, exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +96,7 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     Fetch full config via config_tool.py list --json.
     Returns (config_dict, None) on success, (None, error_str) on failure.
     """
+    vprint(f"Fetching config from {git_path}/collector/config.json")
     command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json list --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
@@ -96,6 +118,7 @@ def set_active(client, git_path: str, value: bool, timeout: int) -> tuple:
     Set active field via config_tool.py set.
     Returns (True, None) on success, (False, error_str) on failure.
     """
+    vprint(f"Setting active={value} on {git_path}/collector/config.json")
     value_str = 'true' if value else 'false'
     command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json set active {value_str} --json'
     try:
@@ -146,6 +169,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
 
     start = time.time()
     try:
+        vprint(f"--- {ip} ---")
         client = ssh_connect(ip, username, password, timeout)
         try:
             # Get before-state
@@ -227,7 +251,12 @@ def main():
                         help='Preview without making changes')
     parser.add_argument('--timeout', type=int, default=30,
                         help='SSH timeout in seconds (default: 30)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
+
+    global _verbose
+    _verbose = args.verbose
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
