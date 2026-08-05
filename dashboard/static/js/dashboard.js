@@ -261,9 +261,10 @@ function showMetricChart(systemName, metricField, metricLabel) {
         })
         .catch(err => {
             console.error('Error fetching metric history:', err);
-            document.getElementById('metricChart').style.display = 'none';
             const chartContainer = document.querySelector('.chart-container');
-            chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            if (chartContainer) {
+                chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            }
         });
 }
 
