@@ -204,42 +204,44 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         scan_depth = config.get('scan_depth', _depth_defaults.get(device_type, 2))
         logger.info(f"scan_depth={scan_depth}")
 
-        # Volume capacity via shutil for all modes (no folder scan needed)
-        volume_capacity = {}
+        # Volume capacity and used bytes via shutil — single pass, all modes.
+        # shutil is the authoritative source for volume totals; it accounts for
+        # filesystem metadata, journal, and files outside any scanned folder.
+        volume_capacity = {}   # /volume1_total_bytes, /volume1_free_bytes
+        volume_used     = {}   # /volume1: used_bytes  (authoritative, from shutil)
         for vol in volumes:
             cap = measure_volume_capacity(vol)
             if cap:
                 volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
                 volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
-                logger.info(f"Volume capacity {vol}: total={cap['total_bytes']}, free={cap['free_bytes']}")
+                volume_used[vol] = cap['total_bytes'] - cap['free_bytes']
+                logger.info(f"Volume {vol}: used={volume_used[vol]}, "
+                            f"total={cap['total_bytes']}, free={cap['free_bytes']}")
 
         # -------------------------------------------------------------------
-        # scan_depth == 1: volume-level only via shutil (fast, no folder scan)
+        # scan_depth == 1: volume-level only (shutil, no folder scan)
         # -------------------------------------------------------------------
         if scan_depth == 1:
             logger.info("scan_depth=1: volume-level stats only (no folder scan)")
-            volume_sums = {}
-            for vol in volumes:
-                cap = measure_volume_capacity(vol)
-                if cap:
-                    volume_sums[vol] = cap['total_bytes'] - cap['free_bytes']
-                    logger.info(f"{vol}: used={volume_sums[vol]}")
-
-            total_usage = sum(volume_sums.values())
+            total_usage = sum(volume_used.values())
             entry = {
                 'header': build_header(name, system_id, device_type),
                 'data': {
                     'data_type':   'folder_usage',
-                    **volume_sums,      # /volume1: used_bytes, ...
-                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes, ...
+                    **volume_used,      # /volume1: used_bytes (shutil)
+                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes
                     'total_usage': total_usage,
                 }
             }
 
         # -------------------------------------------------------------------
         # scan_depth >= 2: folder scan at the requested depth
-        # depth=2 → volume/Folder (standard NAS)
-        # depth=3 → volume/Folder/SubFolder (NAS-Instrument)
+        # scan_depth=2 → measure /volume/tier2 folders
+        # scan_depth=3 → measure /volume/tier2/tier3 folders
+        #
+        # Volume totals always come from shutil (authoritative).
+        # Folder breakdown comes from recursive scan.
+        # Intermediate sums (tier2 level for scan_depth=3) come from scan.
         # -------------------------------------------------------------------
         else:
             nas_type = 'synology' if sys.platform != 'win32' else 'windows'
@@ -248,40 +250,36 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 leaf_folders.extend(discover_at_depth(vol, scan_depth - 1, nas_type))
             logger.info(f"Discovered {len(leaf_folders)} folders at depth {scan_depth}")
 
-            # Use measure_leaf_folders (not measure_all_folders) to measure pre-discovered leaf folders
-            # without re-discovering their subdirectories
             folders = measure_leaf_folders(leaf_folders, timeout=timeout)
             logger.info(f"Measured {len(folders)} folders")
 
             folder_data = {f['path']: f['usage_bytes'] for f in folders}
 
-            # Compute sums for ALL ancestor levels up to and including the volume root.
-            # scan_depth=2: leaf=/volume1/tier2    → sums /volume1
-            # scan_depth=3: leaf=/volume1/tier2/tier3 → sums /volume1/tier2 AND /volume1
-            volume_set = set(volumes)
-            ancestor_sums = {}
-            for path, usage in folder_data.items():
-                current = os.path.dirname(path)
-                while current:
-                    ancestor_sums[current] = ancestor_sums.get(current, 0) + usage
-                    if current in volume_set:
-                        break  # reached the volume root, stop
-                    parent = os.path.dirname(current)
-                    if parent == current:
-                        break  # hit filesystem root
-                    current = parent
+            # For scan_depth >= 3, compute intermediate sums (e.g. tier2 totals)
+            # from scan data. Volume-level sums come from shutil, not here.
+            intermediate_sums = {}
+            if scan_depth >= 3:
+                volume_set = set(volumes)
+                for path, usage in folder_data.items():
+                    current = os.path.dirname(path)
+                    while current and current not in volume_set:
+                        intermediate_sums[current] = intermediate_sums.get(current, 0) + usage
+                        parent = os.path.dirname(current)
+                        if parent == current:
+                            break
+                        current = parent
 
-            # total_usage = sum of volume-level sums (not leaf sums, which may miss
-            # tier2 folders that have no subfolders in a scan_depth=3 scan)
-            total_usage = sum(ancestor_sums.get(vol, 0) for vol in volumes)
+            # Volume totals from shutil — authoritative regardless of scan depth
+            total_usage = sum(volume_used.values())
 
             entry = {
                 'header': build_header(name, system_id, device_type),
                 'data': {
-                    'data_type':   'folder_usage',
-                    **folder_data,      # /volume1/tier2(/tier3): bytes per leaf
-                    **ancestor_sums,    # /volume1/tier2: tier2 sums, /volume1: volume sums
-                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes, ...
+                    'data_type':       'folder_usage',
+                    **folder_data,      # /volume/tier2(/tier3): bytes per leaf (from scan)
+                    **intermediate_sums, # /volume/tier2: tier2 sums for scan_depth>=3 (from scan)
+                    **volume_used,      # /volume: used bytes (shutil, authoritative)
+                    **volume_capacity,  # /volume_total_bytes, /volume_free_bytes
                     'total_usage': total_usage,
                 }
             }
