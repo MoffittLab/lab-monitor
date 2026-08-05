@@ -765,7 +765,6 @@ def get_totals():
 
 
 @app.route('/api/history/<system_name>/<data_type>/<field>', methods=['GET'])
-@require_auth
 def get_metric_history(system_name: str, data_type: str, field: str):
     """
     Fetch time-series data for a specific field within a system's data_type table.
