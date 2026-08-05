@@ -70,38 +70,47 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 # Config management via config_tool.py
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, timeout: int) -> dict:
+def get_config(client, git_path: str, timeout: int) -> tuple:
     """
     Fetch full config via config_tool.py list --json.
-    Returns dict or None on error.
+    Returns (config_dict, None) on success, (None, error_str) on failure.
     """
     command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json list --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
-        if exit_code == 0:
+        if exit_code != 0:
+            return None, f'exit {exit_code} | stderr: {stderr!r} | stdout: {stdout!r}'
+        try:
             result = json.loads(stdout)
-            if result.get('status') == 'ok':
-                return result.get('config', {})
+        except json.JSONDecodeError:
+            return None, f'JSON parse error | stdout: {stdout!r}'
+        if result.get('status') == 'ok':
+            return result.get('config', {}), None
+        return None, f'config_tool error: {result.get("error", "unknown")}'
     except Exception as e:
-        pass
-    return None
+        return None, f'exception: {e}'
 
 
-def set_active(client, git_path: str, value: bool, timeout: int) -> bool:
+def set_active(client, git_path: str, value: bool, timeout: int) -> tuple:
     """
     Set active field via config_tool.py set.
-    Returns True on success.
+    Returns (True, None) on success, (False, error_str) on failure.
     """
     value_str = 'true' if value else 'false'
     command = f'cd "{git_path}/collector" && python3 config_tool.py --config config.json set active {value_str} --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
-        if exit_code == 0:
+        if exit_code != 0:
+            return False, f'exit {exit_code} | stderr: {stderr!r} | stdout: {stdout!r}'
+        try:
             result = json.loads(stdout)
-            return result.get('status') == 'ok'
-    except Exception:
-        pass
-    return False
+        except json.JSONDecodeError:
+            return False, f'JSON parse error | stdout: {stdout!r}'
+        if result.get('status') == 'ok':
+            return True, None
+        return False, f'config_tool error: {result.get("error", "unknown")}'
+    except Exception as e:
+        return False, f'exception: {e}'
 
 
 # ---------------------------------------------------------------------------
@@ -140,27 +149,28 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         client = ssh_connect(ip, username, password, timeout)
         try:
             # Get before-state
-            config_before = get_config(client, git_path, timeout)
+            config_before, err = get_config(client, git_path, timeout)
             if config_before is None:
                 result['status'] = 'failed'
-                result['error'] = 'Could not fetch config before change'
+                result['error'] = f'Could not fetch config before change: {err}'
                 result['elapsed'] = time.time() - start
                 return result
-            
+
             result['config_before'] = config_before
 
             # Set active field
-            if not set_active(client, git_path, target_value, timeout):
+            ok, err = set_active(client, git_path, target_value, timeout)
+            if not ok:
                 result['status'] = 'failed'
-                result['error'] = 'Could not set active field'
+                result['error'] = f'Could not set active field: {err}'
                 result['elapsed'] = time.time() - start
                 return result
 
             # Get after-state
-            config_after = get_config(client, git_path, timeout)
+            config_after, err = get_config(client, git_path, timeout)
             if config_after is None:
                 result['status'] = 'failed'
-                result['error'] = 'Could not fetch config after change'
+                result['error'] = f'Could not fetch config after change: {err}'
                 result['elapsed'] = time.time() - start
                 return result
 
