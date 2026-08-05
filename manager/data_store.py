@@ -284,6 +284,34 @@ class TypedDataStore:
     # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
 
+    def delete_system(self, name: str) -> bool:
+        """
+        Delete the per-system history database file entirely.
+        Closes any open connection first, then removes the .db file.
+        Returns True if the file was deleted, False if it didn't exist.
+        """
+        system_key = name.lower()
+        # Close open connection if any
+        if system_key in self._dbs:
+            try:
+                self._dbs[system_key].close()
+            except Exception:
+                pass
+            del self._dbs[system_key]
+
+        db_path = os.path.join(self.data_dir, name, 'data.db')
+        if os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+                logger.info(f"Deleted per-system DB: {db_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete {db_path}: {e}")
+                return False
+        else:
+            logger.warning(f"No per-system DB found at {db_path}")
+            return False
+
     def close(self):
         for db in self._dbs.values():
             try:

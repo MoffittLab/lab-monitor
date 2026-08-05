@@ -396,6 +396,25 @@ class MetricsDB:
     # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
 
+    def delete_system(self, name: str) -> bool:
+        """
+        Remove all records for a system from the central summary DB.
+        Clears rows from devices, device_snapshot, and device_totals.
+        Returns True if any rows were deleted.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute('DELETE FROM devices WHERE name = ?', (name,))
+            cur.execute('DELETE FROM device_snapshot WHERE name = ?', (name,))
+            cur.execute('DELETE FROM device_totals WHERE name = ?', (name,))
+            self.db.commit()
+            deleted = cur.rowcount > 0
+            logger.info(f"Deleted system '{name}' from central metrics DB")
+            return deleted
+        except Exception as e:
+            logger.error(f"Failed to delete system '{name}' from metrics DB: {e}")
+            return False
+
     def close(self):
         try:
             self.db.close()

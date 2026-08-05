@@ -764,6 +764,45 @@ def get_totals():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/system/<name>', methods=['DELETE'])
+@require_auth
+def delete_system(name: str):
+    """
+    Permanently delete all data for a system.
+
+    Removes:
+      - Per-system history DB:  data/<name>/data.db
+      - Central summary rows:   devices, device_snapshot, device_totals
+
+    This is irreversible. The collector's local JSONL archives are the
+    source of truth and can be used to rebuild the manager if needed.
+
+    Returns:
+        {"status": "ok", "deleted": "<name>"}
+    """
+    if not name or not re.match(r'^[\w\-\.]+$', name):
+        return jsonify({"error": "Invalid system name"}), 400
+
+    _logger.warning(f"DELETE /api/system/{name} — permanently deleting all data for '{name}'")
+
+    try:
+        db_deleted  = _data_store.delete_system(name)
+        rows_deleted = _metrics_db.delete_system(name)
+
+        _logger.info(f"System '{name}' wiped: db_deleted={db_deleted}, central_rows_cleared={rows_deleted}")
+
+        return jsonify({
+            "status":  "ok",
+            "deleted": name,
+            "per_system_db_deleted": db_deleted,
+            "central_db_rows_cleared": rows_deleted,
+        }), 200
+
+    except Exception as e:
+        _logger.error(f"Error deleting system '{name}': {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description="Lab Monitor Manager")
