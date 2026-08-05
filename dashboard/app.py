@@ -306,6 +306,30 @@ def get_data():
     })
 
 
+@app.route('/api/history/<system_name>/<data_type>/<field>')
+def get_metric_history(system_name, data_type, field):
+    """Proxy metric time-series data from Manager for frontend charting."""
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        if limit < 1 or limit > 500:
+            limit = min(limit, 500)
+        
+        # Forward to Manager's history endpoint
+        data = _manager_get(
+            f'/api/history/{system_name}/{data_type}/{field}',
+            params={'limit': limit}
+        )
+        
+        if data is None:
+            return jsonify({'error': 'Manager unreachable or not found'}), 503
+        
+        return jsonify(data), 200
+    
+    except Exception as e:
+        _logger.error(f"Error fetching metric history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/system/<system_name>/disk_history')
 def get_disk_history(system_name):
     """Historical folder_usage rows for a system."""
