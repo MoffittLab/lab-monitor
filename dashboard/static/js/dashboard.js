@@ -10,7 +10,6 @@ let refreshInterval = 30000;
 
 function initDashboard(config) {
     refreshInterval = config.refreshInterval || 30000;
-    setupModal();
     loadData();
     setInterval(loadData, refreshInterval);
     console.log(`Dashboard initialized. Refresh: ${refreshInterval}ms`);
@@ -229,104 +228,7 @@ function createSystemCard(systemName, sys) {
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
 
-    card.addEventListener('click', () => showSystemDetail(systemName, sys));
     return card;
-}
-
-// -------------------------------------------------------------------------
-// Detail modal
-// -------------------------------------------------------------------------
-
-function showSystemDetail(systemName, sys) {
-    const modal      = document.getElementById('detailModal');
-    const deviceType = sys.device_type || 'unknown';
-    document.getElementById('modalNasName').textContent =
-        `${systemName}  (${deviceType})`;
-
-    let html = `
-        <p><strong>Last update:</strong> ${escapeHtml(formatTimestamp(sys.timestamp))}</p>
-        ${sys.first_seen ? `<p><strong>First seen:</strong> ${escapeHtml(formatTimestamp(sys.first_seen))}</p>` : ''}
-        ${sys.system_id  ? `<p><strong>System ID:</strong>  ${escapeHtml(sys.system_id)}</p>` : ''}
-    `;
-
-    // --- Metrics detail ---
-    if (sys.metrics) {
-        const m = sys.metrics;
-        html += `
-            <h3>System Metrics</h3>
-            <table style="width:100%;border-collapse:collapse;">
-                ${metricRow('CPU Usage',       safeFixed(m.cpu_percent, 2) + '%')}
-                ${metricRow('RAM Usage',       safeFixed(m.ram_percent, 2) + '%')}
-                ${metricRow('Uptime',          escapeHtml(m.uptime_formatted || '0s'))}
-                ${metricRow('Download (avg)',  safeFixed(m.network_bandwidth_in_mbps, 2) + ' Mbps')}
-                ${metricRow('Upload (avg)',    safeFixed(m.network_bandwidth_out_mbps, 2) + ' Mbps')}
-                ${metricRow('Total received',  formatBytes(m.network_bytes_in  || 0))}
-                ${metricRow('Total sent',      formatBytes(m.network_bytes_out || 0))}
-            </table>`;
-    }
-
-    // --- Disk detail ---
-    if (sys.disk) {
-        const d = sys.disk;
-        html += `<h3 style="margin-top:20px;">Storage</h3>`;
-
-        if ((d.volumes || []).length > 0) {
-            html += `<h4 style="margin:16px 0 6px;">By Volume</h4>
-                     <table style="width:100%;border-collapse:collapse;">`;
-            for (const vol of d.volumes) {
-                html += metricRow(escapeHtml(vol.path) + ' (used)', escapeHtml(vol.usage_formatted));
-                if (vol.total_bytes) {
-                    const pct = Math.min(100, Math.round((vol.usage_bytes / vol.total_bytes) * 100));
-                    html += metricRow('&nbsp;&nbsp;Total capacity', escapeHtml(vol.total_formatted));
-                    html += metricRow('&nbsp;&nbsp;Free',           escapeHtml(vol.free_formatted));
-                    html += metricRow('&nbsp;&nbsp;Used %',         `${pct}%`);
-                }
-            }
-            html += '</table>';
-        }
-
-        if ((d.folders || []).length > 0) {
-            html += `<h4 style="margin:16px 0 6px;">Folders</h4>
-                     <table style="width:100%;border-collapse:collapse;">`;
-            for (const f of d.folders) {
-                html += metricRow(escapeHtml(f.path), escapeHtml(f.usage_formatted));
-            }
-            html += '</table>';
-        }
-    }
-
-    // --- Running totals section ---
-    if (sys.totals) {
-        const t = sys.totals;
-        html += `
-            <h3 style="margin-top:20px;">Running Totals</h3>
-            <table style="width:100%;border-collapse:collapse;">
-                ${metricRow('Lifetime received', formatBytes(t.total_bytes_in  || 0))}
-                ${metricRow('Lifetime sent',     formatBytes(t.total_bytes_out || 0))}
-                ${metricRow('Current storage',   formatBytes(t.total_disk_bytes || 0))}
-            </table>`;
-    }
-
-    document.getElementById('modalContent').innerHTML = html;
-    modal.style.display = 'block';
-}
-
-function metricRow(label, value) {
-    return `<tr style="border-bottom:1px solid #ddd;">
-                <td style="padding:8px;">${label}</td>
-                <td style="padding:8px;text-align:right;font-weight:bold;">${value}</td>
-            </tr>`;
-}
-
-// -------------------------------------------------------------------------
-// Modal setup
-// -------------------------------------------------------------------------
-
-function setupModal() {
-    const modal    = document.getElementById('detailModal');
-    const closeBtn = document.querySelector('.close');
-    closeBtn.onclick = () => { modal.style.display = 'none'; };
-    window.onclick  = e  => { if (e.target === modal) modal.style.display = 'none'; };
 }
 
 // -------------------------------------------------------------------------
