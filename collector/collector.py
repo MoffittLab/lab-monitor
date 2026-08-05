@@ -172,7 +172,11 @@ def delete_queue(queue_path: str, logger: logging.Logger):
 def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     """Collect disk usage (daily mode)"""
     logger.info("=== DISK USAGE COLLECTION ===")
-    
+
+    if not config.get('active', True):
+        logger.info("Collector is inactive (active=false in config) — skipping collection and sync.")
+        return True
+
     # Support both 'name' and old 'nas_name' for backward compatibility
     name = config.get('name') or config.get('nas_name')
     system_id = config.get('id') or config.get('nas_id')
@@ -308,7 +312,11 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
 def collect_metrics(config: dict, logger: logging.Logger) -> bool:
     """Collect system metrics: CPU, RAM, network (5-minute mode)"""
     logger.info("=== METRICS COLLECTION ===")
-    
+
+    if not config.get('active', True):
+        logger.info("Collector is inactive (active=false in config) — skipping collection and sync.")
+        return True
+
     # Support both 'name' and old 'nas_name' for backward compatibility
     name = config.get('name') or config.get('nas_name')
     system_id = config.get('id') or config.get('nas_id')
