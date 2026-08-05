@@ -232,10 +232,10 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 'header': build_header(name, system_id, device_type),
                 'data': {
                     'data_type':        'folder_usage',
+                    '_unit':            'bytes',   # all numeric fields in this message are bytes
                     **volume_used,      # /volume1: used_bytes (shutil)
                     **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes
                     'total_usage':      total_usage,
-                    'total_usage_unit': 'bytes',
                 }
             }
 
@@ -281,12 +281,12 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 'header': build_header(name, system_id, device_type),
                 'data': {
                     'data_type':       'folder_usage',
+                    '_unit':           'bytes',   # all numeric fields in this message are bytes
                     **folder_data,      # /volume/tier2(/tier3): bytes per leaf (from scan)
                     **intermediate_sums, # /volume/tier2: tier2 sums for scan_depth>=3 (from scan)
                     **volume_used,      # /volume: used bytes (shutil, authoritative)
                     **volume_capacity,  # /volume_total_bytes, /volume_free_bytes
                     'total_usage':      total_usage,
-                    'total_usage_unit': 'bytes',
                 }
             }
         # Append to local archive
