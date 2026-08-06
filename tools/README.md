@@ -38,6 +38,60 @@ atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/Prog
 
 ## Tools
 
+### 0. `archive_all_collectors.py` — Archive & Refresh All Collectors
+
+**Purpose:** Move all YYYY-MM.jsonl archive files to timestamped backup folders on all collectors. Useful for seamless refresh without losing data.
+
+**Use Case:**
+- Start fresh with clean histories
+- Prepare for a major data collection change
+- Manually review archived data before deletion
+- Combine with Manager reset for a full refresh
+
+**Usage:**
+```bash
+python3 archive_all_collectors.py --csv collectors.csv --dry-run
+python3 archive_all_collectors.py --csv collectors.csv
+python3 archive_all_collectors.py --csv collectors.csv --also-delete-queues
+python3 archive_all_collectors.py --csv collectors.csv --timeout 90 --verbose
+```
+
+**What it does:**
+- For each collector, SSHes in and reads its config
+- Creates a timestamped backup folder (`backup_YYYYMMDD_HHMMSS`) in the data directory
+- Moves all `YYYY-MM.jsonl` archive files into the backup folder
+- Optionally deletes `queue.json` to force a fresh sync on the next collection run
+- Shows backup locations for verification/recovery
+
+**What it does NOT do:**
+- Does NOT wipe Manager databases (unlike `reset_system.py`)
+- Does NOT delete anything permanently
+- Does NOT modify any collector configs
+
+**Example workflow:**
+```bash
+# Preview what will happen
+python3 archive_all_collectors.py --csv collectors.csv --dry-run
+
+# Archive everything
+python3 archive_all_collectors.py --csv collectors.csv
+
+# Result:
+# [1/5] 192.168.1.42 ... [OK] Triton: Moved 12 archive file(s) to backup_20260806_084530
+# [2/5] 192.168.1.43 ... [OK] Atlas: Moved 11 archive file(s) to backup_20260806_084531
+# ...
+# Summary: 5/5 collectors archived successfully
+
+# Optional: Also delete pending queues to force fresh sync
+python3 archive_all_collectors.py --csv collectors.csv --also-delete-queues
+
+# Backup folders are saved on each collector for recovery if needed
+```
+
+**Recovery:** If you need to restore archived data, the backup folders remain on each collector.
+
+---
+
 ### 1. `update_collectors.py` — Deploy Code Updates
 
 **Purpose:** Deploy lab-monitor code changes to all collectors by pulling from git.
@@ -207,6 +261,28 @@ python3 config_tool.py --config config.json set active true --json
 ---
 
 ## Common Workflows
+
+### Refresh Collectors & Manager (Full Reset)
+
+Archive all collector history, then optionally reset the Manager to start fresh.
+
+```bash
+# 1. Preview what will be archived
+python3 archive_all_collectors.py --csv collectors.csv --dry-run
+
+# 2. Archive all collectors (moves YYYY-MM.jsonl files to backup folders)
+python3 archive_all_collectors.py --csv collectors.csv
+
+# 3. Optionally also delete pending queues to force fresh sync
+python3 archive_all_collectors.py --csv collectors.csv --also-delete-queues
+
+# 4. Collectors will start fresh on next scheduled run
+#    (To reset Manager too, use a manual reset or API call; see docs/SYSTEM_RESET.md)
+```
+
+**Backup folders are saved on each collector** for recovery if needed. Data is never deleted — only moved.
+
+---
 
 ### Deploy a Code Change and Verify
 
