@@ -126,8 +126,12 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
         return None, f"config_tool.py failed (exit {code}): {err}"
     
     try:
-        config = json.loads(out)
-        return config, None
+        response = json.loads(out)
+        # config_tool.py returns {"status": "ok", "config": {...}}
+        if isinstance(response, dict) and 'config' in response:
+            return response['config'], None
+        # Fallback: if it's a plain config dict (shouldn't happen, but be safe)
+        return response, None
     except json.JSONDecodeError as e:
         return None, f"Invalid JSON from config_tool: {e}"
 
