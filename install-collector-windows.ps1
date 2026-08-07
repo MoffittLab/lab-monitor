@@ -95,6 +95,22 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
     exit 1
 }
 
+# Define helper functions early (before they're used)
+function Write-Step {
+    param([string]$Message)
+    Write-Host $Message -ForegroundColor Yellow
+}
+
+function Write-Success {
+    param([string]$Message)
+    Write-Host "[OK] $Message" -ForegroundColor Green
+}
+
+function Write-Error-Custom {
+    param([string]$Message)
+    Write-Host "ERROR: $Message" -ForegroundColor Red
+}
+
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "Lab Monitor - Windows Collector Install" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
@@ -146,21 +162,6 @@ if (-not $CondaEnv) {
     exit 1
 }
 $PythonExe = (Get-Command python.exe).Source  # Use conda env's python
-
-function Write-Step {
-    param([string]$Message)
-    Write-Host $Message -ForegroundColor Yellow
-}
-
-function Write-Success {
-    param([string]$Message)
-    Write-Host "[OK] $Message" -ForegroundColor Green
-}
-
-function Write-Error-Custom {
-    param([string]$Message)
-    Write-Host "ERROR: $Message" -ForegroundColor Red
-}
 
 # Step 1: Create directory structure
 Write-Step "Step 1: Creating directory structure at $RootDir"
