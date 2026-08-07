@@ -1,23 +1,38 @@
 #
 # Lab Monitor - Windows Server Collector Installation Script
 #
-# Usage (as Administrator):
+# Usage (as Administrator from Anaconda PowerShell Prompt):
 #   Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 #   .\install-collector-windows.ps1
 #
 # This script:
+# 0. Prompts for drive selection (E:\ by default, but customizable)
 # 1. Automatically detects and uses the 'lab-monitor' conda environment (if it exists)
-# 2. Creates directory structure at E:\Users\lab-monitor
+# 2. Creates directory structure at \<Drive>\Users\lab-monitor
 # 3. Clones or updates lab-monitor repository
 # 4. Installs dependencies
 # 5. Creates config.json from template (interactive)
 # 6. Sets up Task Scheduler jobs
 # 7. Tests collection modes
+# 8. Displays manual Task Scheduler configuration (optional fallback)
 #
 # Pre-requisites:
-#   - Run from Anaconda PowerShell Prompt (as Administrator)
+#   - MUST run from Anaconda PowerShell Prompt as Administrator
+#   - CONDA MUST be available in your PATH
 #   - Optional: Create conda environment first with:
 #     conda create -n lab-monitor python=3.11
+#
+# Administrator Rights:
+#   This script requires administrator privileges for:
+#   - Creating directories in the selected drive root
+#   - Installing Python dependencies via pip
+#   - Registering Task Scheduler jobs (runs as SYSTEM)
+#
+#   To run as Administrator:
+#   1. Search for 'Anaconda PowerShell Prompt' in Start Menu
+#   2. Right-click it and select 'Run as administrator'
+#   3. Accept the UAC prompt when asked
+#   4. Then run this script
 #
 
 # Verify conda is available and find/activate lab-monitor environment
@@ -85,8 +100,40 @@ Write-Host "Lab Monitor - Windows Collector Install" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
 
+# Step 0: Prompt for installation drive
+Write-Step "Step 0: Selecting installation drive"
+Write-Host "Detected drives on this system:" -ForegroundColor Cyan
+$AvailableDrives = @()
+foreach ($drive in [System.IO.DriveInfo]::GetDrives() | Where-Object {$_.DriveType -eq 'Fixed'}) {
+    $driveLetter = $drive.Name.TrimEnd(':\')
+    $AvailableDrives += $driveLetter
+    $freeSpace = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
+    $totalSpace = [math]::Round($drive.TotalSize / 1GB, 2)
+    Write-Host "  $driveLetter: $freeSpace GB free / $totalSpace GB total" -ForegroundColor Gray
+}
+
+if ($AvailableDrives.Count -eq 0) {
+    Write-Error-Custom "No fixed drives found on this system"
+    exit 1
+}
+
+$DefaultDrive = if ($AvailableDrives -contains "E") { "E" } else { $AvailableDrives[0] }
+Write-Host ""
+Write-Host "Where would you like to install the lab-monitor collector?" -ForegroundColor Cyan
+Write-Host "(This will create \\Users\\lab-monitor on the selected drive)" -ForegroundColor Gray
+$DriveInput = Read-Host "Enter drive letter (default: $DefaultDrive)"
+$SelectedDrive = if ([string]::IsNullOrWhiteSpace($DriveInput)) { $DefaultDrive } else { $DriveInput.TrimEnd(':') }
+
+if ($SelectedDrive -notin $AvailableDrives) {
+    Write-Error-Custom "Drive '$SelectedDrive' not found. Available drives: $($AvailableDrives -join ', ')"
+    exit 1
+}
+
+Write-Success "Using drive: $SelectedDrive"
+Write-Host ""
+
 # Configuration
-$RootDir = "E:\Users\lab-monitor"
+$RootDir = "$SelectedDrive`:\Users\lab-monitor"
 $DataDir = "$RootDir\data"
 $LogsDir = "$RootDir\logs"
 $ScriptsDir = "$RootDir\scripts"
@@ -116,7 +163,7 @@ function Write-Error-Custom {
 }
 
 # Step 1: Create directory structure
-Write-Step "Step 1: Creating directory structure"
+Write-Step "Step 1: Creating directory structure at $RootDir"
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 if (-not (Test-Path $LogsDir)) { New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null }
 if (-not (Test-Path $ScriptsDir)) { New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null }
