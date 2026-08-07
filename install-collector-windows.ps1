@@ -510,7 +510,7 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "VERIFICATION "&" NEXT STEPS:" -ForegroundColor Cyan
+Write-Host 'VERIFICATION & NEXT STEPS:' -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "1. Review your configuration:" -ForegroundColor White
