@@ -6,99 +6,107 @@
 #   .\install-collector-windows.ps1
 #
 # This script:
-# 0. Prompts for drive selection (E:\ by default, but customizable)
-# 1. Automatically detects and uses the 'lab-monitor' conda environment (if it exists)
-# 2. Creates directory structure at \<Drive>\Users\lab-monitor
-# 3. Clones or updates lab-monitor repository
-# 4. Installs dependencies
-# 5. Creates config.json from template (interactive)
-# 6. Sets up Task Scheduler jobs
-# 7. Tests collection modes
-# 8. Displays manual Task Scheduler configuration (optional fallback)
+#   0. Prompts for installation drive selection
+#   1. Detects and activates the 'lab-monitor' conda environment
+#   2. Creates directory structure at <Drive>:\Users\lab-monitor
+#   3. Clones or updates the lab-monitor repository
+#   4. Installs Python dependencies into the conda environment
+#   5. Gathers configuration interactively
+#   6. Creates wrapper batch scripts with hardcoded Python paths
+#   7. Tests collector
+#   8. Registers Task Scheduler jobs (via batch scripts)
+#   9. Displays manual Task Scheduler instructions (fallback)
 #
 # Pre-requisites:
-#   - MUST run from Anaconda PowerShell Prompt as Administrator
-#   - CONDA MUST be available in your PATH
-#   - Optional: Create conda environment first with:
-#     conda create -n lab-monitor python=3.11
+#   - Run from Anaconda PowerShell Prompt as Administrator
+#   - Optional: create the conda environment first:
+#       conda create -n lab-monitor python=3.11
 #
-# Administrator Rights:
-#   This script requires administrator privileges for:
-#   - Creating directories in the selected drive root
-#   - Installing Python dependencies via pip
-#   - Registering Task Scheduler jobs (runs as SYSTEM)
+# Why batch scripts for scheduling?
+#   Task Scheduler jobs run as a Windows user account (not inside a conda
+#   session). Calling Python directly via a conda env path is fragile when
+#   the task runs as SYSTEM or as a logged-off user. Wrapper .bat files with
+#   a hardcoded absolute path to the conda env's python.exe are self-contained
+#   and work reliably in all cases.
+#
+# Administrator rights are required for:
+#   - Creating directories on the selected drive
+#   - Installing pip packages
+#   - Registering Task Scheduler jobs
 #
 #   To run as Administrator:
-#   1. Search for 'Anaconda PowerShell Prompt' in Start Menu
-#   2. Right-click it and select 'Run as administrator'
-#   3. Accept the UAC prompt when asked
-#   4. Then run this script
+#   1. Search for 'Anaconda PowerShell Prompt' in the Start Menu
+#   2. Right-click -> Run as administrator
+#   3. Accept the UAC prompt
+#   4. Navigate to this script and run it
 #
 
-# Verify conda is available and find/activate lab-monitor environment
+# ==============================================================================
+# Conda availability check
+# ==============================================================================
 if (-not $env:CONDA_EXE) {
-    Write-Host "ERROR: Conda not found (CONDA_EXE not set)" -ForegroundColor Red
-    Write-Host "" -ForegroundColor Red
-    Write-Host "Please run this script from an Anaconda Prompt or Anaconda PowerShell Prompt" -ForegroundColor Yellow
+    Write-Host "ERROR: Conda not found (CONDA_EXE is not set)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Please run this script from an Anaconda PowerShell Prompt." -ForegroundColor Yellow
     exit 1
 }
 
-# Initialize conda for PowerShell if needed
+# Initialise conda for PowerShell if the 'conda' function is not yet present
 if (-not (Test-Path Function:\conda)) {
     & "$env:CONDA_EXE" shell.powershell hook | Out-String | Invoke-Expression
 }
 
 Write-Host "Checking for lab-monitor conda environment..." -ForegroundColor Cyan
 
-# Check if lab-monitor environment exists using conda info
 try {
-    $CondaInfo = & cmd /c "$env:CONDA_EXE info --envs" 2>&1 | Out-String
-    $LabMonitorExists = $CondaInfo | Select-String -Pattern "lab-monitor"
-    
-    if ($LabMonitorExists) {
-        Write-Host "[OK] lab-monitor conda environment found" -ForegroundColor Green
-        Write-Host "Activating lab-monitor environment..." -ForegroundColor Cyan
-        
-        # Activate the lab-monitor environment
+    $CondaEnvList   = & "$env:CONDA_EXE" env list 2>&1 | Out-String
+    $LabMonitorLine = $CondaEnvList | Select-String -Pattern "lab-monitor"
+
+    if ($LabMonitorLine) {
+        Write-Host "[OK] lab-monitor environment found" -ForegroundColor Green
+        Write-Host "Activating lab-monitor..." -ForegroundColor Cyan
         conda activate lab-monitor
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Using conda environment: $env:CONDA_DEFAULT_ENV" -ForegroundColor Green
+        if ($env:CONDA_DEFAULT_ENV -eq "lab-monitor") {
+            Write-Host "[OK] Active environment: lab-monitor" -ForegroundColor Green
         } else {
-            Write-Host "WARNING: Activation may have issues, but continuing..." -ForegroundColor Yellow
+            Write-Host "WARNING: Activation may not have taken effect" -ForegroundColor Yellow
+            Write-Host "         Continuing - Python path will be resolved from CONDA_PREFIX" -ForegroundColor Yellow
         }
     } else {
-        Write-Host "INFO: lab-monitor conda environment not yet created" -ForegroundColor Cyan
-        Write-Host "Note: You can create it before running with:" -ForegroundColor Yellow
-        Write-Host "  conda create -n lab-monitor python=3.11" -ForegroundColor Yellow
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "Continuing with current conda environment..." -ForegroundColor Cyan
+        Write-Host "INFO: lab-monitor environment not found" -ForegroundColor Cyan
+        Write-Host "      Create it first with: conda create -n lab-monitor python=3.11" -ForegroundColor Yellow
+        Write-Host "      Continuing with current environment..." -ForegroundColor Cyan
     }
 } catch {
-    Write-Host "WARNING: Could not check for lab-monitor environment" -ForegroundColor Yellow
-    Write-Host "Continuing with current environment..." -ForegroundColor Yellow
+    Write-Host "WARNING: Could not enumerate conda environments: $_" -ForegroundColor Yellow
+    Write-Host "         Continuing with current environment..." -ForegroundColor Yellow
 }
 
-# Final verification: ensure we have an active conda environment
 if (-not $env:CONDA_DEFAULT_ENV -and -not $env:CONDA_PREFIX) {
     Write-Host "ERROR: No active conda environment detected" -ForegroundColor Red
-    Write-Host "" -ForegroundColor Red
-    Write-Host "Please ensure you're running from Anaconda Prompt or PowerShell with conda initialized" -ForegroundColor Yellow
+    Write-Host "       Run from an Anaconda PowerShell Prompt with an environment active." -ForegroundColor Yellow
     exit 1
 }
 
-# Check if running as Administrator
-if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+# ==============================================================================
+# Administrator check
+# ==============================================================================
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ERROR: This script must be run as Administrator" -ForegroundColor Red
-    Write-Host "" -ForegroundColor Red
-    Write-Host "Right-click on Anaconda Prompt and select 'Run as Administrator'" -ForegroundColor Yellow
+    Write-Host "       Right-click Anaconda PowerShell Prompt -> Run as administrator" -ForegroundColor Yellow
     exit 1
 }
 
-# Define helper functions early (before they're used)
+# ==============================================================================
+# Helper functions  (defined early so all steps can use them)
+# ==============================================================================
 function Write-Step {
     param([string]$Message)
-    Write-Host $Message -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  $Message" -ForegroundColor Yellow
+    Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 }
 
 function Write-Success {
@@ -106,465 +114,569 @@ function Write-Success {
     Write-Host "[OK] $Message" -ForegroundColor Green
 }
 
-function Write-Error-Custom {
+function Write-Warn {
+    param([string]$Message)
+    Write-Host "WARNING: $Message" -ForegroundColor Yellow
+}
+
+function Write-Err {
     param([string]$Message)
     Write-Host "ERROR: $Message" -ForegroundColor Red
 }
 
+# ==============================================================================
+# Banner
+# ==============================================================================
+Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "Lab Monitor - Windows Collector Install" -ForegroundColor Cyan
+Write-Host "  Lab Monitor - Windows Collector Install" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Step 0: Prompt for installation drive
+# ==============================================================================
+# Step 0: Drive selection
+# ==============================================================================
 Write-Step "Step 0: Selecting installation drive"
-Write-Host "Detected drives on this system:" -ForegroundColor Cyan
+
+Write-Host "Fixed drives detected on this system:" -ForegroundColor Cyan
 $AvailableDrives = @()
-foreach ($drive in [System.IO.DriveInfo]::GetDrives() | Where-Object {$_.DriveType -eq 'Fixed'}) {
-    $driveLetter = $drive.Name.TrimEnd(':\')
-    $AvailableDrives += $driveLetter
-    $freeSpace = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
-    $totalSpace = [math]::Round($drive.TotalSize / 1GB, 2)
-    Write-Host "  ${driveLetter}: $freeSpace GB free / $totalSpace GB total" -ForegroundColor Gray
+foreach ($drive in [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }) {
+    # Use Substring(0,1) - TrimEnd(':\') is fragile as it trims individual chars
+    $letter  = $drive.Name.Substring(0, 1).ToUpper()
+    $freeGB  = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
+    $totalGB = [math]::Round($drive.TotalSize / 1GB, 2)
+    $AvailableDrives += $letter
+    Write-Host "  ${letter}: $freeGB GB free / $totalGB GB total" -ForegroundColor Gray
 }
 
 if ($AvailableDrives.Count -eq 0) {
-    Write-Error-Custom "No fixed drives found on this system"
+    Write-Err "No fixed drives found on this system"
     exit 1
 }
 
 $DefaultDrive = if ($AvailableDrives -contains "E") { "E" } else { $AvailableDrives[0] }
+
 Write-Host ""
 Write-Host "Where would you like to install the lab-monitor collector?" -ForegroundColor Cyan
-Write-Host "(This will create \\Users\\lab-monitor on the selected drive)" -ForegroundColor Gray
-$DriveInput = Read-Host "Enter drive letter (default: $DefaultDrive)"
-$SelectedDrive = if ([string]::IsNullOrWhiteSpace($DriveInput)) { $DefaultDrive } else { $DriveInput.TrimEnd(':') }
+Write-Host "(Creates <Drive>:\Users\lab-monitor)" -ForegroundColor Gray
+$DriveInput    = Read-Host "Enter drive letter (default: $DefaultDrive)"
+$SelectedDrive = if ([string]::IsNullOrWhiteSpace($DriveInput)) {
+    $DefaultDrive
+} else {
+    # Accept 'e', 'E', 'e:', 'E:' - normalise to single uppercase letter
+    $DriveInput.TrimEnd(':').Substring(0, 1).ToUpper()
+}
 
 if ($SelectedDrive -notin $AvailableDrives) {
-    Write-Error-Custom "Drive '$SelectedDrive' not found. Available drives: $($AvailableDrives -join ', ')"
+    Write-Err "Drive '$SelectedDrive' not found. Available: $($AvailableDrives -join ', ')"
     exit 1
 }
 
-Write-Success "Using drive: $SelectedDrive"
+Write-Success "Installing to drive ${SelectedDrive}:"
 Write-Host ""
 
-# Configuration
-$RootDir = "${SelectedDrive}:\Users\lab-monitor"
-$DataDir = "$RootDir\data"
-$LogsDir = "$RootDir\logs"
-$ScriptsDir = "$RootDir\scripts"
-$RepoUrl = "https://github.com/MoffittLab/lab-monitor.git"
+# ==============================================================================
+# Configuration variables  (all paths derived from selected drive)
+# ==============================================================================
+$RootDir      = "${SelectedDrive}:\Users\lab-monitor"
+$DataDir      = "$RootDir\data"
+$LogsDir      = "$RootDir\logs"
+$ScriptsDir   = "$RootDir\scripts"
+$BatchDir     = "$RootDir\bin"           # wrapper .bat scripts live here
+$RepoUrl      = "https://github.com/MoffittLab/lab-monitor.git"
 $CollectorDir = "$ScriptsDir\lab-monitor\collector"
-$ConfigFile = "$CollectorDir\local\config.json"
-$CondaEnv = $env:CONDA_DEFAULT_ENV
-if (-not $CondaEnv) {
-    Write-Host "ERROR: Could not determine active conda environment" -ForegroundColor Red
-    exit 1
+$ConfigFile   = "$CollectorDir\local\config.json"
+$CondaEnv     = $env:CONDA_DEFAULT_ENV
+
+# --- Locate python.exe inside the active conda environment -------------------
+# CONDA_PREFIX is set by 'conda activate' to the full env directory path.
+# We use this rather than relying on whatever 'python' is in PATH, so the
+# batch scripts we create will embed the correct absolute path.
+$PythonExe = $null
+if ($env:CONDA_PREFIX) {
+    $candidate = Join-Path $env:CONDA_PREFIX "python.exe"
+    if (Test-Path $candidate) { $PythonExe = $candidate }
 }
-$PythonExe = (Get-Command python.exe).Source  # Use conda env's python
-
-# Step 1: Create directory structure
-Write-Step "Step 1: Creating directory structure at $RootDir"
-if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
-if (-not (Test-Path $LogsDir)) { New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null }
-if (-not (Test-Path $ScriptsDir)) { New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null }
-Write-Success "Directories created at $RootDir"
-Write-Host ""
-
-# Step 2: Verify Python (conda environment)
-Write-Step "Step 2: Verifying Python from conda environment"
 if (-not $PythonExe) {
-    Write-Error-Custom "Python not found in conda environment PATH"
-    Write-Host ""
-    Write-Host "Make sure you:"
-    Write-Host "  1. Opened an Anaconda Prompt (not regular cmd/PowerShell)"
-    Write-Host "  2. (Optional) Activated a conda environment: conda activate lab-monitor"
-    Write-Host ""
+    # Fallback: first python.exe visible in PATH
+    $found = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($found) { $PythonExe = $found.Source }
+}
+if (-not $PythonExe) {
+    Write-Err "Cannot locate python.exe. Ensure the lab-monitor conda environment is activated."
     exit 1
 }
 
-$PythonVersion = & $PythonExe --version 2>&1
-Write-Success "Using Python from conda: $CondaEnv"
-Write-Host "  $PythonVersion"
-Write-Host ""
+# Batch script paths (created in Step 6, used by Task Scheduler)
+$DiskBat    = "$BatchDir\run-disk-collector.bat"
+$MetricsBat = "$BatchDir\run-metrics-collector.bat"
 
-# Step 3: Clone/update repository
+# ScanDepth is initialised here so it is always defined even if config already
+# exists and the interactive block is skipped (avoids blank output in summary)
+$ScanDepth = 2
+
+# ==============================================================================
+# Step 1: Create directory structure
+# ==============================================================================
+Write-Step "Step 1: Creating directory structure"
+foreach ($dir in @($DataDir, $LogsDir, $ScriptsDir, $BatchDir)) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+}
+Write-Success "Directories ready under $RootDir"
+
+# ==============================================================================
+# Step 2: Verify Python
+# ==============================================================================
+Write-Step "Step 2: Verifying Python"
+$PythonVersion = & "$PythonExe" --version 2>&1
+Write-Success "Python:      $PythonVersion"
+Write-Success "Executable:  $PythonExe"
+Write-Success "Conda env:   $CondaEnv"
+Write-Host "  (CONDA_PREFIX: $env:CONDA_PREFIX)" -ForegroundColor Gray
+
+# ==============================================================================
+# Step 3: Clone / update repository
+# ==============================================================================
 Write-Step "Step 3: Cloning/updating lab-monitor repository"
 if (Test-Path "$ScriptsDir\lab-monitor\.git") {
-    Write-Host "Repository already exists, pulling latest..."
+    Write-Host "Repository already present - pulling latest..." -ForegroundColor Cyan
     Push-Location "$ScriptsDir\lab-monitor"
-    & git pull origin main 2>&1 | Out-Null
+    $gitOut  = & git pull origin main 2>&1
+    $gitExit = $LASTEXITCODE
     Pop-Location
+    if ($gitExit -ne 0) {
+        Write-Warn "git pull exited with code $gitExit"
+        Write-Host ($gitOut | Out-String) -ForegroundColor Gray
+    } else {
+        Write-Success "Repository updated"
+    }
 } else {
-    Write-Host "Cloning from GitHub..."
+    Write-Host "Cloning from $RepoUrl ..." -ForegroundColor Cyan
     Push-Location $ScriptsDir
-    & git clone $RepoUrl 2>&1 | Out-Null
+    $gitOut  = & git clone $RepoUrl 2>&1
+    $gitExit = $LASTEXITCODE
     Pop-Location
+    if ($gitExit -ne 0) {
+        Write-Warn "git clone exited with code $gitExit"
+        Write-Host ($gitOut | Out-String) -ForegroundColor Gray
+    }
 }
-if ($LASTEXITCODE -eq 0 -or (Test-Path "$ScriptsDir\lab-monitor\collector\collector.py")) {
+if (Test-Path "$ScriptsDir\lab-monitor\collector\collector.py") {
     Write-Success "Repository ready at $ScriptsDir\lab-monitor"
 } else {
-    Write-Error-Custom "Could not clone repository"
+    Write-Err "collector.py not found after clone/pull"
+    Write-Host "  Verify that git is installed and $RepoUrl is reachable" -ForegroundColor Yellow
     exit 1
 }
-Write-Host ""
 
+# ==============================================================================
 # Step 4: Conda environment info
-Write-Step "Step 4: Using conda environment"
-Write-Success "Conda environment: $CondaEnv"
-Write-Host "  Python: $PythonExe"
-Write-Host ""
+# ==============================================================================
+Write-Step "Step 4: Conda environment"
+Write-Success "Environment: $CondaEnv"
+Write-Host "  Python:  $PythonExe" -ForegroundColor Gray
+Write-Host "  Prefix:  $env:CONDA_PREFIX" -ForegroundColor Gray
 
-# Step 5: Install dependencies
-Write-Step "Step 5: Installing dependencies"
-Write-Host "Installing from requirements.txt..."
-& $PythonExe -m pip install --upgrade pip 2>&1 | Out-Null
+# ==============================================================================
+# Step 5: Install Python dependencies
+# ==============================================================================
+Write-Step "Step 5: Installing Python dependencies"
+Write-Host "Upgrading pip..." -ForegroundColor Cyan
+& "$PythonExe" -m pip install --upgrade pip 2>&1 | Out-Null
+
+Write-Host "Installing from requirements.txt..." -ForegroundColor Cyan
 Push-Location $CollectorDir
-& $PythonExe -m pip install -r requirements.txt 2>&1 | Out-Null
+$pipOut  = & "$PythonExe" -m pip install -r requirements.txt 2>&1
+$pipExit = $LASTEXITCODE
 Pop-Location
-if ($LASTEXITCODE -eq 0) {
+
+if ($pipExit -eq 0) {
     Write-Success "Dependencies installed"
 } else {
-    Write-Error-Custom "Could not install dependencies"
+    Write-Err "pip install failed (exit code $pipExit)"
+    Write-Host ($pipOut | Out-String) -ForegroundColor Gray
     exit 1
 }
+
+# ==============================================================================
+# Step 6: Create wrapper batch scripts
+# ==============================================================================
+Write-Step "Step 6: Creating wrapper batch scripts"
+Write-Host "These batch scripts embed the full absolute path to python.exe" -ForegroundColor Cyan
+Write-Host "inside the conda environment. Task Scheduler calls them via cmd.exe," -ForegroundColor Cyan
+Write-Host "so they work even when no conda session is active and even when the" -ForegroundColor Cyan
+Write-Host "task runs as a different Windows user account." -ForegroundColor Cyan
 Write-Host ""
 
-# Step 6: Gather configuration (interactive)
-Write-Step "Step 6: Gathering configuration"
+$DiskBatContent = @"
+@echo off
+REM Lab Monitor - Disk Collection
+REM Auto-generated by install-collector-windows.ps1 -- do not edit manually.
+REM Python: $PythonExe
+setlocal
+cd /d "$CollectorDir"
+"$PythonExe" collector.py --config local\config.json --mode disk
+endlocal
+"@
+
+$MetricsBatContent = @"
+@echo off
+REM Lab Monitor - Metrics Collection
+REM Auto-generated by install-collector-windows.ps1 -- do not edit manually.
+REM Python: $PythonExe
+setlocal
+cd /d "$CollectorDir"
+"$PythonExe" collector.py --config local\config.json --mode metrics
+endlocal
+"@
+
+Set-Content -Path $DiskBat    -Value $DiskBatContent    -Encoding ASCII
+Set-Content -Path $MetricsBat -Value $MetricsBatContent -Encoding ASCII
+
+Write-Success "Disk script:    $DiskBat"
+Write-Success "Metrics script: $MetricsBat"
+Write-Host ""
+Write-Host "Test them at any time from an admin prompt:" -ForegroundColor Gray
+Write-Host "  cmd /c `"$DiskBat`"" -ForegroundColor Gray
+Write-Host "  cmd /c `"$MetricsBat`"" -ForegroundColor Gray
+
+# ==============================================================================
+# Step 7: Gather configuration (interactive)
+# ==============================================================================
+Write-Step "Step 7: Gathering configuration"
 $LocalDir = "$CollectorDir\local"
 if (-not (Test-Path $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
 
 if (-not (Test-Path $ConfigFile)) {
-    Write-Host "Auto-detected values:"
+
+    Write-Host "Auto-detected values:" -ForegroundColor Cyan
     $ServerName = $env:COMPUTERNAME.ToLower()
-    Write-Host "  - Server name: $ServerName"
+    Write-Host "  Server name: $ServerName" -ForegroundColor Gray
     Write-Host ""
-    
-    # Prompt for Manager URL
+
+    # -- Manager URL ----------------------------------------------------------
     $ManagerUrl = Read-Host "Enter Manager URL (e.g., http://atlantis.med.harvard.edu:5000)"
     if ([string]::IsNullOrWhiteSpace($ManagerUrl)) {
-        Write-Error-Custom "Manager URL cannot be empty"
+        Write-Err "Manager URL cannot be empty"
         exit 1
     }
     if ($ManagerUrl -like "https://*") {
-        Write-Host " WARNING:  Warning: URL starts with https:// but Manager runs plain HTTP" -ForegroundColor Yellow
+        Write-Warn "URL starts with https:// but Manager runs plain HTTP"
         $Confirm = Read-Host "Continue with https:// anyway? [y/N]"
         if ($Confirm -ne "y" -and $Confirm -ne "Y") {
-            Write-Host "Please re-run and enter the correct URL."
+            Write-Host "Please re-run with the correct URL."
             exit 1
         }
     }
 
-    # Prompt for Manager Token
+    # -- Manager Token --------------------------------------------------------
     $ManagerToken = Read-Host "Enter Manager Token (from Manager config)"
     if ([string]::IsNullOrWhiteSpace($ManagerToken)) {
-        Write-Error-Custom "Manager Token cannot be empty"
+        Write-Err "Manager Token cannot be empty"
         exit 1
     }
 
-    # Prompt for Device Type
+    # -- Device Type ----------------------------------------------------------
     Write-Host ""
-    Write-Host "Device types:"
-    Write-Host "  NAS           - Standard NAS (scan folders)"
-    Write-Host "  NAS-Instrument - Research instrument storage (scan deeper)"
-    Write-Host "  NAS-Backup    - Backup volume (volume-only, fast)"
-    Write-Host "  Server        - Windows Server (scan folders)"
-    $DeviceType = Read-Host "Enter Device Type [NAS/NAS-Instrument/NAS-Backup/Server]"
-    if ([string]::IsNullOrWhiteSpace($DeviceType)) {
-        $DeviceType = "Server"
-    }
+    Write-Host "Device types:" -ForegroundColor Cyan
+    Write-Host "  NAS            - Standard NAS (scan top-level folders)" -ForegroundColor Gray
+    Write-Host "  NAS-Instrument - Research instrument storage (scan deeper)" -ForegroundColor Gray
+    Write-Host "  NAS-Backup     - Backup volume (volume-level only, fast)" -ForegroundColor Gray
+    Write-Host "  Server         - Windows Server (scan top-level folders)" -ForegroundColor Gray
+    $DeviceType = Read-Host "Enter Device Type [NAS/NAS-Instrument/NAS-Backup/Server] (default: Server)"
+    if ([string]::IsNullOrWhiteSpace($DeviceType)) { $DeviceType = "Server" }
     if ($DeviceType -notin @("NAS", "NAS-Instrument", "NAS-Backup", "Server")) {
-        Write-Host " WARNING:  Warning: '$DeviceType' is not a recognized device type. Continuing anyway." -ForegroundColor Yellow
+        Write-Warn "'$DeviceType' is not a recognised device type - continuing anyway"
     }
 
-    # Suggest default scan_depth
+    # -- Scan depth -----------------------------------------------------------
     $DefaultDepth = switch ($DeviceType) {
-        "NAS-Backup" { 1 }
+        "NAS-Backup"     { 1 }
         "NAS-Instrument" { 3 }
-        default { 2 }
+        default          { 2 }
     }
-
     Write-Host ""
-    Write-Host "Scan depth controls how many folder levels the disk collector measures:"
-    Write-Host "  1 = Volume only        (fast, filesystem stats  -- recommended for NAS-Backup)"
-    Write-Host "  2 = Volume/Folder      (standard                -- recommended for NAS and Server)"
-    Write-Host "  3 = Volume/Folder/Sub  (one level deeper        -- recommended for NAS-Instrument)"
+    Write-Host "Scan depth controls how many folder levels are measured:" -ForegroundColor Cyan
+    Write-Host "  1 = Volume only        (fast  - recommended for NAS-Backup)" -ForegroundColor Gray
+    Write-Host "  2 = Volume + folders   (standard - recommended for NAS/Server)" -ForegroundColor Gray
+    Write-Host "  3 = Volume + sub-folders (detailed - recommended for NAS-Instrument)" -ForegroundColor Gray
     $ScanDepthInput = Read-Host "Enter Scan Depth [1/2/3] (default: $DefaultDepth)"
     $ScanDepth = if ([string]::IsNullOrWhiteSpace($ScanDepthInput)) { $DefaultDepth } else { [int]$ScanDepthInput }
     if ($ScanDepth -lt 1 -or $ScanDepth -gt 10) {
-        Write-Error-Custom "Scan Depth must be a positive integer"
+        Write-Err "Scan Depth must be between 1 and 10"
         exit 1
     }
     Write-Success "Scan depth: $ScanDepth"
 
-    # Prompt for volumes
+    # -- Volumes --------------------------------------------------------------
     Write-Host ""
-    Write-Host "Detected drives: C:, D:, E:, F:, G:, H:, I:, J:, K:, L:, M:, N:, O:, P:, Q:, R:, S:, T:, U:, V:, W:, X:, Y:, Z:"
+    # Show only drives that actually exist on this machine (from Step 0)
+    $DriveList = ($AvailableDrives | ForEach-Object { "${_}:" }) -join ", "
+    Write-Host "Available fixed drives: $DriveList" -ForegroundColor Cyan
     $VolumesInput = Read-Host "Enter drives to monitor (comma-separated, e.g., E:,F:,G:)"
-    $Volumes = @()
     if (-not [string]::IsNullOrWhiteSpace($VolumesInput)) {
-        $Volumes = @($VolumesInput -split ',' | ForEach-Object { $_.Trim() })
+        $Volumes = @($VolumesInput -split ',' | ForEach-Object { $_.Trim().ToUpper() })
     } else {
-        # Default to E: and F:
-        $Volumes = @("E:", "F:")
+        # Default to all detected fixed drives except C: (system drive)
+        $Volumes = @($AvailableDrives | Where-Object { $_ -ne "C" } | ForEach-Object { "${_}:" })
+        if ($Volumes.Count -eq 0) { $Volumes = @("C:") }
+        Write-Host "No input - defaulting to: $($Volumes -join ', ')" -ForegroundColor Gray
     }
-    Write-Host "Volumes to monitor: $($Volumes -join ', ')"
-    Write-Host ""
+    Write-Host "Volumes to monitor: $($Volumes -join ', ')" -ForegroundColor Cyan
 
-    # Display what will be profiled based on scan depth
-    Write-Step "Disk Profiling Preview (Scan Depth: $ScanDepth)"
-    Write-Host "The disk collection will profile the following folder levels:" -ForegroundColor Cyan
+    # -- Disk profiling preview -----------------------------------------------
     Write-Host ""
-    
+    Write-Host "Disk profiling preview (scan depth $ScanDepth):" -ForegroundColor Cyan
     switch ($ScanDepth) {
         1 {
-            Write-Host "  [Level 1] Volume root only" -ForegroundColor Yellow
-            Write-Host "    Example: E:\ (filesystem stats only)" -ForegroundColor Gray
-            Write-Host "    [OK] Fastest" -ForegroundColor Green
-            Write-Host "    [X] No per-folder breakdown" -ForegroundColor Red
+            Write-Host "  Level 1: Volume root only  (e.g., E:\)" -ForegroundColor Gray
+            Write-Host "  [OK] Fastest   [X] No per-folder breakdown" -ForegroundColor Gray
         }
         2 {
-            Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
-            Write-Host "    Example: E:\" -ForegroundColor Gray
-            Write-Host "  [Level 2] Top-level folders" -ForegroundColor Yellow
-            Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
-            Write-Host "    [OK] Standard: captures main data areas" -ForegroundColor Green
+            Write-Host "  Level 1: Volume root  (e.g., E:\)" -ForegroundColor Gray
+            Write-Host "  Level 2: Top-level folders  (e.g., E:\Data, E:\Backups, E:\Projects)" -ForegroundColor Gray
+            Write-Host "  [OK] Standard - captures main data areas" -ForegroundColor Gray
         }
         3 {
-            Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
-            Write-Host "    Example: E:\" -ForegroundColor Gray
-            Write-Host "  [Level 2] Top-level folders" -ForegroundColor Yellow
-            Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
-            Write-Host "  [Level 3] Subfolders" -ForegroundColor Yellow
-            Write-Host "    Examples: E:\Data\2024, E:\Data\2024\Experiments" -ForegroundColor Gray
-            Write-Host "    [OK] Detailed breakdown of folder structures" -ForegroundColor Green
-            Write-Host "    [X] Takes longer on deep hierarchies" -ForegroundColor Red
+            Write-Host "  Level 1: Volume root  (e.g., E:\)" -ForegroundColor Gray
+            Write-Host "  Level 2: Top-level folders  (e.g., E:\Data, E:\Backups, E:\Projects)" -ForegroundColor Gray
+            Write-Host "  Level 3: Sub-folders  (e.g., E:\Data\2024, E:\Data\2024\Experiments)" -ForegroundColor Gray
+            Write-Host "  [OK] Detailed breakdown   [X] Slower on deep hierarchies" -ForegroundColor Gray
         }
         default {
-            Write-Host "  Custom depth: $ScanDepth levels" -ForegroundColor Yellow
+            Write-Host "  Custom depth: $ScanDepth levels" -ForegroundColor Gray
         }
     }
     Write-Host ""
-    Write-Host "These profiled folders and their sizes will be sent to the Manager" -ForegroundColor Cyan
-    Write-Host "The full filesystem hierarchy is preserved in your local data directory" -ForegroundColor Cyan
-    Write-Host ""
 
-    # Create config file
+    # -- Write config.json ----------------------------------------------------
     $ConfigContent = @{
-        name = $ServerName
-        id = "windows-$ServerName"
-        device_type = $DeviceType
-        manager_url = $ManagerUrl
-        manager_token = $ManagerToken
-        volumes = $Volumes
-        scan_depth = $ScanDepth
-        data_dir = "$RootDir\data"
-        log_file = "$RootDir\logs\collector.log"
-        log_level = "INFO"
-        timeout_seconds = 3600
+        name                    = $ServerName
+        id                      = "windows-$ServerName"
+        device_type             = $DeviceType
+        manager_url             = $ManagerUrl
+        manager_token           = $ManagerToken
+        volumes                 = $Volumes
+        scan_depth              = $ScanDepth
+        data_dir                = "$RootDir\data"
+        log_file                = "$RootDir\logs\collector.log"
+        log_level               = "INFO"
+        timeout_seconds         = 3600
         request_timeout_seconds = 30
     } | ConvertTo-Json -Depth 3
 
     Set-Content -Path $ConfigFile -Value $ConfigContent
-    Write-Success "Config file created at $ConfigFile"
+    Write-Success "Config written to $ConfigFile"
     Write-Host ""
-    Write-Host "Configuration saved with:"
-    Write-Host "  - Server Name:   $ServerName"
-    Write-Host "  - Device Type:   $DeviceType"
-    Write-Host "  - Scan Depth:    $ScanDepth"
-    Write-Host "  - Volumes:       $($Volumes -join ', ')"
-    Write-Host "  - Manager URL:   $ManagerUrl"
-    Write-Host "  - Manager Token: (set)"
-    Write-Host ""
-} else {
-    Write-Success "Config file already exists at $ConfigFile"
-    Write-Host "   (Edit manually if needed: notepad $ConfigFile)"
-}
-Write-Host ""
+    Write-Host "  Server name: $ServerName"              -ForegroundColor Gray
+    Write-Host "  Device type: $DeviceType"              -ForegroundColor Gray
+    Write-Host "  Scan depth:  $ScanDepth"               -ForegroundColor Gray
+    Write-Host "  Volumes:     $($Volumes -join ', ')"   -ForegroundColor Gray
+    Write-Host "  Manager URL: $ManagerUrl"              -ForegroundColor Gray
+    Write-Host "  Token:       (set)"                    -ForegroundColor Gray
 
-# Step 7: Test collector
-Write-Step "Step 7: Testing collector (metrics mode)"
-Write-Host "Testing metrics collection..."
+} else {
+    Write-Success "Config already exists at $ConfigFile"
+    Write-Host "  (Edit manually if needed: notepad `"$ConfigFile`")" -ForegroundColor Gray
+
+    # Read ScanDepth from existing config so the final summary is accurate
+    try {
+        $existingCfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+        if ($null -ne $existingCfg.scan_depth) { $ScanDepth = $existingCfg.scan_depth }
+    } catch {}
+}
+
+# ==============================================================================
+# Step 8: Test collector
+# ==============================================================================
+Write-Step "Step 8: Testing collector (metrics mode)"
+Write-Host "Running a quick metrics test against the Manager..." -ForegroundColor Cyan
 Push-Location $CollectorDir
-& $PythonExe collector.py --config local\config.json --mode metrics 2>&1 | Out-Null
-$TestResult = $LASTEXITCODE
+& "$PythonExe" collector.py --config local\config.json --mode metrics 2>&1 | Out-Null
+$TestExit = $LASTEXITCODE
 Pop-Location
-if ($TestResult -eq 0) {
-    Write-Success "Metrics collection test passed"
+if ($TestExit -eq 0) {
+    Write-Success "Metrics test passed"
 } else {
-    Write-Host " WARNING:  Metrics collection test failed (may be normal if Manager not running yet)" -ForegroundColor Yellow
+    Write-Warn "Metrics test returned exit code $TestExit"
+    Write-Host "  This is normal if the Manager is not yet running or reachable." -ForegroundColor Gray
 }
+
+# ==============================================================================
+# Step 9: Register Task Scheduler jobs
+# ==============================================================================
+Write-Step "Step 9: Registering Task Scheduler jobs"
+
+Write-Host "Tasks invoke the batch scripts in $BatchDir" -ForegroundColor Cyan
+Write-Host "The batch scripts use a hardcoded absolute path to python.exe" -ForegroundColor Cyan
+Write-Host "so they are independent of any conda session or user environment." -ForegroundColor Cyan
 Write-Host ""
 
-# Step 8: Register Task Scheduler jobs
-Write-Step "Step 8: Registering Task Scheduler jobs"
+# Run tasks as current user (not SYSTEM - SYSTEM cannot access a per-user
+# conda environment). The tasks are registered for the current logged-on user.
+$CurrentUser = "$env:USERDOMAIN\$env:USERNAME"
+Write-Host "Registering tasks to run as: $CurrentUser" -ForegroundColor Gray
+Write-Host ""
+Write-Host "NOTE: By default, tasks run 'only when this user is logged on'." -ForegroundColor Yellow
+Write-Host "      For unattended execution (user logged off), open Task Scheduler" -ForegroundColor Yellow
+Write-Host "      after install, edit each task, choose 'Run whether user is" -ForegroundColor Yellow
+Write-Host "      logged on or not', and enter your Windows password when prompted." -ForegroundColor Yellow
+Write-Host ""
 
-# Try to import the ScheduledTasks module
 try {
     Import-Module ScheduledTasks -ErrorAction Stop
-    Write-Host "ScheduledTasks module loaded" -ForegroundColor Gray
 } catch {
-    Write-Host "WARNING: Could not import ScheduledTasks module: $_" -ForegroundColor Yellow
-    Write-Host "Attempting to continue anyway..." -ForegroundColor Yellow
+    Write-Warn "Could not import ScheduledTasks module: $_"
+    Write-Host "  Attempting to continue anyway..." -ForegroundColor Yellow
 }
 
-# Disk collection job (daily 2 AM)
+# -- Disk collection (daily at 2:00 AM) --------------------------------------
 try {
-    $DiskAction = New-ScheduledTaskAction `
-        -Execute $PythonExe `
-        -Argument "$CollectorDir\collector.py --config local\config.json --mode disk" `
-        -WorkingDirectory $CollectorDir
+    $DiskAction   = New-ScheduledTaskAction `
+                        -Execute  "cmd.exe" `
+                        -Argument "/c `"$DiskBat`""
 
-    $DiskTrigger = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
+    $DiskTrigger  = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
 
-    $DiskTask = @{
-        TaskName = "Lab Monitor - Disk Collection"
-        Action = $DiskAction
-        Trigger = $DiskTrigger
-        RunLevel = "Highest"
-        User = "SYSTEM"
-        Force = $true
-    }
+    $DiskSettings = New-ScheduledTaskSettingsSet `
+                        -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+                        -StartWhenAvailable
 
-    Register-ScheduledTask @DiskTask | Out-Null
-    Write-Success "Disk collection job registered (daily at 2:00 AM)"
+    Register-ScheduledTask `
+        -TaskName "Lab Monitor - Disk Collection" `
+        -Action   $DiskAction  `
+        -Trigger  $DiskTrigger `
+        -Settings $DiskSettings `
+        -RunLevel Highest `
+        -User     $CurrentUser `
+        -Force | Out-Null
+
+    Write-Success "Disk collection task registered (daily at 2:00 AM)"
+    Write-Host "  Script: $DiskBat" -ForegroundColor Gray
 } catch {
-    Write-Host "WARNING: Could not register disk job: $_" -ForegroundColor Yellow
-    Write-Host "You may need to manually create this task (see Step 9 instructions)" -ForegroundColor Yellow
+    Write-Warn "Could not register disk task: $_"
+    Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
 }
 
 Write-Host ""
 
-# Metrics collection job (every 5 minutes)
+# -- Metrics collection (every 5 minutes, indefinitely) ----------------------
 try {
-    $MetricsAction = New-ScheduledTaskAction `
-        -Execute $PythonExe `
-        -Argument "$CollectorDir\collector.py --config local\config.json --mode metrics" `
-        -WorkingDirectory $CollectorDir
+    $MetricsAction   = New-ScheduledTaskAction `
+                           -Execute  "cmd.exe" `
+                           -Argument "/c `"$MetricsBat`""
 
-    $MetricsTrigger = New-ScheduledTaskTrigger `
-        -Once `
-        -At "00:00" `
-        -RepetitionInterval (New-TimeSpan -Minutes 5) `
-        -RepetitionDuration (New-TimeSpan -Days 365)
+    # Use -Days 9999 for indefinite repetition (works on all Windows versions)
+    $MetricsTrigger  = New-ScheduledTaskTrigger `
+                           -Once `
+                           -At                 "00:00" `
+                           -RepetitionInterval (New-TimeSpan -Minutes 5) `
+                           -RepetitionDuration (New-TimeSpan -Days 9999)
 
-    $MetricsTask = @{
-        TaskName = "Lab Monitor - Metrics Collection"
-        Action = $MetricsAction
-        Trigger = $MetricsTrigger
-        RunLevel = "Highest"
-        User = "SYSTEM"
-        Force = $true
-    }
+    $MetricsSettings = New-ScheduledTaskSettingsSet `
+                           -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+                           -StartWhenAvailable `
+                           -MultipleInstances   IgnoreNew
 
-    Register-ScheduledTask @MetricsTask | Out-Null
-    Write-Success "Metrics collection job registered (every 5 minutes)"
+    Register-ScheduledTask `
+        -TaskName "Lab Monitor - Metrics Collection" `
+        -Action   $MetricsAction   `
+        -Trigger  $MetricsTrigger  `
+        -Settings $MetricsSettings `
+        -RunLevel Highest `
+        -User     $CurrentUser `
+        -Force | Out-Null
+
+    Write-Success "Metrics collection task registered (every 5 min, indefinite)"
+    Write-Host "  Script: $MetricsBat" -ForegroundColor Gray
 } catch {
-    Write-Host "WARNING: Could not register metrics job: $_" -ForegroundColor Yellow
-    Write-Host "You may need to manually create this task (see Step 9 instructions)" -ForegroundColor Yellow
+    Write-Warn "Could not register metrics task: $_"
+    Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
 }
+
+# ==============================================================================
+# Step 10: Manual Task Scheduler instructions (fallback)
+# ==============================================================================
+Write-Step "Step 10: Manual Task Scheduler Configuration (if auto-registration failed)"
+Write-Host "Both tasks call cmd.exe with a batch script as the argument." -ForegroundColor Cyan
 Write-Host ""
 
-# Step 9: Display manual Task Scheduler configuration instructions
-Write-Step "Step 9: Manual Task Scheduler Configuration (Optional)"
-Write-Host "If automatic registration failed, you can manually create the scheduled tasks:" -ForegroundColor Cyan
-Write-Host ""
 Write-Host "DISK COLLECTION TASK (Daily at 2:00 AM):" -ForegroundColor Yellow
-Write-Host "===============================================" -ForegroundColor Yellow
-Write-Host "1. Open Windows Task Scheduler (search 'Task Scheduler' in Start Menu)" -ForegroundColor White
-Write-Host "2. Click 'Create Task' on the right sidebar" -ForegroundColor White
-Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
-Write-Host "   - Name: Lab Monitor - Disk Collection" -ForegroundColor Gray
-Write-Host "   - Check: 'Run with highest privileges'" -ForegroundColor Gray
-Write-Host "4. Go to the 'Triggers' tab:" -ForegroundColor White
-Write-Host "   - Click 'New'" -ForegroundColor Gray
-Write-Host "   - Begin the task: On a schedule" -ForegroundColor Gray
-Write-Host "   - Set to: Daily" -ForegroundColor Gray
-Write-Host "   - Start time: 02:00:00 (2:00 AM)" -ForegroundColor Gray
-Write-Host "   - Repeat every: 1 day" -ForegroundColor Gray
-Write-Host "5. Go to the 'Actions' tab:" -ForegroundColor White
-Write-Host "   - Click 'New'" -ForegroundColor Gray
-Write-Host "   - Action: Start a program" -ForegroundColor Gray
-Write-Host "   - Program/script: $PythonExe" -ForegroundColor Gray
-Write-Host "   - Arguments: $CollectorDir\collector.py --config local\config.json --mode disk" -ForegroundColor Gray
-Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
-Write-Host "6. Click 'OK' to save" -ForegroundColor White
-Write-Host ""
-Write-Host "METRICS COLLECTION TASK (Every 5 minutes):" -ForegroundColor Yellow
-Write-Host "===============================================" -ForegroundColor Yellow
-Write-Host "1. Open Windows Task Scheduler" -ForegroundColor White
-Write-Host "2. Click 'Create Task'" -ForegroundColor White
-Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
-Write-Host "   - Name: Lab Monitor - Metrics Collection" -ForegroundColor Gray
-Write-Host "   - Check: 'Run with highest privileges'" -ForegroundColor Gray
-Write-Host "4. Go to the 'Triggers' tab:" -ForegroundColor White
-Write-Host "   - Click 'New'" -ForegroundColor Gray
-Write-Host "   - Begin the task: On a schedule" -ForegroundColor Gray
-Write-Host "   - Set to: Daily" -ForegroundColor Gray
-Write-Host "   - Start time: 00:00:00 (midnight, or any time)" -ForegroundColor Gray
-Write-Host "   - Repeat task every: 5 minutes" -ForegroundColor Gray
-Write-Host "   - For a duration of: 1 day (repeats continuously)" -ForegroundColor Gray
-Write-Host "5. Go to the 'Actions' tab:" -ForegroundColor White
-Write-Host "   - Click 'New'" -ForegroundColor Gray
-Write-Host "   - Action: Start a program" -ForegroundColor Gray
-Write-Host "   - Program/script: $PythonExe" -ForegroundColor Gray
-Write-Host "   - Arguments: $CollectorDir\collector.py --config local\config.json --mode metrics" -ForegroundColor Gray
-Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
-Write-Host "6. Click 'OK' to save" -ForegroundColor White
-Write-Host ""
-Write-Host "VERIFY TASKS:" -ForegroundColor Yellow
-Write-Host "=============" -ForegroundColor Yellow
-Write-Host "- Open Task Scheduler and look for tasks named 'Lab Monitor'" -ForegroundColor White
-Write-Host "- Right-click a task and select 'Run' to test it immediately" -ForegroundColor White
-Write-Host "- Check the log file for results: $LogsDir\collector.log" -ForegroundColor White
-Write-Host ""
-Write-Host "TROUBLESHOOTING FAILED TASK REGISTRATION:" -ForegroundColor Yellow
-Write-Host "=========================================" -ForegroundColor Yellow
-Write-Host "If automatic Task Scheduler registration failed ('Invalid namespace' error):" -ForegroundColor White
-Write-Host ""
-Write-Host "1. This usually means the WMI Task Scheduler classes aren't available." -ForegroundColor Gray
-Write-Host "2. Try these fixes (in order):" -ForegroundColor White
-Write-Host ""
-Write-Host "   a) Close this PowerShell and try with a fresh Anaconda PowerShell Prompt" -ForegroundColor Gray
-Write-Host "      (WMI sometimes needs reinitialization)" -ForegroundColor Gray
-Write-Host ""
-Write-Host "   b) Rebuild WMI: Run in Administrator cmd.exe (NOT PowerShell):" -ForegroundColor Gray
-Write-Host "      winmgmt /salvagerepository" -ForegroundColor Gray
-Write-Host ""
-Write-Host "   c) Manually create tasks using the GUI (see Step 9 above)" -ForegroundColor Gray
-Write-Host ""
-Write-Host "3. After any fix, re-run this script to retry automatic registration." -ForegroundColor White
+Write-Host "==========================================" -ForegroundColor Yellow
+Write-Host "1. Open Task Scheduler (search Start Menu)" -ForegroundColor White
+Write-Host "2. Action menu -> Create Task" -ForegroundColor White
+Write-Host "3. General tab:" -ForegroundColor White
+Write-Host "     Name:  Lab Monitor - Disk Collection" -ForegroundColor Gray
+Write-Host "     Check: Run with highest privileges" -ForegroundColor Gray
+Write-Host "     Optional: Run whether user is logged on or not" -ForegroundColor Gray
+Write-Host "4. Triggers tab -> New:" -ForegroundColor White
+Write-Host "     Begin the task: On a schedule -> Daily at 02:00:00" -ForegroundColor Gray
+Write-Host "5. Actions tab -> New:" -ForegroundColor White
+Write-Host "     Program/script: cmd.exe" -ForegroundColor Gray
+Write-Host "     Arguments:      /c `"$DiskBat`"" -ForegroundColor Gray
+Write-Host "6. OK to save" -ForegroundColor White
 Write-Host ""
 
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
-Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "METRICS COLLECTION TASK (Every 5 minutes):" -ForegroundColor Yellow
+Write-Host "==========================================" -ForegroundColor Yellow
+Write-Host "1. Open Task Scheduler -> Action menu -> Create Task" -ForegroundColor White
+Write-Host "2. General tab:" -ForegroundColor White
+Write-Host "     Name:  Lab Monitor - Metrics Collection" -ForegroundColor Gray
+Write-Host "     Check: Run with highest privileges" -ForegroundColor Gray
+Write-Host "     Optional: Run whether user is logged on or not" -ForegroundColor Gray
+Write-Host "3. Triggers tab -> New:" -ForegroundColor White
+Write-Host "     Begin the task: On a schedule -> Daily at 00:00:00" -ForegroundColor Gray
+Write-Host "     Check: Repeat task every 5 minutes, for Indefinitely" -ForegroundColor Gray
+Write-Host "4. Actions tab -> New:" -ForegroundColor White
+Write-Host "     Program/script: cmd.exe" -ForegroundColor Gray
+Write-Host "     Arguments:      /c `"$MetricsBat`"" -ForegroundColor Gray
+Write-Host "5. Settings tab:" -ForegroundColor White
+Write-Host "     Check: Start task as soon as possible after a scheduled start is missed" -ForegroundColor Gray
+Write-Host "     If task is already running: Do not start a new instance" -ForegroundColor Gray
+Write-Host "6. OK to save" -ForegroundColor White
 Write-Host ""
-Write-Host 'VERIFICATION & NEXT STEPS:' -ForegroundColor Cyan
-Write-Host "======================================" -ForegroundColor Cyan
+
+Write-Host "TROUBLESHOOTING TASK REGISTRATION:" -ForegroundColor Yellow
+Write-Host "====================================" -ForegroundColor Yellow
+Write-Host "If you see 'Invalid namespace' on auto-registration, try:" -ForegroundColor White
+Write-Host "  a) Close and re-open Anaconda PowerShell Prompt (as Admin), re-run script" -ForegroundColor Gray
+Write-Host "  b) Rebuild WMI - run this in Administrator cmd.exe (not PowerShell):" -ForegroundColor Gray
+Write-Host "       winmgmt /salvagerepository" -ForegroundColor Gray
+Write-Host "  c) Create tasks manually using the GUI steps above" -ForegroundColor Gray
 Write-Host ""
-Write-Host "1. Review your configuration:" -ForegroundColor White
-Write-Host "   notepad '$ConfigFile'" -ForegroundColor Gray
+
+# ==============================================================================
+# Final summary
+# ==============================================================================
 Write-Host ""
-Write-Host "2. Verify scheduled tasks were created:" -ForegroundColor White
-Write-Host "   Get-ScheduledTask | Select-String 'Lab Monitor'" -ForegroundColor Gray
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "  [OK] Installation Complete" -ForegroundColor Green
+Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "3. Test disk collection manually:" -ForegroundColor White
-Write-Host "   cd '$CollectorDir'" -ForegroundColor Gray
-Write-Host '   & $PythonExe collector.py --config local\config.json --mode disk' -ForegroundColor Gray
+Write-Host "INSTALLED FILES:" -ForegroundColor Yellow
+Write-Host "================" -ForegroundColor Yellow
+Write-Host "  Root:            $RootDir"            -ForegroundColor Gray
+Write-Host "  Config:          $ConfigFile"         -ForegroundColor Gray
+Write-Host "  Disk script:     $DiskBat"            -ForegroundColor Gray
+Write-Host "  Metrics script:  $MetricsBat"         -ForegroundColor Gray
+Write-Host "  Logs:            $LogsDir\collector.log" -ForegroundColor Gray
+Write-Host "  Scan depth:      $ScanDepth"          -ForegroundColor Gray
 Write-Host ""
-Write-Host "4. Monitor ongoing collections (follow log in real-time):" -ForegroundColor White
-Write-Host "   Get-Content -Path '$LogsDir\collector.log' -Tail 50 -Wait" -ForegroundColor Gray
+Write-Host "VERIFICATION:" -ForegroundColor Yellow
+Write-Host "=============" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "5. Check task execution history in Task Scheduler:" -ForegroundColor White
-Write-Host "   Open 'Task Scheduler' and navigate to Task Scheduler Library" -ForegroundColor Gray
-Write-Host "   Right-click 'Lab Monitor - Disk Collection' -> View All Tasks" -ForegroundColor Gray
+Write-Host "1. Review config:" -ForegroundColor White
+Write-Host "     notepad `"$ConfigFile`"" -ForegroundColor Gray
 Write-Host ""
-Write-Host "IMPORTANT NOTES:" -ForegroundColor Yellow
-Write-Host "===================" -ForegroundColor Yellow
-Write-Host "- The collector will profile folders at depth $ScanDepth" -ForegroundColor White
-Write-Host "- Disk collection runs daily at 2:00 AM (slow operation)" -ForegroundColor White
-Write-Host "- Metrics collection runs every 5 minutes (lightweight)" -ForegroundColor White
-Write-Host "- Check logs in: $LogsDir" -ForegroundColor White
+Write-Host "2. Confirm tasks registered:" -ForegroundColor White
+Write-Host '     Get-ScheduledTask | Where-Object { $_.TaskName -like "*Lab Monitor*" }' -ForegroundColor Gray
+Write-Host ""
+Write-Host "3. Test batch scripts manually:" -ForegroundColor White
+Write-Host "     cmd /c `"$DiskBat`"" -ForegroundColor Gray
+Write-Host "     cmd /c `"$MetricsBat`"" -ForegroundColor Gray
+Write-Host ""
+Write-Host "4. Watch the log live:" -ForegroundColor White
+Write-Host "     Get-Content `"$LogsDir\collector.log`" -Tail 50 -Wait" -ForegroundColor Gray
 Write-Host ""
