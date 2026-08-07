@@ -400,56 +400,69 @@ Write-Host ""
 # Step 8: Register Task Scheduler jobs
 Write-Step "Step 8: Registering Task Scheduler jobs"
 
-# Disk collection job (daily 2 AM)
-$DiskAction = New-ScheduledTaskAction `
-    -Execute $PythonExe `
-    -Argument "$CollectorDir\collector.py --config local\config.json --mode disk" `
-    -WorkingDirectory $CollectorDir
-
-$DiskTrigger = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
-
-$DiskTask = @{
-    TaskName = "Lab Monitor - Disk Collection"
-    Action = $DiskAction
-    Trigger = $DiskTrigger
-    RunLevel = "Highest"
-    User = "SYSTEM"
-    Force = $true
+# Try to import the ScheduledTasks module
+try {
+    Import-Module ScheduledTasks -ErrorAction Stop
+    Write-Host "ScheduledTasks module loaded" -ForegroundColor Gray
+} catch {
+    Write-Host "WARNING: Could not import ScheduledTasks module: $_" -ForegroundColor Yellow
+    Write-Host "Attempting to continue anyway..." -ForegroundColor Yellow
 }
 
+# Disk collection job (daily 2 AM)
 try {
+    $DiskAction = New-ScheduledTaskAction `
+        -Execute $PythonExe `
+        -Argument "$CollectorDir\collector.py --config local\config.json --mode disk" `
+        -WorkingDirectory $CollectorDir
+
+    $DiskTrigger = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
+
+    $DiskTask = @{
+        TaskName = "Lab Monitor - Disk Collection"
+        Action = $DiskAction
+        Trigger = $DiskTrigger
+        RunLevel = "Highest"
+        User = "SYSTEM"
+        Force = $true
+    }
+
     Register-ScheduledTask @DiskTask | Out-Null
     Write-Success "Disk collection job registered (daily at 2:00 AM)"
 } catch {
-    Write-Host " WARNING:  Could not register disk job: $_" -ForegroundColor Yellow
+    Write-Host "WARNING: Could not register disk job: $_" -ForegroundColor Yellow
+    Write-Host "You may need to manually create this task (see Step 9 instructions)" -ForegroundColor Yellow
 }
+
+Write-Host ""
 
 # Metrics collection job (every 5 minutes)
-$MetricsAction = New-ScheduledTaskAction `
-    -Execute $PythonExe `
-    -Argument "$CollectorDir\collector.py --config local\config.json --mode metrics" `
-    -WorkingDirectory $CollectorDir
-
-$MetricsTrigger = New-ScheduledTaskTrigger `
-    -Once `
-    -At "00:00" `
-    -RepetitionInterval (New-TimeSpan -Minutes 5) `
-    -RepetitionDuration (New-TimeSpan -Days 365)
-
-$MetricsTask = @{
-    TaskName = "Lab Monitor - Metrics Collection"
-    Action = $MetricsAction
-    Trigger = $MetricsTrigger
-    RunLevel = "Highest"
-    User = "SYSTEM"
-    Force = $true
-}
-
 try {
+    $MetricsAction = New-ScheduledTaskAction `
+        -Execute $PythonExe `
+        -Argument "$CollectorDir\collector.py --config local\config.json --mode metrics" `
+        -WorkingDirectory $CollectorDir
+
+    $MetricsTrigger = New-ScheduledTaskTrigger `
+        -Once `
+        -At "00:00" `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration (New-TimeSpan -Days 365)
+
+    $MetricsTask = @{
+        TaskName = "Lab Monitor - Metrics Collection"
+        Action = $MetricsAction
+        Trigger = $MetricsTrigger
+        RunLevel = "Highest"
+        User = "SYSTEM"
+        Force = $true
+    }
+
     Register-ScheduledTask @MetricsTask | Out-Null
     Write-Success "Metrics collection job registered (every 5 minutes)"
 } catch {
-    Write-Host " WARNING:  Could not register metrics job: $_" -ForegroundColor Yellow
+    Write-Host "WARNING: Could not register metrics job: $_" -ForegroundColor Yellow
+    Write-Host "You may need to manually create this task (see Step 9 instructions)" -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -505,6 +518,23 @@ Write-Host "=============" -ForegroundColor Yellow
 Write-Host "- Open Task Scheduler and look for tasks named 'Lab Monitor'" -ForegroundColor White
 Write-Host "- Right-click a task and select 'Run' to test it immediately" -ForegroundColor White
 Write-Host "- Check the log file for results: $LogsDir\collector.log" -ForegroundColor White
+Write-Host ""
+Write-Host "TROUBLESHOOTING FAILED TASK REGISTRATION:" -ForegroundColor Yellow
+Write-Host "=========================================" -ForegroundColor Yellow
+Write-Host "If automatic Task Scheduler registration failed ('Invalid namespace' error):" -ForegroundColor White
+Write-Host ""
+Write-Host "1. This usually means the WMI Task Scheduler classes aren't available." -ForegroundColor Gray
+Write-Host "2. Try these fixes (in order):" -ForegroundColor White
+Write-Host ""
+Write-Host "   a) Close this PowerShell and try with a fresh Anaconda PowerShell Prompt" -ForegroundColor Gray
+Write-Host "      (WMI sometimes needs reinitialization)" -ForegroundColor Gray
+Write-Host ""
+Write-Host "   b) Rebuild WMI: Run in Administrator cmd.exe (NOT PowerShell):" -ForegroundColor Gray
+Write-Host "      winmgmt /salvagerepository" -ForegroundColor Gray
+Write-Host ""
+Write-Host "   c) Manually create tasks using the GUI (see Step 9 above)" -ForegroundColor Gray
+Write-Host ""
+Write-Host "3. After any fix, re-run this script to retry automatic registration." -ForegroundColor White
 Write-Host ""
 
 Write-Host "==========================================" -ForegroundColor Cyan
