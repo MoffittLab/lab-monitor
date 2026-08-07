@@ -247,7 +247,7 @@ if (-not (Test-Path $ConfigFile)) {
         exit 1
     }
     if ($ManagerUrl -like "https://*") {
-        Write-Host "⚠️  Warning: URL starts with https:// but Manager runs plain HTTP" -ForegroundColor Yellow
+        Write-Host " WARNING:  Warning: URL starts with https:// but Manager runs plain HTTP" -ForegroundColor Yellow
         $Confirm = Read-Host "Continue with https:// anyway? [y/N]"
         if ($Confirm -ne "y" -and $Confirm -ne "Y") {
             Write-Host "Please re-run and enter the correct URL."
@@ -274,7 +274,7 @@ if (-not (Test-Path $ConfigFile)) {
         $DeviceType = "Server"
     }
     if ($DeviceType -notin @("NAS", "NAS-Instrument", "NAS-Backup", "Server")) {
-        Write-Host "⚠️  Warning: '$DeviceType' is not a recognized device type. Continuing anyway." -ForegroundColor Yellow
+        Write-Host " WARNING:  Warning: '$DeviceType' is not a recognized device type. Continuing anyway." -ForegroundColor Yellow
     }
 
     # Suggest default scan_depth
@@ -320,15 +320,15 @@ if (-not (Test-Path $ConfigFile)) {
         1 {
             Write-Host "  [Level 1] Volume root only" -ForegroundColor Yellow
             Write-Host "    Example: E:\ (filesystem stats only)" -ForegroundColor Gray
-            Write-Host "    ✓ Fastest" -ForegroundColor Green
-            Write-Host "    ✗ No per-folder breakdown" -ForegroundColor Red
+            Write-Host "    [OK] Fastest" -ForegroundColor Green
+            Write-Host "    [X] No per-folder breakdown" -ForegroundColor Red
         }
         2 {
             Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
             Write-Host "    Example: E:\" -ForegroundColor Gray
             Write-Host "  [Level 2] Top-level folders" -ForegroundColor Yellow
             Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
-            Write-Host "    ✓ Standard: captures main data areas" -ForegroundColor Green
+            Write-Host "    [OK] Standard: captures main data areas" -ForegroundColor Green
         }
         3 {
             Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
@@ -337,8 +337,8 @@ if (-not (Test-Path $ConfigFile)) {
             Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
             Write-Host "  [Level 3] Subfolders" -ForegroundColor Yellow
             Write-Host "    Examples: E:\Data\2024, E:\Data\2024\Experiments" -ForegroundColor Gray
-            Write-Host "    ✓ Detailed breakdown of folder structures" -ForegroundColor Green
-            Write-Host "    ✗ Takes longer on deep hierarchies" -ForegroundColor Red
+            Write-Host "    [OK] Detailed breakdown of folder structures" -ForegroundColor Green
+            Write-Host "    [X] Takes longer on deep hierarchies" -ForegroundColor Red
         }
         default {
             Write-Host "  Custom depth: $ScanDepth levels" -ForegroundColor Yellow
@@ -392,7 +392,7 @@ Pop-Location
 if ($TestResult -eq 0) {
     Write-Success "Metrics collection test passed"
 } else {
-    Write-Host "⚠️  Metrics collection test failed (may be normal if Manager not running yet)" -ForegroundColor Yellow
+    Write-Host " WARNING:  Metrics collection test failed (may be normal if Manager not running yet)" -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -420,7 +420,7 @@ try {
     Register-ScheduledTask @DiskTask | Out-Null
     Write-Success "Disk collection job registered (daily at 2:00 AM)"
 } catch {
-    Write-Host "⚠️  Could not register disk job: $_" -ForegroundColor Yellow
+    Write-Host " WARNING:  Could not register disk job: $_" -ForegroundColor Yellow
 }
 
 # Metrics collection job (every 5 minutes)
@@ -448,7 +448,7 @@ try {
     Register-ScheduledTask @MetricsTask | Out-Null
     Write-Success "Metrics collection job registered (every 5 minutes)"
 } catch {
-    Write-Host "⚠️  Could not register metrics job: $_" -ForegroundColor Yellow
+    Write-Host " WARNING:  Could not register metrics job: $_" -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -457,7 +457,7 @@ Write-Step "Step 9: Manual Task Scheduler Configuration (Optional)"
 Write-Host "If automatic registration failed, you can manually create the scheduled tasks:" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "DISK COLLECTION TASK (Daily at 2:00 AM):" -ForegroundColor Yellow
-Write-Host "═══════════════════════════════════════════════" -ForegroundColor Yellow
+Write-Host "===============================================" -ForegroundColor Yellow
 Write-Host "1. Open Windows Task Scheduler (search 'Task Scheduler' in Start Menu)" -ForegroundColor White
 Write-Host "2. Click 'Create Task' on the right sidebar" -ForegroundColor White
 Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
@@ -478,7 +478,7 @@ Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
 Write-Host "6. Click 'OK' to save" -ForegroundColor White
 Write-Host ""
 Write-Host "METRICS COLLECTION TASK (Every 5 minutes):" -ForegroundColor Yellow
-Write-Host "═══════════════════════════════════════════════" -ForegroundColor Yellow
+Write-Host "===============================================" -ForegroundColor Yellow
 Write-Host "1. Open Windows Task Scheduler" -ForegroundColor White
 Write-Host "2. Click 'Create Task'" -ForegroundColor White
 Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
@@ -500,7 +500,7 @@ Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
 Write-Host "6. Click 'OK' to save" -ForegroundColor White
 Write-Host ""
 Write-Host "VERIFY TASKS:" -ForegroundColor Yellow
-Write-Host "═════════════" -ForegroundColor Yellow
+Write-Host "=============" -ForegroundColor Yellow
 Write-Host "- Open Task Scheduler and look for tasks named 'Lab Monitor'" -ForegroundColor White
 Write-Host "- Right-click a task and select 'Run' to test it immediately" -ForegroundColor White
 Write-Host "- Check the log file for results: $LogsDir\collector.log" -ForegroundColor White
@@ -511,7 +511,7 @@ Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "VERIFICATION "&" NEXT STEPS:" -ForegroundColor Cyan
-Write-Host "══════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "1. Review your configuration:" -ForegroundColor White
 Write-Host "   notepad '$ConfigFile'" -ForegroundColor Gray
@@ -528,10 +528,10 @@ Write-Host "   Get-Content -Path '$LogsDir\collector.log' -Tail 50 -Wait" -Foreg
 Write-Host ""
 Write-Host "5. Check task execution history in Task Scheduler:" -ForegroundColor White
 Write-Host "   Open 'Task Scheduler' and navigate to Task Scheduler Library" -ForegroundColor Gray
-Write-Host "   Right-click 'Lab Monitor - Disk Collection' → View All Tasks" -ForegroundColor Gray
+Write-Host "   Right-click 'Lab Monitor - Disk Collection' -> View All Tasks" -ForegroundColor Gray
 Write-Host ""
 Write-Host "IMPORTANT NOTES:" -ForegroundColor Yellow
-Write-Host "═══════════════════" -ForegroundColor Yellow
+Write-Host "===================" -ForegroundColor Yellow
 Write-Host "- The collector will profile folders at depth $ScanDepth" -ForegroundColor White
 Write-Host "- Disk collection runs daily at 2:00 AM (slow operation)" -ForegroundColor White
 Write-Host "- Metrics collection runs every 5 minutes (lightweight)" -ForegroundColor White
