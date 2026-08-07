@@ -109,7 +109,7 @@ foreach ($drive in [System.IO.DriveInfo]::GetDrives() | Where-Object {$_.DriveTy
     $AvailableDrives += $driveLetter
     $freeSpace = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
     $totalSpace = [math]::Round($drive.TotalSize / 1GB, 2)
-    Write-Host "  $driveLetter: $freeSpace GB free / $totalSpace GB total" -ForegroundColor Gray
+    Write-Host "  ${driveLetter}: $freeSpace GB free / $totalSpace GB total" -ForegroundColor Gray
 }
 
 if ($AvailableDrives.Count -eq 0) {
@@ -133,7 +133,7 @@ Write-Success "Using drive: $SelectedDrive"
 Write-Host ""
 
 # Configuration
-$RootDir = "$SelectedDrive`:\Users\lab-monitor"
+$RootDir = "${SelectedDrive}:\Users\lab-monitor"
 $DataDir = "$RootDir\data"
 $LogsDir = "$RootDir\logs"
 $ScriptsDir = "$RootDir\scripts"
@@ -510,7 +510,7 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "VERIFICATION & NEXT STEPS:" -ForegroundColor Cyan
+Write-Host "VERIFICATION "&" NEXT STEPS:" -ForegroundColor Cyan
 Write-Host "══════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "1. Review your configuration:" -ForegroundColor White
@@ -521,7 +521,7 @@ Write-Host "   Get-ScheduledTask | Select-String 'Lab Monitor'" -ForegroundColor
 Write-Host ""
 Write-Host "3. Test disk collection manually:" -ForegroundColor White
 Write-Host "   cd '$CollectorDir'" -ForegroundColor Gray
-Write-Host "   & $PythonExe collector.py --config local\\config.json --mode disk" -ForegroundColor Gray
+Write-Host '   & $PythonExe collector.py --config local\config.json --mode disk' -ForegroundColor Gray
 Write-Host ""
 Write-Host "4. Monitor ongoing collections (follow log in real-time):" -ForegroundColor White
 Write-Host "   Get-Content -Path '$LogsDir\collector.log' -Tail 50 -Wait" -ForegroundColor Gray
