@@ -6,26 +6,69 @@
 #   .\install-collector-windows.ps1
 #
 # This script:
-# 1. Creates directory structure
-# 2. Clones or updates lab-monitor repository
-# 3. Installs dependencies (if not using conda)
-# 4. Creates config.json from template (interactive)
-# 5. Sets up Task Scheduler jobs
-# 6. Tests both collection modes
+# 1. Automatically detects and uses the 'lab-monitor' conda environment (if it exists)
+# 2. Creates directory structure at E:\Users\lab-monitor
+# 3. Clones or updates lab-monitor repository
+# 4. Installs dependencies
+# 5. Creates config.json from template (interactive)
+# 6. Sets up Task Scheduler jobs
+# 7. Tests collection modes
+#
+# Pre-requisites:
+#   - Run from Anaconda PowerShell Prompt (as Administrator)
+#   - Optional: Create conda environment first with:
+#     conda create -n lab-monitor python=3.11
 #
 
-# Check if running from Anaconda Prompt (CONDA_DEFAULT_ENV set)
-if (-not $env:CONDA_DEFAULT_ENV) {
-    Write-Host "ERROR: This script must be run from an Anaconda Prompt" -ForegroundColor Red
+# Verify conda is available and find/activate lab-monitor environment
+if (-not $env:CONDA_EXE) {
+    Write-Host "ERROR: Conda not found (CONDA_EXE not set)" -ForegroundColor Red
     Write-Host "" -ForegroundColor Red
-    Write-Host "How to launch:" -ForegroundColor Yellow
-    Write-Host "  1. Open Anaconda Prompt (or Anaconda PowerShell Prompt)" -ForegroundColor Yellow
-    Write-Host "  2. (Optional) Create a conda environment:" -ForegroundColor Yellow
-    Write-Host "       conda create -n lab-monitor python=3.11" -ForegroundColor Yellow
-    Write-Host "  3. (Optional) Activate it:" -ForegroundColor Yellow
-    Write-Host "       conda activate lab-monitor" -ForegroundColor Yellow
-    Write-Host "  4. Run this script:" -ForegroundColor Yellow
-    Write-Host "       .\install-collector-windows.ps1" -ForegroundColor Yellow
+    Write-Host "Please run this script from an Anaconda Prompt or Anaconda PowerShell Prompt" -ForegroundColor Yellow
+    exit 1
+}
+
+# Initialize conda for PowerShell if needed
+if (-not (Test-Path Function:\conda)) {
+    & "$env:CONDA_EXE" shell.powershell hook | Out-String | Invoke-Expression
+}
+
+Write-Host "Checking for lab-monitor conda environment..." -ForegroundColor Cyan
+
+# Check if lab-monitor environment exists using conda info
+try {
+    $CondaInfo = & cmd /c "$env:CONDA_EXE info --envs" 2>&1 | Out-String
+    $LabMonitorExists = $CondaInfo | Select-String -Pattern "lab-monitor"
+    
+    if ($LabMonitorExists) {
+        Write-Host "[OK] lab-monitor conda environment found" -ForegroundColor Green
+        Write-Host "Activating lab-monitor environment..." -ForegroundColor Cyan
+        
+        # Activate the lab-monitor environment
+        conda activate lab-monitor
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Using conda environment: $env:CONDA_DEFAULT_ENV" -ForegroundColor Green
+        } else {
+            Write-Host "WARNING: Activation may have issues, but continuing..." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "INFO: lab-monitor conda environment not yet created" -ForegroundColor Cyan
+        Write-Host "Note: You can create it before running with:" -ForegroundColor Yellow
+        Write-Host "  conda create -n lab-monitor python=3.11" -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Continuing with current conda environment..." -ForegroundColor Cyan
+    }
+} catch {
+    Write-Host "WARNING: Could not check for lab-monitor environment" -ForegroundColor Yellow
+    Write-Host "Continuing with current environment..." -ForegroundColor Yellow
+}
+
+# Final verification: ensure we have an active conda environment
+if (-not $env:CONDA_DEFAULT_ENV -and -not $env:CONDA_PREFIX) {
+    Write-Host "ERROR: No active conda environment detected" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "Please ensure you're running from Anaconda Prompt or PowerShell with conda initialized" -ForegroundColor Yellow
     exit 1
 }
 
@@ -51,6 +94,10 @@ $RepoUrl = "https://github.com/MoffittLab/lab-monitor.git"
 $CollectorDir = "$ScriptsDir\lab-monitor\collector"
 $ConfigFile = "$CollectorDir\local\config.json"
 $CondaEnv = $env:CONDA_DEFAULT_ENV
+if (-not $CondaEnv) {
+    Write-Host "ERROR: Could not determine active conda environment" -ForegroundColor Red
+    exit 1
+}
 $PythonExe = (Get-Command python.exe).Source  # Use conda env's python
 
 function Write-Step {
@@ -217,6 +264,44 @@ if (-not (Test-Path $ConfigFile)) {
     Write-Host "Volumes to monitor: $($Volumes -join ', ')"
     Write-Host ""
 
+    # Display what will be profiled based on scan depth
+    Write-Step "Disk Profiling Preview (Scan Depth: $ScanDepth)"
+    Write-Host "The disk collection will profile the following folder levels:" -ForegroundColor Cyan
+    Write-Host ""
+    
+    switch ($ScanDepth) {
+        1 {
+            Write-Host "  [Level 1] Volume root only" -ForegroundColor Yellow
+            Write-Host "    Example: E:\ (filesystem stats only)" -ForegroundColor Gray
+            Write-Host "    ✓ Fastest" -ForegroundColor Green
+            Write-Host "    ✗ No per-folder breakdown" -ForegroundColor Red
+        }
+        2 {
+            Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
+            Write-Host "    Example: E:\" -ForegroundColor Gray
+            Write-Host "  [Level 2] Top-level folders" -ForegroundColor Yellow
+            Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
+            Write-Host "    ✓ Standard: captures main data areas" -ForegroundColor Green
+        }
+        3 {
+            Write-Host "  [Level 1] Volume root" -ForegroundColor Yellow
+            Write-Host "    Example: E:\" -ForegroundColor Gray
+            Write-Host "  [Level 2] Top-level folders" -ForegroundColor Yellow
+            Write-Host "    Examples: E:\Data, E:\Backups, E:\Projects" -ForegroundColor Gray
+            Write-Host "  [Level 3] Subfolders" -ForegroundColor Yellow
+            Write-Host "    Examples: E:\Data\2024, E:\Data\2024\Experiments" -ForegroundColor Gray
+            Write-Host "    ✓ Detailed breakdown of folder structures" -ForegroundColor Green
+            Write-Host "    ✗ Takes longer on deep hierarchies" -ForegroundColor Red
+        }
+        default {
+            Write-Host "  Custom depth: $ScanDepth levels" -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+    Write-Host "These profiled folders and their sizes will be sent to the Manager" -ForegroundColor Cyan
+    Write-Host "The full filesystem hierarchy is preserved in your local data directory" -ForegroundColor Cyan
+    Write-Host ""
+
     # Create config file
     $ConfigContent = @{
         name = $ServerName
@@ -320,17 +405,88 @@ try {
 }
 Write-Host ""
 
+# Step 9: Display manual Task Scheduler configuration instructions
+Write-Step "Step 9: Manual Task Scheduler Configuration (Optional)"
+Write-Host "If automatic registration failed, you can manually create the scheduled tasks:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "DISK COLLECTION TASK (Daily at 2:00 AM):" -ForegroundColor Yellow
+Write-Host "═══════════════════════════════════════════════" -ForegroundColor Yellow
+Write-Host "1. Open Windows Task Scheduler (search 'Task Scheduler' in Start Menu)" -ForegroundColor White
+Write-Host "2. Click 'Create Task' on the right sidebar" -ForegroundColor White
+Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
+Write-Host "   - Name: Lab Monitor - Disk Collection" -ForegroundColor Gray
+Write-Host "   - Check: 'Run with highest privileges'" -ForegroundColor Gray
+Write-Host "4. Go to the 'Triggers' tab:" -ForegroundColor White
+Write-Host "   - Click 'New'" -ForegroundColor Gray
+Write-Host "   - Begin the task: On a schedule" -ForegroundColor Gray
+Write-Host "   - Set to: Daily" -ForegroundColor Gray
+Write-Host "   - Start time: 02:00:00 (2:00 AM)" -ForegroundColor Gray
+Write-Host "   - Repeat every: 1 day" -ForegroundColor Gray
+Write-Host "5. Go to the 'Actions' tab:" -ForegroundColor White
+Write-Host "   - Click 'New'" -ForegroundColor Gray
+Write-Host "   - Action: Start a program" -ForegroundColor Gray
+Write-Host "   - Program/script: $PythonExe" -ForegroundColor Gray
+Write-Host "   - Arguments: $CollectorDir\collector.py --config local\config.json --mode disk" -ForegroundColor Gray
+Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
+Write-Host "6. Click 'OK' to save" -ForegroundColor White
+Write-Host ""
+Write-Host "METRICS COLLECTION TASK (Every 5 minutes):" -ForegroundColor Yellow
+Write-Host "═══════════════════════════════════════════════" -ForegroundColor Yellow
+Write-Host "1. Open Windows Task Scheduler" -ForegroundColor White
+Write-Host "2. Click 'Create Task'" -ForegroundColor White
+Write-Host "3. Go to the 'General' tab:" -ForegroundColor White
+Write-Host "   - Name: Lab Monitor - Metrics Collection" -ForegroundColor Gray
+Write-Host "   - Check: 'Run with highest privileges'" -ForegroundColor Gray
+Write-Host "4. Go to the 'Triggers' tab:" -ForegroundColor White
+Write-Host "   - Click 'New'" -ForegroundColor Gray
+Write-Host "   - Begin the task: On a schedule" -ForegroundColor Gray
+Write-Host "   - Set to: Daily" -ForegroundColor Gray
+Write-Host "   - Start time: 00:00:00 (midnight, or any time)" -ForegroundColor Gray
+Write-Host "   - Repeat task every: 5 minutes" -ForegroundColor Gray
+Write-Host "   - For a duration of: 1 day (repeats continuously)" -ForegroundColor Gray
+Write-Host "5. Go to the 'Actions' tab:" -ForegroundColor White
+Write-Host "   - Click 'New'" -ForegroundColor Gray
+Write-Host "   - Action: Start a program" -ForegroundColor Gray
+Write-Host "   - Program/script: $PythonExe" -ForegroundColor Gray
+Write-Host "   - Arguments: $CollectorDir\collector.py --config local\config.json --mode metrics" -ForegroundColor Gray
+Write-Host "   - Start in: $CollectorDir" -ForegroundColor Gray
+Write-Host "6. Click 'OK' to save" -ForegroundColor White
+Write-Host ""
+Write-Host "VERIFY TASKS:" -ForegroundColor Yellow
+Write-Host "═════════════" -ForegroundColor Yellow
+Write-Host "- Open Task Scheduler and look for tasks named 'Lab Monitor'" -ForegroundColor White
+Write-Host "- Right-click a task and select 'Run' to test it immediately" -ForegroundColor White
+Write-Host "- Check the log file for results: $LogsDir\collector.log" -ForegroundColor White
+Write-Host ""
+
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] Windows Collector Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "1. Verify configuration:"
-Write-Host "   notepad $ConfigFile"
+Write-Host "VERIFICATION & NEXT STEPS:" -ForegroundColor Cyan
+Write-Host "══════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "2. Verify jobs registered:"
-Write-Host "   Get-ScheduledTask | Select-String 'Lab Monitor'"
+Write-Host "1. Review your configuration:" -ForegroundColor White
+Write-Host "   notepad '$ConfigFile'" -ForegroundColor Gray
 Write-Host ""
-Write-Host "3. Monitor collections:"
-Write-Host "   Get-Content -Path '$LogsDir\collector.log' -Tail 20 -Wait"
+Write-Host "2. Verify scheduled tasks were created:" -ForegroundColor White
+Write-Host "   Get-ScheduledTask | Select-String 'Lab Monitor'" -ForegroundColor Gray
+Write-Host ""
+Write-Host "3. Test disk collection manually:" -ForegroundColor White
+Write-Host "   cd '$CollectorDir'" -ForegroundColor Gray
+Write-Host "   & $PythonExe collector.py --config local\\config.json --mode disk" -ForegroundColor Gray
+Write-Host ""
+Write-Host "4. Monitor ongoing collections (follow log in real-time):" -ForegroundColor White
+Write-Host "   Get-Content -Path '$LogsDir\collector.log' -Tail 50 -Wait" -ForegroundColor Gray
+Write-Host ""
+Write-Host "5. Check task execution history in Task Scheduler:" -ForegroundColor White
+Write-Host "   Open 'Task Scheduler' and navigate to Task Scheduler Library" -ForegroundColor Gray
+Write-Host "   Right-click 'Lab Monitor - Disk Collection' → View All Tasks" -ForegroundColor Gray
+Write-Host ""
+Write-Host "IMPORTANT NOTES:" -ForegroundColor Yellow
+Write-Host "═══════════════════" -ForegroundColor Yellow
+Write-Host "- The collector will profile folders at depth $ScanDepth" -ForegroundColor White
+Write-Host "- Disk collection runs daily at 2:00 AM (slow operation)" -ForegroundColor White
+Write-Host "- Metrics collection runs every 5 minutes (lightweight)" -ForegroundColor White
+Write-Host "- Check logs in: $LogsDir" -ForegroundColor White
 Write-Host ""
