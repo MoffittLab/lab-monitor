@@ -184,7 +184,7 @@ $LogsDir      = "$RootDir\logs"
 $ScriptsDir   = "$RootDir\scripts"
 $BatchDir     = "$RootDir\bin"           # wrapper .bat scripts live here
 $RepoUrl      = "https://github.com/MoffittLab/lab-monitor.git"
-$CollectorDir = "$ScriptsDir\lab-monitor\collector"
+$CollectorDir = "$ScriptsDir\collector"
 $ConfigFile   = "$CollectorDir\local\config.json"
 $CondaEnv     = $env:CONDA_DEFAULT_ENV
 
@@ -240,9 +240,9 @@ Write-Host "  (CONDA_PREFIX: $env:CONDA_PREFIX)" -ForegroundColor Gray
 # Step 3: Clone / update repository
 # ==============================================================================
 Write-Step "Step 3: Cloning/updating lab-monitor repository"
-if (Test-Path "$ScriptsDir\lab-monitor\.git") {
+if (Test-Path "$ScriptsDir\.git") {
     Write-Host "Repository already present - pulling latest..." -ForegroundColor Cyan
-    Push-Location "$ScriptsDir\lab-monitor"
+    Push-Location "$ScriptsDir"
     $gitOut  = & git pull origin main 2>&1
     $gitExit = $LASTEXITCODE
     Pop-Location
@@ -253,18 +253,16 @@ if (Test-Path "$ScriptsDir\lab-monitor\.git") {
         Write-Success "Repository updated"
     }
 } else {
-    Write-Host "Cloning from $RepoUrl ..." -ForegroundColor Cyan
-    Push-Location $ScriptsDir
-    $gitOut  = & git clone $RepoUrl 2>&1
+    Write-Host "Cloning from $RepoUrl into $ScriptsDir ..." -ForegroundColor Cyan
+    $gitOut  = & git clone $RepoUrl "$ScriptsDir" 2>&1
     $gitExit = $LASTEXITCODE
-    Pop-Location
     if ($gitExit -ne 0) {
         Write-Warn "git clone exited with code $gitExit"
         Write-Host ($gitOut | Out-String) -ForegroundColor Gray
     }
 }
-if (Test-Path "$ScriptsDir\lab-monitor\collector\collector.py") {
-    Write-Success "Repository ready at $ScriptsDir\lab-monitor"
+if (Test-Path "$ScriptsDir\collector\collector.py") {
+    Write-Success "Repository ready at $ScriptsDir"
 } else {
     Write-Err "collector.py not found after clone/pull"
     Write-Host "  Verify that git is installed and $RepoUrl is reachable" -ForegroundColor Yellow
