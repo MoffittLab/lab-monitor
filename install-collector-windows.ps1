@@ -243,6 +243,7 @@ Write-Host "  (CONDA_PREFIX: $env:CONDA_PREFIX)" -ForegroundColor Gray
 # ==============================================================================
 Write-Step "Step 3: Cloning/updating lab-monitor repository"
 if (Test-Path "$ScriptsDir\.git") {
+    # Full clone present - pull latest
     Write-Host "Repository already present - pulling latest..." -ForegroundColor Cyan
     Push-Location "$ScriptsDir"
     $gitOut  = & git pull origin main 2>&1
@@ -254,7 +255,15 @@ if (Test-Path "$ScriptsDir\.git") {
     } else {
         Write-Success "Repository updated"
     }
+} elseif (Test-Path "$CollectorDir\collector.py") {
+    # collector.py is present but there is no .git at the expected location
+    # (e.g. a previous install left files, or the clone was interrupted).
+    # Skip cloning to avoid the 'destination already exists' git error.
+    Write-Warn "collector.py found at $CollectorDir but no .git in $ScriptsDir - skipping clone."
+    Write-Host "  To pull updates manually run:" -ForegroundColor Gray
+    Write-Host "    git -C `"$ScriptsDir`" pull origin main" -ForegroundColor Gray
 } else {
+    # Fresh install - clone into the (empty) scripts directory
     Write-Host "Cloning from $RepoUrl into $ScriptsDir ..." -ForegroundColor Cyan
     $gitOut  = & git clone $RepoUrl "$ScriptsDir" 2>&1
     $gitExit = $LASTEXITCODE
