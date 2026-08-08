@@ -510,21 +510,26 @@ def get_per_user_stats() -> list:
     """
     Aggregate CPU% and RAM (bytes) by Windows user account across all processes.
     Returns a list sorted by cpu_percent descending.
-    Filters out blank/None usernames.
+    Filters out blank/None usernames and accounts matching exclude_users patterns.
     Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
     """
     try:
         import psutil
         from collections import defaultdict
+        import fnmatch
 
         user_cpu = defaultdict(float)
         user_ram = defaultdict(int)
         cpu_count = psutil.cpu_count(logical=True) or 1
+        exclude_patterns = _config.get('exclude_users', [])
 
         for proc in psutil.process_iter(['username', 'cpu_percent', 'memory_info']):
             try:
                 username = proc.info.get('username') or ''
                 if not username:
+                    continue
+                # Skip if matches any exclude pattern (e.g., 'UMFD*', 'SYSTEM')
+                if any(fnmatch.fnmatch(username, pattern) for pattern in exclude_patterns):
                     continue
                 user_cpu[username] += proc.info.get('cpu_percent') or 0.0
                 mem = proc.info.get('memory_info')

@@ -21,7 +21,8 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
   "data_dir":         "/volume1/lab-monitor/data",
   "log_file":         "/volume1/lab-monitor/logs/collector.log",
   "log_level":        "INFO",
-  "timeout_seconds":  3600
+  "timeout_seconds":  3600,
+  "exclude_users":    ["SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "UMFD*"]
 }
 ```
 
@@ -35,6 +36,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `volumes` | Paths to measure. Collector measures immediate subdirectories of each. |
 | `data_dir` | Local data directory for archives and queue |
 | `timeout_seconds` | Max time to measure a single subdirectory (default 3600) |
+| `exclude_users` | (Optional) List of username patterns to exclude from user activity metrics. Supports wildcards (e.g., `UMFD*`). Examples: `["SYSTEM", "UMFD*"]`. Users matching any pattern are not collected. Default: empty (collect all). |
 
 `volumes` examples:
 - Synology: `["/volume1", "/volume2"]`
