@@ -130,9 +130,12 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         git_path = git_path.replace('\\', '/')
         python_path = python_path.replace('\\', '/')
     
-    # Construct the collection command
-    # Format: cd {git_path} && {python_path} collector/collector.py --config collector/local/config.json --mode {mode}
-    command = f'cd "{git_path}" && "{python_path}" collector/collector.py --config collector/local/config.json --mode {mode}'
+    # Construct absolute paths (no cd needed; works on both Windows and Unix over SSH)
+    collector_py = f"{git_path}/collector/collector.py"
+    config_json = f"{git_path}/collector/local/config.json"
+    
+    # Run Python with absolute paths
+    command = f'"{python_path}" "{collector_py}" --config "{config_json}" --mode {mode}'
 
     if dry_run:
         result['status'] = 'dry-run'

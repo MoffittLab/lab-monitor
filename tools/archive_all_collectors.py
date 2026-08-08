@@ -135,8 +135,10 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     if is_windows_path(git_path):
         git_path = git_path.replace('\\', '/')
     
-    vprint(f"Reading config from {git_path}/collector/local/config.json")
-    command = f'cd "{git_path}/collector" && python3 config_tool.py --config local/config.json list --json'
+    config_tool_path = f"{git_path}/collector/config_tool.py"
+    config_path = f"{git_path}/collector/local/config.json"
+    vprint(f"Reading config from {config_path}")
+    command = f'python3 "{config_tool_path}" --config "{config_path}" list --json'
     
     out, err, code = run_remote(client, command, timeout)
     
