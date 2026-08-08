@@ -53,6 +53,24 @@ def vprint(msg: str):
 # SSH helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Path normalization
+# ---------------------------------------------------------------------------
+
+def is_windows_path(path: str) -> bool:
+    """Heuristic: Windows paths contain a drive letter or .exe extension."""
+    p = path.strip()
+    return (
+        p.lower().endswith('.exe') or
+        (len(p) >= 2 and p[1] == ':') or
+        '\\' in p
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSH helpers
+# ---------------------------------------------------------------------------
+
 def ssh_connect(ip: str, username: str, password: str, timeout: int):
     """Open an SSH connection. Uses key auth if password is blank."""
     auth = 'password' if password else 'key/agent'
@@ -98,6 +116,12 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     git_path = row['git_path'].strip()
     python_path = row['python_path'].strip()
 
+    # Normalize Windows paths: convert backslashes to forward slashes for SSH shell
+    windows = is_windows_path(git_path) or is_windows_path(python_path)
+    if windows:
+        git_path = git_path.replace('\\', '/')
+        python_path = python_path.replace('\\', '/')
+
     result = {
         'ip': ip,
         'status': None,
@@ -107,7 +131,7 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     }
 
     # Construct the collection command
-    # Format: cd {git_path} && {python_path} collector/collector.py --config collector/config.json --mode {mode}
+    # Format: cd {git_path} && {python_path} collector/collector.py --config collector/local/config.json --mode {mode}
     command = f'cd "{git_path}" && "{python_path}" collector/collector.py --config collector/local/config.json --mode {mode}'
 
     if dry_run:
