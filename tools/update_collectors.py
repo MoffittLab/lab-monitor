@@ -134,33 +134,34 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 def build_commands(row: dict, skip_pip: bool) -> list[tuple[str, str]]:
     """
     Return a list of (label, shell_command) pairs for this system.
-    Handles path quoting and shell differences between Linux and Windows SSH.
+
+    Uses 'git -C <path>' and absolute paths throughout so no 'cd' is
+    needed and each command is fully self-contained.
     """
     git_path    = row['git_path'].strip()
     python_path = row.get('python_path', '').strip()
     windows     = is_windows_path(git_path) or is_windows_path(python_path)
 
-    # Normalise path separators for shell usage
     if windows:
-        # Windows OpenSSH uses cmd.exe; forward slashes work for most commands
         gp = git_path.replace('\\', '/')
         pp = python_path.replace('\\', '/')
-        git_cmd = f'cd /d "{gp}" && git pull origin main'
-        pip_cmd = f'"{pp}" -m pip install --upgrade pip -q && "{pp}" -m pip install -r requirements.txt -q'
     else:
         gp = git_path
         pp = python_path
-        git_cmd = f'cd "{gp}" && git pull origin main'
-        pip_cmd = f'"{pp}" -m pip install --upgrade pip -q && "{pp}" -m pip install -r requirements.txt -q'
+
+    req_path = f'{gp}/requirements.txt'
+
+    # git -C runs in the repo directory without needing a cd
+    git_cmd = f'git -C "{gp}" pull origin main'
 
     commands = [('git pull', git_cmd)]
+
     if not skip_pip and python_path:
-        # pip install runs from repo root so requirements.txt is found
-        if windows:
-            pip_full = f'cd /d "{gp}" && {pip_cmd}'
-        else:
-            pip_full = f'cd "{gp}" && {pip_cmd}'
-        commands.append(('pip install', pip_full))
+        # Upgrade pip, then install from the absolute requirements.txt path
+        pip_upgrade = f'"{pp}" -m pip install --upgrade pip -q'
+        pip_install = f'"{pp}" -m pip install -r "{req_path}" -q'
+        commands.append(('pip upgrade', pip_upgrade))
+        commands.append(('pip install', pip_install))
 
     return commands
 
