@@ -792,6 +792,80 @@ Write-Host "  c) Create tasks manually using the GUI steps above" -ForegroundCol
 Write-Host ""
 
 # ==============================================================================
+# ==============================================================================
+# Step 11: OpenSSH Server (enables remote update via update_collectors.py)
+# ==============================================================================
+Write-Step "Step 11: OpenSSH Server (optional — enables remote updates)"
+Write-Host "The update_collectors.py tool uses SSH to push git + pip updates" -ForegroundColor Cyan
+Write-Host "to this server remotely. OpenSSH Server must be installed for this." -ForegroundColor Cyan
+Write-Host ""
+
+$SshdInstalled = (Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue |`
+                  Where-Object State -eq Installed)
+$SshdRunning   = (Get-Service sshd -ErrorAction SilentlyContinue | Where-Object Status -eq Running)
+
+if ($SshdInstalled -and $SshdRunning) {
+    Write-Success "OpenSSH Server is already installed and running"
+} else {
+    if ($SshdInstalled) {
+        Write-Host "OpenSSH Server is installed but not running." -ForegroundColor Yellow
+    } else {
+        Write-Host "OpenSSH Server is not installed on this system." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    $InstallSsh = Read-Host "Install/enable OpenSSH Server now? [y/N]"
+    if ($InstallSsh -eq 'y' -or $InstallSsh -eq 'Y') {
+        if (-not $SshdInstalled) {
+            Write-Host "Installing OpenSSH Server..." -ForegroundColor Cyan
+            try {
+                Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop | Out-Null
+                Write-Success "OpenSSH Server installed"
+            } catch {
+                Write-Warn "Could not install OpenSSH Server: $_"
+                Write-Host "  Install manually: Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0" -ForegroundColor Gray
+            }
+        }
+        Write-Host "Starting sshd service and setting to auto-start..." -ForegroundColor Cyan
+        try {
+            Start-Service sshd -ErrorAction Stop
+            Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+            Write-Success "sshd service started and set to Automatic"
+        } catch {
+            Write-Warn "Could not start sshd: $_"
+        }
+        # Firewall rule
+        $FwRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+        if (-not $FwRule) {
+            Write-Host "Adding firewall rule for port 22..." -ForegroundColor Cyan
+            try {
+                New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+                    -DisplayName 'OpenSSH Server (sshd)' `
+                    -Enabled True -Direction Inbound `
+                    -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+                Write-Success "Firewall rule added (TCP port 22 inbound)"
+            } catch {
+                Write-Warn "Could not add firewall rule: $_"
+                Write-Host "  Add manually: New-NetFirewallRule -Name OpenSSH-Server-In-TCP -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22" -ForegroundColor Gray
+            }
+        } else {
+            Write-Success "Firewall rule already present"
+        }
+        # Verify
+        $Listening = netstat -ano 2>$null | Select-String ':22 '
+        if ($Listening) {
+            Write-Success "sshd is listening on port 22"
+        } else {
+            Write-Warn "Port 22 not detected in netstat — sshd may still be starting"
+        }
+    } else {
+        Write-Host "  Skipped. To enable later, run in an admin PowerShell:" -ForegroundColor Gray
+        Write-Host "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0" -ForegroundColor Gray
+        Write-Host "    Start-Service sshd" -ForegroundColor Gray
+        Write-Host "    Set-Service -Name sshd -StartupType Automatic" -ForegroundColor Gray
+    }
+}
+
+# ==============================================================================
 # Final summary
 # ==============================================================================
 Write-Host ""

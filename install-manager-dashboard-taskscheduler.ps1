@@ -351,6 +351,74 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] Manager + Dashboard Installation Complete" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
+# ==============================================================================
+# OpenSSH Server (enables remote update via update_collectors.py)
+# ==============================================================================
+Write-Host ""
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "  OpenSSH Server (optional — enables remote updates)" -ForegroundColor Yellow
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "The update_collectors.py tool uses SSH to push git + pip updates" -ForegroundColor Cyan
+Write-Host "to this server remotely. OpenSSH Server must be installed for this." -ForegroundColor Cyan
+Write-Host ""
+
+$SshdInstalled = (Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue |`
+                  Where-Object State -eq Installed)
+$SshdRunning   = (Get-Service sshd -ErrorAction SilentlyContinue | Where-Object Status -eq Running)
+
+if ($SshdInstalled -and $SshdRunning) {
+    Write-Host "[OK] OpenSSH Server is already installed and running" -ForegroundColor Green
+} else {
+    if ($SshdInstalled) {
+        Write-Host "OpenSSH Server is installed but not running." -ForegroundColor Yellow
+    } else {
+        Write-Host "OpenSSH Server is not installed on this system." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    $InstallSsh = Read-Host "Install/enable OpenSSH Server now? [y/N]"
+    if ($InstallSsh -eq 'y' -or $InstallSsh -eq 'Y') {
+        if (-not $SshdInstalled) {
+            Write-Host "Installing OpenSSH Server..." -ForegroundColor Cyan
+            try {
+                Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop | Out-Null
+                Write-Host "[OK] OpenSSH Server installed" -ForegroundColor Green
+            } catch {
+                Write-Host "WARNING: Could not install OpenSSH Server: $_" -ForegroundColor Yellow
+                Write-Host "  Install manually: Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0" -ForegroundColor Gray
+            }
+        }
+        Write-Host "Starting sshd and setting to auto-start..." -ForegroundColor Cyan
+        try {
+            Start-Service sshd -ErrorAction Stop
+            Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+            Write-Host "[OK] sshd started and set to Automatic" -ForegroundColor Green
+        } catch {
+            Write-Host "WARNING: Could not start sshd: $_" -ForegroundColor Yellow
+        }
+        $FwRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+        if (-not $FwRule) {
+            Write-Host "Adding firewall rule for port 22..." -ForegroundColor Cyan
+            try {
+                New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+                    -DisplayName 'OpenSSH Server (sshd)' `
+                    -Enabled True -Direction Inbound `
+                    -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+                Write-Host "[OK] Firewall rule added (TCP port 22 inbound)" -ForegroundColor Green
+            } catch {
+                Write-Host "WARNING: Could not add firewall rule: $_" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "[OK] Firewall rule already present" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  Skipped. To enable later, run in an admin PowerShell:" -ForegroundColor Gray
+        Write-Host "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0" -ForegroundColor Gray
+        Write-Host "    Start-Service sshd" -ForegroundColor Gray
+        Write-Host "    Set-Service -Name sshd -StartupType Automatic" -ForegroundColor Gray
+    }
+}
+Write-Host ""
+
 Write-Host "Setup Summary:" -ForegroundColor Cyan
 Write-Host "1. Launcher script: $LauncherScript"
 Write-Host "2. Task Scheduler: 'Lab Monitor Startup' (set to run at system startup)"
