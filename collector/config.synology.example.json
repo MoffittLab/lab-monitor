@@ -4,10 +4,18 @@
   "device_type": "NAS",
   "manager_url": "http://atlantis.med.harvard.edu:5000",
   "manager_token": "YOUR-BEARER-TOKEN-HERE",
-  "volumes": ["/volume1"],
+
+  "volumes": ["/volume1", "/volume2"],
+
+  "scan_paths": [
+    "/volume1/*",
+    "/volume2/*"
+  ],
+
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
   "log_level": "INFO",
   "timeout_seconds": 3600,
-  "request_timeout_seconds": 30
+  "request_timeout_seconds": 30,
+  "exclude_users": []
 }

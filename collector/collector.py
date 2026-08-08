@@ -41,7 +41,7 @@ from pathlib import Path
 # Add lib directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-from disk_usage import measure_all_folders, measure_leaf_folders, discover_volumes, measure_volume_capacity, discover_at_depth
+from disk_usage import measure_all_folders, measure_leaf_folders, discover_volumes, measure_volume_capacity, discover_at_depth, discover_folders, measure_folder_recursive
 
 
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
@@ -174,121 +174,107 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     logger.info("=== DISK USAGE COLLECTION ===")
 
     if not config.get('active', True):
-        logger.info("Collector is inactive (active=false in config) — skipping collection and sync.")
+        logger.info("Collector is inactive (active=false in config) - skipping collection and sync.")
         return True
 
-    # Support both 'name' and old 'nas_name' for backward compatibility
     name = config.get('name') or config.get('nas_name')
     system_id = config.get('id') or config.get('nas_id')
-    device_type = config.get('device_type', 'unknown')  # Default to 'unknown' if not specified
-    
+    device_type = config.get('device_type', 'unknown')
+
     if not name:
-        logger.error("Config missing 'name' field (or old 'nas_name'). Update config.json.")
+        logger.error("Config missing 'name' field. Update config.json.")
         return False
-    
-    volumes = config.get('volumes')
-    timeout = config.get('timeout_seconds', 3600)
-    
+
+    volumes   = config.get('volumes', [])
+    scan_paths = config.get('scan_paths', [])
+    timeout   = config.get('timeout_seconds', 3600)
+    nas_type  = 'synology' if sys.platform != 'win32' else 'windows'
+
     try:
         logger.info(f"Measuring disk usage for {name} (device_type={device_type})")
 
-        # Auto-discover volumes if not specified in config
+        # ------------------------------------------------------------------
+        # 1. Volume capacity (used / free / total) — always via shutil.
+        #    'volumes' exists purely for this purpose.
+        #    Auto-discover if omitted.
+        # ------------------------------------------------------------------
         if not volumes:
-            logger.info("No volumes specified in config, auto-discovering...")
-            nas_type = "synology" if sys.platform != "win32" else "windows"
+            logger.info("No volumes specified — auto-discovering...")
             volumes = discover_volumes(nas_type)
             if volumes:
                 logger.info(f"Auto-discovered volumes: {volumes}")
             else:
-                logger.warning("No volumes discovered. Specify 'volumes' in config.json")
-                return False
+                logger.warning("No volumes found. Add 'volumes' to config.json.")
 
-        # Default scan_depth by device_type if not explicitly set in config
-        _depth_defaults = {'NAS-Backup': 1, 'NAS-Instrument': 3, 'NAS': 2, 'Server': 2}
-        scan_depth = config.get('scan_depth', _depth_defaults.get(device_type, 2))
-        logger.info(f"scan_depth={scan_depth}")
-
-        # Volume capacity and used bytes via shutil — single pass, all modes.
-        # shutil is the authoritative source for volume totals; it accounts for
-        # filesystem metadata, journal, and files outside any scanned folder.
-        volume_capacity = {}   # /volume1_total_bytes, /volume1_free_bytes
-        volume_used     = {}   # /volume1: used_bytes  (authoritative, from shutil)
+        volume_capacity = {}   # keyed as "{vol}_total_bytes" / "{vol}_free_bytes"
+        volume_used     = {}   # keyed as "{vol}" → used bytes
         for vol in volumes:
             cap = measure_volume_capacity(vol)
             if cap:
                 volume_capacity[f"{vol}_total_bytes"] = cap['total_bytes']
                 volume_capacity[f"{vol}_free_bytes"]  = cap['free_bytes']
                 volume_used[vol] = cap['total_bytes'] - cap['free_bytes']
-                logger.info(f"Volume {vol}: used={volume_used[vol]}, "
-                            f"total={cap['total_bytes']}, free={cap['free_bytes']}")
+                logger.info(
+                    f"Volume {vol}: used={volume_used[vol]:,}  "
+                    f"total={cap['total_bytes']:,}  free={cap['free_bytes']:,}"
+                )
 
-        # -------------------------------------------------------------------
-        # scan_depth == 1: volume-level only (shutil, no folder scan)
-        # -------------------------------------------------------------------
-        if scan_depth == 1:
-            logger.info("scan_depth=1: volume-level stats only (no folder scan)")
-            total_usage = sum(volume_used.values())
-            entry = {
-                'header': build_header(name, system_id, device_type),
-                'data': {
-                    'data_type':        'folder_usage',
-                    '_unit':            'bytes',   # all numeric fields in this message are bytes
-                    **volume_used,      # /volume1: used_bytes (shutil)
-                    **volume_capacity,  # /volume1_total_bytes, /volume1_free_bytes
-                    'total_usage':      total_usage,
-                }
-            }
-
-        # -------------------------------------------------------------------
-        # scan_depth >= 2: folder scan at the requested depth
-        # scan_depth=2 → measure /volume/tier2 folders
-        # scan_depth=3 → measure /volume/tier2/tier3 folders
+        # ------------------------------------------------------------------
+        # 2. Folder usage — driven by 'scan_paths'.
         #
-        # Volume totals always come from shutil (authoritative).
-        # Folder breakdown comes from recursive scan.
-        # Intermediate sums (tier2 level for scan_depth=3) come from scan.
-        # -------------------------------------------------------------------
-        else:
-            nas_type = 'synology' if sys.platform != 'win32' else 'windows'
-            leaf_folders = []
+        #    Each entry is either:
+        #      "/volume1/Data1"    → measure that folder as a single total
+        #      "/volume1/Data1/*"  → measure each immediate subfolder separately
+        #
+        #    Backward-compat: if scan_paths is absent, fall back to scanning
+        #    one level deep in each volume (old behaviour).
+        # ------------------------------------------------------------------
+        folder_data = {}
+
+        if not scan_paths:
+            # Legacy fallback: one level deep in each volume
+            logger.info("No scan_paths configured — falling back to one level deep in each volume.")
             for vol in volumes:
-                leaf_folders.extend(discover_at_depth(vol, scan_depth - 1, nas_type))
-            logger.info(f"Discovered {len(leaf_folders)} folders at depth {scan_depth}")
+                subfolders = discover_folders(vol, nas_type)
+                measured   = measure_leaf_folders(subfolders, timeout=timeout)
+                for f in measured:
+                    folder_data[f['path']] = f['usage_bytes']
+        else:
+            for spec in scan_paths:
+                spec = spec.strip()
+                if spec.endswith('/*'):
+                    # Glob mode: measure each immediate subfolder
+                    root = spec[:-2].rstrip('/').rstrip('\\')
+                    logger.info(f"Scanning subfolders of: {root}")
+                    subfolders = discover_folders(root, nas_type)
+                    if not subfolders:
+                        logger.warning(f"No subfolders found under {root}")
+                    measured = measure_leaf_folders(subfolders, timeout=timeout)
+                    for f in measured:
+                        folder_data[f['path']] = f['usage_bytes']
+                else:
+                    # Single-folder mode: measure this path as one total
+                    logger.info(f"Measuring folder: {spec}")
+                    if not os.path.exists(spec):
+                        logger.warning(f"scan_path does not exist: {spec}")
+                        continue
+                    bytes_used, files_counted = measure_folder_recursive(spec, timeout=timeout)
+                    folder_data[spec] = bytes_used
+                    logger.info(f"  {spec}: {bytes_used:,} bytes ({files_counted:,} files)")
 
-            folders = measure_leaf_folders(leaf_folders, timeout=timeout)
-            logger.info(f"Measured {len(folders)} folders")
+        total_usage = sum(volume_used.values())
 
-            folder_data = {f['path']: f['usage_bytes'] for f in folders}
-
-            # For scan_depth >= 3, compute intermediate sums (e.g. tier2 totals)
-            # from scan data. Volume-level sums come from shutil, not here.
-            intermediate_sums = {}
-            if scan_depth >= 3:
-                volume_set = set(volumes)
-                for path, usage in folder_data.items():
-                    current = os.path.dirname(path)
-                    while current and current not in volume_set:
-                        intermediate_sums[current] = intermediate_sums.get(current, 0) + usage
-                        parent = os.path.dirname(current)
-                        if parent == current:
-                            break
-                        current = parent
-
-            # Volume totals from shutil — authoritative regardless of scan depth
-            total_usage = sum(volume_used.values())
-
-            entry = {
-                'header': build_header(name, system_id, device_type),
-                'data': {
-                    'data_type':       'folder_usage',
-                    '_unit':           'bytes',   # all numeric fields in this message are bytes
-                    **folder_data,      # /volume/tier2(/tier3): bytes per leaf (from scan)
-                    **intermediate_sums, # /volume/tier2: tier2 sums for scan_depth>=3 (from scan)
-                    **volume_used,      # /volume: used bytes (shutil, authoritative)
-                    **volume_capacity,  # /volume_total_bytes, /volume_free_bytes
-                    'total_usage':      total_usage,
-                }
+        entry = {
+            'header': build_header(name, system_id, device_type),
+            'data': {
+                'data_type':   'folder_usage',
+                '_unit':       'bytes',
+                **folder_data,      # per-folder usage from scan_paths
+                **volume_used,      # per-volume used bytes (shutil, authoritative)
+                **volume_capacity,  # per-volume total/free bytes
+                'total_usage': total_usage,
             }
+        }
         # Append to local archive
         archive_path = get_archive_path(config, name)
         append_to_archive(archive_path, entry, logger)

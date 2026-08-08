@@ -17,12 +17,20 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
   "device_type":      "synology",
   "manager_url":      "http://atlantis.med.harvard.edu:5000",
   "manager_token":    "YOUR-MANAGER-TOKEN",
+
   "volumes":          ["/volume1", "/volume2"],
+
+  "scan_paths": [
+    "/volume1/*",
+    "/volume1/Data1/*",
+    "/volume2/*"
+  ],
+
   "data_dir":         "/volume1/lab-monitor/data",
   "log_file":         "/volume1/lab-monitor/logs/collector.log",
   "log_level":        "INFO",
   "timeout_seconds":  3600,
-  "exclude_users":    ["SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "UMFD*"]
+  "exclude_users":    []
 }
 ```
 
@@ -33,10 +41,11 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `device_type` | System type: `synology`, `windows`, or any label you choose |
 | `manager_url` | URL of the Manager service |
 | `manager_token` | Bearer token — must match one of Manager's `auth_tokens` |
-| `volumes` | Paths to measure. Collector measures immediate subdirectories of each. |
+| `volumes` | Drives/volumes to report **capacity** for (used/free/total bytes). Used only for capacity reporting, not folder scanning. |
+| `scan_paths` | Folders to measure for **usage breakdown**. Each entry is either a path (`/volume1/Data1` = measure that folder as a single total) or a glob (`/volume1/Data1/*` = measure each immediate subfolder separately). If omitted, falls back to scanning one level deep in each volume. |
 | `data_dir` | Local data directory for archives and queue |
-| `timeout_seconds` | Max time to measure a single subdirectory (default 3600) |
-| `exclude_users` | (Optional) List of username patterns to exclude from user activity metrics. Supports wildcards (e.g., `UMFD*`). Examples: `["SYSTEM", "UMFD*"]`. Users matching any pattern are not collected. Default: empty (collect all). |
+| `timeout_seconds` | Max time to measure a single folder (default 3600) |
+| `exclude_users` | (Optional) Username patterns to exclude from user activity metrics. Supports wildcards. Built-in defaults already exclude `UMFD-*`, `NT AUTHORITY\*`, etc. |
 
 `volumes` examples:
 - Synology: `["/volume1", "/volume2"]`

@@ -5,13 +5,17 @@
   "device_type": "Server",
   "manager_url": "http://atlantis.med.harvard.edu:5000",
   "manager_token": "YOUR-BEARER-TOKEN-HERE",
-  "volumes": [
-    "E:",
-    "F:"
+
+  "volumes": ["E:", "F:"],
+
+  "scan_paths": [
+    "E:/Users/*"
   ],
+
   "data_dir": "E:\\Users\\lab-monitor\\data",
   "log_file": "E:\\Users\\lab-monitor\\logs\\collector.log",
   "log_level": "INFO",
   "timeout_seconds": 3600,
-  "request_timeout_seconds": 30
+  "request_timeout_seconds": 30,
+  "exclude_users": ["UMFD-*", "NT AUTHORITY\\*", "NT SERVICE\\*"]
 }
