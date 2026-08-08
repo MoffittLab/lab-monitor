@@ -14,7 +14,7 @@
 #   5. Gathers configuration interactively
 #   6. Creates wrapper batch scripts with hardcoded Python paths
 #   7. Tests collector
-#   8. Registers Task Scheduler jobs (via batch scripts)
+#   8. Registers Task Scheduler jobs (auto-detects SYSTEM vs. user logon mode)
 #   9. Displays manual Task Scheduler instructions (fallback)
 #
 # Pre-requisites:
@@ -23,11 +23,13 @@
 #       conda create -n lab-monitor python=3.11
 #
 # Why batch scripts for scheduling?
-#   Task Scheduler jobs run as a Windows user account (not inside a conda
-#   session). Calling Python directly via a conda env path is fragile when
-#   the task runs as SYSTEM or as a logged-off user. Wrapper .bat files with
-#   a hardcoded absolute path to the conda env's python.exe are self-contained
-#   and work reliably in all cases.
+#   Task Scheduler jobs run outside any conda session. Wrapper .bat files
+#   embed a hardcoded absolute path to the conda env's python.exe so no
+#   'conda activate' is needed at run time. When Python is at a system-wide
+#   path the tasks are registered as SYSTEM and run regardless of who is
+#   logged on. When Python is in a per-user profile the installer captures the
+#   account password for unattended execution, or falls back to 'only when
+#   logged on' if no password is supplied.
 #
 # Administrator rights are required for:
 #   - Creating directories on the selected drive
@@ -508,19 +510,12 @@ if ($TestExit -eq 0) {
 Write-Step "Step 9: Registering Task Scheduler jobs"
 
 Write-Host "Tasks invoke the batch scripts in $BatchDir" -ForegroundColor Cyan
-Write-Host "The batch scripts use a hardcoded absolute path to python.exe" -ForegroundColor Cyan
-Write-Host "so they are independent of any conda session or user environment." -ForegroundColor Cyan
+Write-Host "The batch scripts embed a hardcoded absolute path to python.exe" -ForegroundColor Cyan
+Write-Host "so no conda session is needed when the task runs." -ForegroundColor Cyan
 Write-Host ""
 
-# Run tasks as current user (not SYSTEM - SYSTEM cannot access a per-user
-# conda environment). The tasks are registered for the current logged-on user.
 $CurrentUser = "$env:USERDOMAIN\$env:USERNAME"
-Write-Host "Registering tasks to run as: $CurrentUser" -ForegroundColor Gray
-Write-Host ""
-Write-Host "NOTE: By default, tasks run 'only when this user is logged on'." -ForegroundColor Yellow
-Write-Host "      For unattended execution (user logged off), open Task Scheduler" -ForegroundColor Yellow
-Write-Host "      after install, edit each task, choose 'Run whether user is" -ForegroundColor Yellow
-Write-Host "      logged on or not', and enter your Windows password when prompted." -ForegroundColor Yellow
+Write-Host "Current user: $CurrentUser" -ForegroundColor Gray
 Write-Host ""
 
 try {
@@ -528,6 +523,90 @@ try {
 } catch {
     Write-Warn "Could not import ScheduledTasks module: $_"
     Write-Host "  Attempting to continue anyway..." -ForegroundColor Yellow
+}
+
+# --- Determine logon mode ---------------------------------------------------
+# If Python is at a system-wide path (outside the per-user profile), register
+# tasks as SYSTEM so they run regardless of who is logged on.  If Python is
+# inside the per-user profile, offer to store the account password so the
+# task can run unattended; fall back to 'only when logged on' if skipped.
+
+$UseSystem    = $false
+$TaskPassword = $null
+
+$UserProfileNorm = $env:USERPROFILE.ToLower().TrimEnd('\')
+$PythonExeNorm   = $PythonExe.ToLower()
+
+if (-not $PythonExeNorm.StartsWith($UserProfileNorm)) {
+    $UseSystem = $true
+    Write-Host "Python is at a system-wide path; tasks will run as SYSTEM (no login required)." -ForegroundColor Cyan
+    Write-Host "  ($PythonExe)" -ForegroundColor Gray
+    $TaskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+} else {
+    Write-Host "Python is inside the per-user profile:" -ForegroundColor Cyan
+    Write-Host "  $PythonExe" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "To run tasks when '$CurrentUser' is logged off, enter that" -ForegroundColor Yellow
+    Write-Host "account's Windows password now. Leave blank to register as" -ForegroundColor Yellow
+    Write-Host "'only when logged on' (tasks will not run unattended)." -ForegroundColor Yellow
+    Write-Host ""
+    $SecurePass = Read-Host "Windows password for $CurrentUser (Enter to skip)" -AsSecureString
+    $BSTR       = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePass)
+    $PlainPass  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+    if (-not [string]::IsNullOrWhiteSpace($PlainPass)) {
+        $TaskPassword = $PlainPass
+        Write-Success "Password captured; tasks will run unattended."
+    } else {
+        Write-Warn "No password supplied - tasks will only run while $CurrentUser is logged on."
+        Write-Host "  To change later: Task Scheduler -> edit each task -> General tab ->" -ForegroundColor Gray
+        Write-Host "  'Run whether user is logged on or not'" -ForegroundColor Gray
+    }
+    $TaskPrincipal = $null
+}
+
+Write-Host ""
+
+# Helper: register one task using the logon mode determined above
+function Register-LabTask {
+    param(
+        [string]$TaskName,
+        [string]$Description,
+        $Action,
+        $Trigger,
+        $Settings
+    )
+    if ($script:UseSystem) {
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -Principal   $script:TaskPrincipal `
+            -Force | Out-Null
+    } elseif ($script:TaskPassword) {
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -RunLevel    Highest `
+            -User        $script:CurrentUser `
+            -Password    $script:TaskPassword `
+            -Force | Out-Null
+    } else {
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -RunLevel    Highest `
+            -User        $script:CurrentUser `
+            -Force | Out-Null
+    }
 }
 
 # -- Disk collection (daily at 2:00 AM) --------------------------------------
@@ -542,14 +621,12 @@ try {
                         -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
                         -StartWhenAvailable
 
-    Register-ScheduledTask `
-        -TaskName "Lab Monitor - Disk Collection" `
-        -Action   $DiskAction  `
-        -Trigger  $DiskTrigger `
-        -Settings $DiskSettings `
-        -RunLevel Highest `
-        -User     $CurrentUser `
-        -Force | Out-Null
+    Register-LabTask `
+        -TaskName    "Lab Monitor - Disk Collection" `
+        -Description "Lab Monitor daily disk-usage scan (runs at 2 AM)" `
+        -Action      $DiskAction `
+        -Trigger     $DiskTrigger `
+        -Settings    $DiskSettings
 
     Write-Success "Disk collection task registered (daily at 2:00 AM)"
     Write-Host "  Script: $DiskBat" -ForegroundColor Gray
@@ -562,30 +639,32 @@ Write-Host ""
 
 # -- Metrics collection (every 5 minutes, indefinitely) ----------------------
 try {
-    $MetricsAction   = New-ScheduledTaskAction `
-                           -Execute  "cmd.exe" `
-                           -Argument "/c `"$MetricsBat`""
+    $MetricsAction = New-ScheduledTaskAction `
+                         -Execute  "cmd.exe" `
+                         -Argument "/c `"$MetricsBat`""
 
-    # Use -Days 9999 for indefinite repetition (works on all Windows versions)
-    $MetricsTrigger  = New-ScheduledTaskTrigger `
-                           -Once `
-                           -At                 "00:00" `
-                           -RepetitionInterval (New-TimeSpan -Minutes 5) `
-                           -RepetitionDuration (New-TimeSpan -Days 9999)
+    # Start 1 minute from now so the trigger fires immediately after
+    # registration rather than anchoring to a past midnight time.
+    # Repetition is set via .Repetition properties rather than the cmdlet
+    # constructor parameters, which are silently ignored on some Windows
+    # Server versions and would leave a one-shot task instead of a repeating
+    # one.
+    $MetricsTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+    $MetricsTrigger.Repetition.Interval          = "PT5M"
+    $MetricsTrigger.Repetition.Duration          = "P9999D"
+    $MetricsTrigger.Repetition.StopAtDurationEnd = $false
 
     $MetricsSettings = New-ScheduledTaskSettingsSet `
                            -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
                            -StartWhenAvailable `
                            -MultipleInstances   IgnoreNew
 
-    Register-ScheduledTask `
-        -TaskName "Lab Monitor - Metrics Collection" `
-        -Action   $MetricsAction   `
-        -Trigger  $MetricsTrigger  `
-        -Settings $MetricsSettings `
-        -RunLevel Highest `
-        -User     $CurrentUser `
-        -Force | Out-Null
+    Register-LabTask `
+        -TaskName    "Lab Monitor - Metrics Collection" `
+        -Description "Lab Monitor system-metrics collection (runs every 5 min)" `
+        -Action      $MetricsAction `
+        -Trigger     $MetricsTrigger `
+        -Settings    $MetricsSettings
 
     Write-Success "Metrics collection task registered (every 5 min, indefinite)"
     Write-Host "  Script: $MetricsBat" -ForegroundColor Gray
