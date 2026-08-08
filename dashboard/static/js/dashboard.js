@@ -127,11 +127,15 @@ function updateSummary(globalTotals) {
 
 function createSystemCard(systemName, sys) {
     const card = document.createElement('div');
-    card.className = 'nas-card';
+    card.className = 'nas-card' + (isOffline ? ' offline' : '');
 
     const deviceType = sys.device_type || 'unknown';
-    const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
-    const timestamp   = metricsTs ? ('Last report: ' + formatTimestamp(metricsTs)) : 'No metrics yet';
+    const metricsTs        = sys.metrics ? sys.metrics.timestamp : null;
+    const OFFLINE_MS        = 7 * 60 * 1000;
+    const isOffline         = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
+    const timestamp         = isOffline
+                                ? 'System offline'
+                                : ('Last report: ' + formatTimestamp(metricsTs));
 
     // --- Metrics section ---
     let metricsHtml = '';
