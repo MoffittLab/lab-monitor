@@ -386,6 +386,7 @@ class MetricsDB:
             except Exception:
                 raw = {}
             d['units'] = self._extract_units(raw)
+            d['gpus']  = raw.get('gpus', [])
             result[d['name']] = d
         return result
 

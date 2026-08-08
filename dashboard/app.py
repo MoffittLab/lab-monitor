@@ -250,6 +250,7 @@ def get_all_systems_data() -> tuple:
             'network_bandwidth_in_mbps':    data.get('network_bandwidth_in_mbps', 0.0),
             'network_bandwidth_out_mbps':   data.get('network_bandwidth_out_mbps', 0.0),
             'units':                        data.get('units', {}),
+            'gpus':                         data.get('gpus', []),
         }
 
     # --- disk snapshots ---

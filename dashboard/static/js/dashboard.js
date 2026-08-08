@@ -359,8 +359,44 @@ function createSystemCard(systemName, sys) {
     }
 
     // --- User activity section (server devices only) ---
-    let usersHtml = '';
     const isServer = !NAS_TYPES.has((sys.device_type || '').toLowerCase());
+
+    // --- GPU section (server devices with NVIDIA GPUs only) ---
+    let gpuHtml = '';
+    const gpus = (sys.metrics || {}).gpus || [];
+    if (isServer && gpus.length > 0) {
+        const gpuRows = gpus.map(g => {
+            const vramPct   = g.vram_total_bytes > 0
+                ? Math.round((g.vram_used_bytes / g.vram_total_bytes) * 100) : 0;
+            const gpuCls    = g.gpu_percent >= 90 ? 'danger'  : g.gpu_percent >= 70 ? 'warning' : '';
+            const vramCls   = vramPct       >= 90 ? 'danger'  : vramPct       >= 75 ? 'warning' : '';
+            const tempStr   = g.temperature_c !== null && g.temperature_c !== undefined
+                ? ` &bull; ${g.temperature_c}\u00b0C` : '';
+            const powerStr  = g.power_watts  !== null && g.power_watts  !== undefined
+                ? ` &bull; ${g.power_watts}W` : '';
+            return `
+                <div class="gpu-row">
+                    <div class="gpu-name">${escapeHtml(g.name)}${tempStr}${powerStr}</div>
+                    <div class="metrics-stats">
+                        <div class="metric-item ${gpuCls}">
+                            <span class="metric-label">GPU</span>
+                            <span class="metric-value">${safeFixed(g.gpu_percent, 1)}%</span>
+                        </div>
+                        <div class="metric-item ${vramCls}">
+                            <span class="metric-label">VRAM</span>
+                            <span class="metric-value">${escapeHtml(g.vram_used_formatted)} / ${escapeHtml(g.vram_total_formatted)}</span>
+                        </div>
+                    </div>
+                </div>`;
+        }).join('');
+        gpuHtml = `
+            <div class="card-section">
+                <div class="section-label">GPU</div>
+                ${gpuRows}
+            </div>`;
+    }
+
+    let usersHtml = '';
     if (isServer && sys.users && sys.users.length > 0) {
         const topUsers = sys.users.slice(0, 8);  // cap at 8 rows
         const rows = topUsers.map(u => `
@@ -390,6 +426,7 @@ function createSystemCard(systemName, sys) {
             <div class="timestamp">${timestamp}</div>
         </div>
         ${metricsHtml}
+        ${gpuHtml}
         ${usersHtml}
         ${storageOverviewHtml}
         ${diskHtml}

@@ -333,8 +333,11 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         uptime_seconds = get_uptime_seconds()
         uptime_formatted = format_uptime(uptime_seconds)
         
-        logger.info(f"CPU: {cpu_percent}% | RAM: {ram_percent}% | Uptime: {uptime_formatted} | Network: {network_stats}")
-        
+        gpu_stats = get_gpu_stats()
+        gpu_summary = f" | GPUs: {len(gpu_stats)} ({', '.join(f"{g['name']} {g['gpu_percent']}%" for g in gpu_stats)})"\
+            if gpu_stats else " | GPUs: none/unavailable"
+        logger.info(f"CPU: {cpu_percent}% | RAM: {ram_percent}% | Uptime: {uptime_formatted} | Network: {network_stats}{gpu_summary}")
+
         # Create message (header + data).
         # Each numeric field is accompanied by a sibling *_unit field so any
         # consumer (dashboard, downstream scripts) can interpret values
@@ -358,6 +361,8 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
                 'network_bandwidth_in_mbps_unit':   'Mbps',
                 'network_bandwidth_out_mbps':       network_stats.get('bandwidth_out_mbps', 0.0),
                 'network_bandwidth_out_mbps_unit':  'Mbps',
+                'gpus':                             gpu_stats,
+                'gpu_count':                        len(gpu_stats),
             }
         }
         
@@ -545,6 +550,74 @@ def _format_bytes(b: int) -> str:
             return f"{b:.1f} {unit}"
         b /= 1024
     return f"{b:.1f} PB"
+
+
+def get_gpu_stats() -> list:
+    """
+    Collect per-GPU utilisation stats via pynvml (NVIDIA only).
+    Returns an empty list if pynvml is not installed, no NVIDIA driver is
+    present, or no GPUs are found — callers should treat an empty list as
+    "GPU data unavailable" rather than an error.
+
+    Each entry:
+        index, name, gpu_percent, vram_used_bytes, vram_total_bytes,
+        vram_used_formatted, vram_total_formatted,
+        temperature_c (None if unavailable), power_watts (None if unavailable)
+    """
+    try:
+        import pynvml
+    except ImportError:
+        return []   # pynvml not installed
+
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        return []   # no NVIDIA driver / GPU
+
+    gpus = []
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+        for i in range(count):
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+
+                raw_name = pynvml.nvmlDeviceGetName(handle)
+                name = raw_name.decode('utf-8') if isinstance(raw_name, bytes) else raw_name
+
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem  = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                try:
+                    temp = pynvml.nvmlDeviceGetTemperature(
+                        handle, pynvml.NVML_TEMPERATURE_GPU)
+                except Exception:
+                    temp = None
+
+                try:
+                    power = round(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0, 1)
+                except Exception:
+                    power = None
+
+                gpus.append({
+                    'index':                i,
+                    'name':                 name,
+                    'gpu_percent':          util.gpu,
+                    'vram_used_bytes':      mem.used,
+                    'vram_total_bytes':     mem.total,
+                    'vram_used_formatted':  _format_bytes(mem.used),
+                    'vram_total_formatted': _format_bytes(mem.total),
+                    'temperature_c':        temp,
+                    'power_watts':          power,
+                })
+            except Exception:
+                pass   # skip individual GPU on error
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+    return gpus
 
 
 def fallback_ram_percent() -> float:
