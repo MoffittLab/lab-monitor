@@ -134,6 +134,11 @@ function updateSummary(globalTotals) {
 
 const NAS_TYPES = new Set(['nas', 'nas-instrument', 'nas-backup']);
 
+function metricClass1(val, warnThresh, dangerThresh) {
+    if (val === null || isNaN(val)) return '';
+    return val >= dangerThresh ? 'danger' : val >= warnThresh ? 'warning' : '';
+}
+
 function createSummaryButton(systemName, sys) {
     const btn = document.createElement('div');
 
@@ -142,42 +147,64 @@ function createSummaryButton(systemName, sys) {
     const OFFLINE_MS = 7 * 60 * 1000;
     const isOffline  = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
 
-    let colorClass = '';
-    let statHtml   = '';
+    let outerClass = '';
+    let innerHtml  = '';
 
-    if (NAS_TYPES.has(deviceType)) {
-        // Aggregate storage across all volumes
+    if (isOffline) {
+        innerHtml = '<div class="sys-btn-stat" style="color:#c0392b">Offline</div>';
+    } else if (NAS_TYPES.has(deviceType)) {
+        // --- NAS: aggregate bar + used/total label ---
         let usedBytes  = 0;
         let totalBytes = 0;
         for (const vol of ((sys.disk || {}).volumes || [])) {
             usedBytes  += (vol.usage_bytes || 0);
             totalBytes += (vol.total_bytes || 0);
         }
-        const pct = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : null;
-        colorClass = pct === null ? '' : pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
-        statHtml   = pct !== null
-            ? `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)} &nbsp;<span style="opacity:.7">(${pct}%)</span>`
-            : '<span style="opacity:.6">No storage data</span>';
+        const pct      = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : null;
+        const barClass = metricClass1(pct, 75, 90);
+        outerClass     = barClass;
+        if (pct !== null) {
+            innerHtml = `
+                <div class="sys-btn-bar-row">
+                    <div class="usage-bar ${barClass}"><div class="usage-fill" style="width:${pct}%"></div></div>
+                    <span class="sys-btn-pct">${pct}%</span>
+                </div>
+                <div class="sys-btn-stat">${formatBytes(usedBytes)} / ${formatBytes(totalBytes)}</div>`;
+        } else {
+            innerHtml = '<div class="sys-btn-stat" style="opacity:.6">No storage data</div>';
+        }
     } else {
-        // Server: CPU + RAM
-        const m   = sys.metrics || {};
-        const cpu = parseFloat(m.cpu_percent);
-        const ram = parseFloat(m.ram_percent);
-        const max = Math.max(isNaN(cpu) ? 0 : cpu, isNaN(ram) ? 0 : ram);
-        colorClass = max >= 90 ? 'danger' : max >= 50 ? 'warning' : '';
+        // --- Server: CPU + RAM sub-tiles ---
+        const m      = sys.metrics || {};
+        const cpu    = parseFloat(m.cpu_percent);
+        const ram    = parseFloat(m.ram_percent);
+        const cpuCls = metricClass1(isNaN(cpu) ? null : cpu, 50, 90);
+        const ramCls = metricClass1(isNaN(ram) ? null : ram, 50, 90);
+        const max    = Math.max(isNaN(cpu) ? 0 : cpu, isNaN(ram) ? 0 : ram);
+        outerClass   = metricClass1(max, 50, 90);
+        const cpuW   = isNaN(cpu) ? 0 : Math.min(100, cpu);
+        const ramW   = isNaN(ram) ? 0 : Math.min(100, ram);
         const cpuTxt = isNaN(cpu) ? '—' : safeFixed(cpu, 1) + '%';
         const ramTxt = isNaN(ram) ? '—' : safeFixed(ram, 1) + '%';
-        statHtml = `CPU&nbsp;${cpuTxt} &middot; RAM&nbsp;${ramTxt}`;
+        innerHtml = `
+            <div class="sys-btn-metrics">
+                <div class="sys-btn-metric ${cpuCls}">
+                    <div class="sys-btn-metric-label">CPU</div>
+                    <div class="sys-btn-metric-val">${cpuTxt}</div>
+                    <div class="usage-bar ${cpuCls}"><div class="usage-fill" style="width:${cpuW}%"></div></div>
+                </div>
+                <div class="sys-btn-metric ${ramCls}">
+                    <div class="sys-btn-metric-label">RAM</div>
+                    <div class="sys-btn-metric-val">${ramTxt}</div>
+                    <div class="usage-bar ${ramCls}"><div class="usage-fill" style="width:${ramW}%"></div></div>
+                </div>
+            </div>`;
     }
 
-    const classes = ['sys-btn', colorClass, isOffline ? 'offline' : ''].filter(Boolean).join(' ');
-    btn.className = classes;
-    btn.innerHTML = `
-        <div class="sys-btn-name">${escapeHtml(systemName)}</div>
-        <div class="sys-btn-stat">${isOffline ? 'Offline' : statHtml}</div>
-    `;
+    btn.className = ['sys-btn', outerClass, isOffline ? 'offline' : ''].filter(Boolean).join(' ');
+    btn.innerHTML = `<div class="sys-btn-name">${escapeHtml(systemName)}</div>${innerHtml}`;
 
-    // Clicking the summary button scrolls to the full card
+    // Click scrolls to the full card
     btn.addEventListener('click', () => {
         const card = document.querySelector(`[data-system-name="${CSS.escape(systemName)}"]`);
         if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });

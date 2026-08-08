@@ -124,9 +124,11 @@ body {
     background: white;
     border: 1px solid var(--light);
     border-radius: 6px;
-    padding: 8px 14px;
+    padding: 10px 12px;
     cursor: pointer;
-    min-width: 160px;
+    width: 200px;
+    flex: 0 0 200px;
+    box-sizing: border-box;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
     transition: box-shadow 0.15s;
 }
@@ -135,37 +137,78 @@ body {
     box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
 }
 
-.sys-btn.warning {
-    background: #fff8e6;
-    border-color: #f39c12;
-}
-
-.sys-btn.danger {
-    background: #fdf0f0;
-    border-color: #e74c3c;
-}
-
-.sys-btn.offline {
-    background: #fdf0f0;
-    border-color: #e8a0a0;
-    opacity: 0.8;
-}
+.sys-btn.warning { background: #fff8e6; border-color: #f39c12; }
+.sys-btn.danger  { background: #fdf0f0; border-color: #e74c3c; }
+.sys-btn.offline { background: #fdf0f0; border-color: #e8a0a0; opacity: 0.8; }
 
 .sys-btn-name {
     font-size: 13px;
     font-weight: 600;
     color: var(--primary);
-    margin-bottom: 3px;
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-
-.sys-btn-stat {
-    font-size: 12px;
-    color: #666;
-}
-
-.sys-btn.warning .sys-btn-stat { color: #d68910; }
-.sys-btn.danger  .sys-btn-stat { color: #c0392b; }
 .sys-btn.offline .sys-btn-name { color: #c0392b; }
+
+/* NAS bar row */
+.sys-btn-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+.sys-btn-bar-row .usage-bar {
+    flex: 1;
+    height: 6px;
+    margin-bottom: 0;
+}
+.sys-btn-pct {
+    font-size: 11px;
+    color: #666;
+    min-width: 28px;
+    text-align: right;
+}
+.sys-btn-stat {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
+}
+
+/* Server sub-metric tiles */
+.sys-btn-metrics {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+}
+.sys-btn-metric {
+    flex: 1;
+    background: #f4f6f8;
+    border-radius: 4px;
+    padding: 5px 6px 4px;
+    text-align: center;
+}
+.sys-btn-metric-label {
+    font-size: 10px;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.sys-btn-metric-val {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--primary);
+    margin: 1px 0 3px;
+}
+.sys-btn-metric .usage-bar {
+    height: 4px;
+    margin-bottom: 0;
+}
+.sys-btn-metric.warning { background: #fff8e6; }
+.sys-btn-metric.danger  { background: #fdf0f0; }
+.sys-btn-metric.warning .sys-btn-metric-val { color: #d68910; }
+.sys-btn-metric.danger  .sys-btn-metric-val { color: #c0392b; }
 
 /* NAS Grid */
 .nas-grid {
