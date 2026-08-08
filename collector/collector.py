@@ -562,8 +562,8 @@ def _format_bytes(b: int) -> str:
 
 def get_gpu_stats() -> list:
     """
-    Collect per-GPU utilisation stats via pynvml (NVIDIA only).
-    Returns an empty list if pynvml is not installed, no NVIDIA driver is
+    Collect per-GPU utilisation stats via nvidia-ml-py (NVIDIA only).
+    Returns an empty list if nvidia-ml-py is not installed, no NVIDIA driver is
     present, or no GPUs are found — callers should treat an empty list as
     "GPU data unavailable" rather than an error.
 

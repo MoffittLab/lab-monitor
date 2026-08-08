@@ -20,7 +20,8 @@ psutil==5.9.6
 # --- NVIDIA GPU stats (collector) ---
 # Soft dependency: gracefully skipped at runtime if not installed
 # or if no NVIDIA GPU/driver is present.
-pynvml
+# nvidia-ml-py is the maintained fork of pynvml
+nvidia-ml-py
 
 # --- Web framework (manager + dashboard) ---
 Flask==2.3.3
