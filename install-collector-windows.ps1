@@ -186,7 +186,7 @@ $LogsDir      = "$RootDir\logs"
 $ScriptsDir   = "$RootDir\scripts"
 $BatchDir     = "$RootDir\bin"           # wrapper .bat scripts live here
 $RepoUrl      = "https://github.com/MoffittLab/lab-monitor.git"
-$CollectorDir = "$ScriptsDir\collector"
+$CollectorDir = "$ScriptsDir\lab-monitor\collector"
 $ConfigFile   = "$CollectorDir\local\config.json"
 $CondaEnv     = $env:CONDA_DEFAULT_ENV
 
@@ -242,29 +242,8 @@ Write-Host "  (CONDA_PREFIX: $env:CONDA_PREFIX)" -ForegroundColor Gray
 # Step 3: Clone / update repository
 # ==============================================================================
 Write-Step "Step 3: Cloning/updating lab-monitor repository"
-# The canonical clone target is $ScriptsDir itself.  However a previous run
-# or manual clone may have used git's default behaviour and placed the repo in
-# a 'lab-monitor' subdirectory ($ScriptsDir\lab-monitor).  Detect both layouts
-# and update $CollectorDir / $ConfigFile so all subsequent steps resolve the
-# correct paths.
-if (Test-Path "$ScriptsDir\.git") {
-    # Repo cloned directly into $ScriptsDir
+if (Test-Path "$ScriptsDir\lab-monitor\.git") {
     Write-Host "Repository already present - pulling latest..." -ForegroundColor Cyan
-    Push-Location "$ScriptsDir"
-    $gitOut  = & git pull origin main 2>&1
-    $gitExit = $LASTEXITCODE
-    Pop-Location
-    if ($gitExit -ne 0) {
-        Write-Warn "git pull exited with code $gitExit"
-        Write-Host ($gitOut | Out-String) -ForegroundColor Gray
-    } else {
-        Write-Success "Repository updated"
-    }
-} elseif (Test-Path "$ScriptsDir\lab-monitor\.git") {
-    # Repo was cloned into the default 'lab-monitor' subdirectory (git's
-    # default when no target path is supplied).  Pull from there and redirect
-    # $CollectorDir / $ConfigFile so Steps 5-9 resolve the correct paths.
-    Write-Host "Repository found at $ScriptsDir\lab-monitor - pulling latest..." -ForegroundColor Cyan
     Push-Location "$ScriptsDir\lab-monitor"
     $gitOut  = & git pull origin main 2>&1
     $gitExit = $LASTEXITCODE
@@ -275,27 +254,14 @@ if (Test-Path "$ScriptsDir\.git") {
     } else {
         Write-Success "Repository updated"
     }
-    $CollectorDir = "$ScriptsDir\lab-monitor\collector"
-    $ConfigFile   = "$CollectorDir\local\config.json"
-    Write-Host "  Collector path: $CollectorDir" -ForegroundColor Gray
-} elseif ((Get-ChildItem -Path $ScriptsDir -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
-    # $ScriptsDir is empty - safe to clone directly into it
-    Write-Host "Cloning from $RepoUrl into $ScriptsDir ..." -ForegroundColor Cyan
-    $gitOut  = & git clone $RepoUrl "$ScriptsDir" 2>&1
+} else {
+    Write-Host "Cloning from $RepoUrl into $ScriptsDir\lab-monitor ..." -ForegroundColor Cyan
+    $gitOut  = & git clone $RepoUrl "$ScriptsDir\lab-monitor" 2>&1
     $gitExit = $LASTEXITCODE
     if ($gitExit -ne 0) {
         Write-Warn "git clone exited with code $gitExit"
         Write-Host ($gitOut | Out-String) -ForegroundColor Gray
     }
-} else {
-    Write-Err "Cannot clone: $ScriptsDir is not empty and no .git was found"
-    Write-Host "  Expected locations checked:" -ForegroundColor Yellow
-    Write-Host "    $ScriptsDir\.git" -ForegroundColor Gray
-    Write-Host "    $ScriptsDir\lab-monitor\.git" -ForegroundColor Gray
-    Write-Host "  Options:" -ForegroundColor Yellow
-    Write-Host "    1. Remove $ScriptsDir and re-run this script" -ForegroundColor Yellow
-    Write-Host "    2. Clone the repo manually into an empty directory" -ForegroundColor Yellow
-    exit 1
 }
 if (Test-Path "$CollectorDir\collector.py") {
     Write-Success "Repository ready at $CollectorDir"
