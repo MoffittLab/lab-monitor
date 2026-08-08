@@ -380,7 +380,7 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         entries.append(entry)
         
         # Per-user metrics (one message per user for normalized history storage)
-        user_stats = get_per_user_stats()
+        user_stats = get_per_user_stats(config)
         for user in user_stats:
             user_entry = {
                 'header': build_header(name, system_id, device_type),
@@ -506,7 +506,7 @@ def get_ram_percent() -> float:
         return fallback_ram_percent()
 
 
-def get_per_user_stats() -> list:
+def get_per_user_stats(config: dict) -> list:
     """
     Aggregate CPU% and RAM (bytes) by Windows user account across all processes.
     Returns a list sorted by cpu_percent descending.
@@ -521,7 +521,16 @@ def get_per_user_stats() -> list:
         user_cpu = defaultdict(float)
         user_ram = defaultdict(int)
         cpu_count = psutil.cpu_count(logical=True) or 1
-        exclude_patterns = _config.get('exclude_users', [])
+        # Always exclude well-known Windows service accounts.
+        # Additional patterns can be added via exclude_users in config.json.
+        default_excludes = [
+            'UMFD-*',
+            'NT AUTHORITY\\*',
+            'NT SERVICE\\*',
+            'Window Manager\\*',
+            'Font Driver Host\\*',
+        ]
+        exclude_patterns = default_excludes + config.get('exclude_users', [])
 
         for proc in psutil.process_iter(['username', 'cpu_percent', 'memory_info']):
             try:
