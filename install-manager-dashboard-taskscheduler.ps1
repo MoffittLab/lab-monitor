@@ -356,7 +356,7 @@ Write-Host ""
 # ==============================================================================
 Write-Host ""
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
-Write-Host "  OpenSSH Server (optional — enables remote updates)" -ForegroundColor Yellow
+Write-Host "  OpenSSH Server (optional - enables remote updates)" -ForegroundColor Yellow
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "The update_collectors.py tool uses SSH to push git + pip updates" -ForegroundColor Cyan
 Write-Host "to this server remotely. OpenSSH Server must be installed for this." -ForegroundColor Cyan

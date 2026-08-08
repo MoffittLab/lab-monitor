@@ -854,7 +854,7 @@ if ($SshdInstalled -and $SshdRunning) {
         if ($Listening) {
             Write-Success "sshd is listening on port 22"
         } else {
-            Write-Warn "Port 22 not detected in netstat — sshd may still be starting"
+            Write-Warn "Port 22 not detected in netstat - sshd may still be starting"
         }
     } else {
         Write-Host "  Skipped. To enable later, run in an admin PowerShell:" -ForegroundColor Gray
