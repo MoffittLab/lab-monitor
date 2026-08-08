@@ -50,6 +50,20 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+def is_windows_path(path: str) -> bool:
+    """Heuristic: Windows paths contain a drive letter or .exe extension."""
+    p = path.strip()
+    return (
+        p.lower().endswith('.exe') or
+        (len(p) >= 2 and p[1] == ':') or
+        '\\' in p
+    )
+
+
+# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
@@ -110,8 +124,13 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         'elapsed': 0.0,
     }
 
+    # Normalize paths: convert backslashes to forward slashes for SSH
+    windows = is_windows_path(git_path) or is_windows_path(python_path)
+    if windows:
+        git_path = git_path.replace('\\', '/')
+        python_path = python_path.replace('\\', '/')
+    
     # Construct the collection command
-    # Keep paths as-is from CSV (Windows or Unix); just quote them properly
     # Format: cd {git_path} && {python_path} collector/collector.py --config collector/local/config.json --mode {mode}
     command = f'cd "{git_path}" && "{python_path}" collector/collector.py --config collector/local/config.json --mode {mode}'
 

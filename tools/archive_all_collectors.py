@@ -73,6 +73,20 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+def is_windows_path(path: str) -> bool:
+    """Heuristic: Windows paths contain a drive letter or .exe extension."""
+    p = path.strip()
+    return (
+        p.lower().endswith('.exe') or
+        (len(p) >= 2 and p[1] == ':') or
+        '\\' in p
+    )
+
+
+# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
@@ -117,6 +131,10 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     Fetch collector config via config_tool.py.
     Returns (config_dict, None) on success, (None, error_str) on failure.
     """
+    # Normalize Windows paths
+    if is_windows_path(git_path):
+        git_path = git_path.replace('\\', '/')
+    
     vprint(f"Reading config from {git_path}/collector/local/config.json")
     command = f'cd "{git_path}/collector" && python3 config_tool.py --config local/config.json list --json'
     
