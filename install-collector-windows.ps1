@@ -44,6 +44,24 @@
 #
 
 # ==============================================================================
+# Administrator check
+# ==============================================================================
+$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host ""
+    Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "To fix this:" -ForegroundColor Yellow
+    Write-Host "  1. Close this window." -ForegroundColor Yellow
+    Write-Host "  2. Search for 'Anaconda PowerShell Prompt' in the Start Menu." -ForegroundColor Yellow
+    Write-Host "  3. Right-click it and choose 'Run as administrator'." -ForegroundColor Yellow
+    Write-Host "  4. Accept the UAC prompt, navigate here, and run the script again." -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+Write-Host "[OK] Running as Administrator" -ForegroundColor Green
+
+# ==============================================================================
 # Conda availability check
 # ==============================================================================
 if (-not $env:CONDA_EXE) {
