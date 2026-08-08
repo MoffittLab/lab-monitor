@@ -54,6 +54,20 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
+# Path normalization
+# ---------------------------------------------------------------------------
+
+def is_windows_path(path: str) -> bool:
+    """Heuristic: Windows paths contain a drive letter or .exe extension."""
+    p = path.strip()
+    return (
+        p.lower().endswith('.exe') or
+        (len(p) >= 2 and p[1] == ':') or
+        '\\' in p
+    )
+
+
+# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
@@ -149,6 +163,10 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     username = row['username'].strip()
     password = row.get('password', '').strip()
     git_path = row['git_path'].strip()
+    
+    # Normalize Windows paths for SSH shell
+    if is_windows_path(git_path):
+        git_path = git_path.replace('\\', '/')
 
     result = {
         'ip': ip,
