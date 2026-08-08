@@ -67,11 +67,12 @@ _config = {}
 _logger = None
 _metrics_db = None
 _data_store = None
+_user_metrics = None   # initialised in init_app()
 
 
 def init_app(config: dict, logger: logging.Logger):
     """Initialize app with config"""
-    global _config, _logger, _metrics_db, _data_store
+    global _config, _logger, _metrics_db, _data_store, _user_metrics
     _config = config
     _logger = logger
 
@@ -86,6 +87,11 @@ def init_app(config: dict, logger: logging.Logger):
     # Per-system typed data store (full history)
     _data_store = TypedDataStore(data_dir=data_dir)
     logger.info(f"TypedDataStore root: {data_dir}")
+
+    # User metrics store (per-user CPU/RAM snapshots and history)
+    from metrics import UserMetricsStore
+    _user_metrics = UserMetricsStore(_metrics_db.db)
+    logger.info("User metrics store initialized")
 
     # Configure CORS with specific origins
     cors_origins = config.get("cors_origins", ["http://localhost:5001"])
@@ -486,6 +492,16 @@ def _ingest_messages(name: str, system_id: str, messages: list) -> tuple:
                 int(payload.get('total_usage', 0) or 0),
                 timestamp,
             )
+        elif data_type == 'user_metrics':
+            if _user_metrics:
+                _user_metrics.ingest(
+                    dev_name,
+                    timestamp,
+                    payload.get('username', ''),
+                    float(payload.get('cpu_percent', 0) or 0),
+                    int(payload.get('ram_bytes', 0) or 0),
+                    payload.get('ram_formatted', ''),
+                )
         else:
             # Unknown / not_specified: nothing to do in central DB
             pass
@@ -655,6 +671,46 @@ def get_nas_metrics(nas_name):
     
     except Exception as e:
         _logger.error(f"Error fetching metrics for {nas_name}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/user_metrics/all', methods=['GET'])
+@require_auth
+def get_all_user_metrics():
+    """Latest per-user CPU/RAM snapshot for all devices."""
+    try:
+        if not _user_metrics:
+            return jsonify({"error": "User metrics not initialized"}), 500
+        return jsonify(_user_metrics.get_all_snapshots()), 200
+    except Exception as e:
+        _logger.error(f"Error fetching user metrics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/user_metrics/<device_name>', methods=['GET'])
+@require_auth
+def get_device_user_metrics(device_name: str):
+    """Latest per-user CPU/RAM snapshot for one device."""
+    try:
+        if not _user_metrics:
+            return jsonify({"error": "User metrics not initialized"}), 500
+        return jsonify(_user_metrics.get_snapshot(device_name)), 200
+    except Exception as e:
+        _logger.error(f"Error fetching user metrics for {device_name}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/user_metrics/history/<device_name>/<path:username>', methods=['GET'])
+@require_auth
+def get_user_metrics_history(device_name: str, username: str):
+    """Time-series CPU/RAM for one user on one device."""
+    try:
+        limit = request.args.get('limit', 200, type=int)
+        if not _user_metrics:
+            return jsonify({"error": "User metrics not initialized"}), 500
+        return jsonify(_user_metrics.get_history(device_name, username, limit)), 200
+    except Exception as e:
+        _logger.error(f"Error fetching user history: {e}")
         return jsonify({"error": str(e)}), 500
 
 

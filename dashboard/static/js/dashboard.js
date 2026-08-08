@@ -358,6 +358,27 @@ function createSystemCard(systemName, sys) {
         }
     }
 
+    // --- User activity section (server devices only) ---
+    let usersHtml = '';
+    const isServer = !NAS_TYPES.has((sys.device_type || '').toLowerCase());
+    if (isServer && sys.users && sys.users.length > 0) {
+        const topUsers = sys.users.slice(0, 8);  // cap at 8 rows
+        const rows = topUsers.map(u => `
+            <div class="user-row">
+                <span class="user-name" title="${escapeHtml(u.username)}">${escapeHtml(u.username.split('\\').pop())}</span>
+                <span class="user-cpu ${u.cpu_percent >= 90 ? 'danger' : u.cpu_percent >= 50 ? 'warning' : ''}">${safeFixed(u.cpu_percent, 1)}%</span>
+                <span class="user-ram">${escapeHtml(u.ram_formatted)}</span>
+            </div>`).join('');
+        usersHtml = `
+            <div class="card-section">
+                <div class="section-label">User Activity</div>
+                <div class="user-header">
+                    <span>User</span><span>CPU</span><span>RAM</span>
+                </div>
+                <div class="user-list">${rows}</div>
+            </div>`;
+    }
+
     card.dataset.systemName = systemName;
 
     card.innerHTML = `
@@ -369,6 +390,7 @@ function createSystemCard(systemName, sys) {
             <div class="timestamp">${timestamp}</div>
         </div>
         ${metricsHtml}
+        ${usersHtml}
         ${storageOverviewHtml}
         ${diskHtml}
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}

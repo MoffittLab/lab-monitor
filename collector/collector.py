@@ -370,8 +370,24 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         queue_path = get_queue_path(config, name)
         entries = read_queue(queue_path)
         entries.append(entry)
+        
+        # Per-user metrics (one message per user for normalized history storage)
+        user_stats = get_per_user_stats()
+        for user in user_stats:
+            user_entry = {
+                'header': build_header(name, system_id, device_type),
+                'data': {
+                    'data_type':     'user_metrics',
+                    'username':      user['username'],
+                    'cpu_percent':   user['cpu_percent'],
+                    'ram_bytes':     user['ram_bytes'],
+                    'ram_formatted': user['ram_formatted'],
+                },
+            }
+            entries.append(user_entry)
+        
         write_queue(queue_path, entries, logger)
-        logger.info(f"Added to queue ({len(entries)} entries)")
+        logger.info(f"Added {len(entries)} entries to queue (including {len(user_stats)} user metrics)")
         
         # Try to sync queue to manager
         return sync_queue_to_manager(config, name, system_id, queue_path, logger)
@@ -480,6 +496,55 @@ def get_ram_percent() -> float:
         return psutil.virtual_memory().percent
     except ImportError:
         return fallback_ram_percent()
+
+
+def get_per_user_stats() -> list:
+    """
+    Aggregate CPU% and RAM (bytes) by Windows user account across all processes.
+    Returns a list sorted by cpu_percent descending.
+    Filters out blank/None usernames.
+    Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
+    """
+    try:
+        import psutil
+        from collections import defaultdict
+
+        user_cpu = defaultdict(float)
+        user_ram = defaultdict(int)
+        cpu_count = psutil.cpu_count(logical=True) or 1
+
+        for proc in psutil.process_iter(['username', 'cpu_percent', 'memory_info']):
+            try:
+                username = proc.info.get('username') or ''
+                if not username:
+                    continue
+                user_cpu[username] += proc.info.get('cpu_percent') or 0.0
+                mem = proc.info.get('memory_info')
+                user_ram[username] += mem.rss if mem else 0
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        result = []
+        for username, cpu_total in user_cpu.items():
+            ram_b = user_ram[username]
+            result.append({
+                'username':      username,
+                'cpu_percent':   round(cpu_total / cpu_count, 2),
+                'ram_bytes':     ram_b,
+                'ram_formatted': _format_bytes(ram_b),
+            })
+        return sorted(result, key=lambda x: x['cpu_percent'], reverse=True)
+
+    except Exception:
+        return []
+
+
+def _format_bytes(b: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
 
 
 def fallback_ram_percent() -> float:

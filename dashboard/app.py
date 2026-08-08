@@ -275,6 +275,12 @@ def get_all_systems_data() -> tuple:
                 'total_disk_bytes': t.get('total_disk_bytes', 0),
             }
 
+    # --- per-user metrics snapshot ---
+    user_all = _manager_get('/api/user_metrics/all') or {}
+    for name, users in user_all.items():
+        if name in systems:
+            systems[name]['users'] = users
+
     # Surface most-recent timestamp per system
     for sys in systems.values():
         ts = (sys.get('metrics') or {}).get('timestamp') \

@@ -452,3 +452,107 @@ class MetricsDB:
             self.db.close()
         except Exception:
             pass
+
+
+class UserMetricsStore:
+    """
+    Manages per-user CPU/RAM snapshot and normalized history.
+
+    Snapshot table  (device_user_snapshot): latest row per (device, username).
+    History table   (user_metrics_history):  one row per (device, timestamp, username).
+    """
+
+    def __init__(self, db):
+        self.db = db
+        self._init_tables()
+
+    def _init_tables(self):
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS device_user_snapshot (
+                name          TEXT NOT NULL,
+                username      TEXT NOT NULL,
+                cpu_percent   REAL,
+                ram_bytes     INTEGER,
+                ram_formatted TEXT,
+                timestamp     TEXT,
+                PRIMARY KEY (name, username)
+            )
+        ''')
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS user_metrics_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL,
+                timestamp   TEXT NOT NULL,
+                username    TEXT NOT NULL,
+                cpu_percent REAL,
+                ram_bytes   INTEGER,
+                ram_formatted TEXT
+            )
+        ''')
+        self.db.execute('''
+            CREATE INDEX IF NOT EXISTS idx_umh_device_ts
+                ON user_metrics_history (device_name, timestamp)
+        ''')
+        self.db.execute('''
+            CREATE INDEX IF NOT EXISTS idx_umh_device_user_ts
+                ON user_metrics_history (device_name, username, timestamp)
+        ''')
+        self.db.commit()
+
+    def ingest(self, device_name: str, timestamp: str, username: str,
+               cpu_percent: float, ram_bytes: int, ram_formatted: str):
+        """Store one user-metric observation: updates snapshot + appends history."""
+        # Upsert snapshot
+        self.db.execute('''
+            INSERT INTO device_user_snapshot
+                (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, username) DO UPDATE SET
+                cpu_percent   = excluded.cpu_percent,
+                ram_bytes     = excluded.ram_bytes,
+                ram_formatted = excluded.ram_formatted,
+                timestamp     = excluded.timestamp
+        ''', (device_name, username, cpu_percent, ram_bytes, ram_formatted, timestamp))
+
+        # Append history
+        self.db.execute('''
+            INSERT INTO user_metrics_history
+                (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted))
+
+        self.db.commit()
+
+    def get_snapshot(self, device_name: str) -> list:
+        """Current users for one device, sorted by cpu_percent desc."""
+        cur = self.db.execute('''
+            SELECT username, cpu_percent, ram_bytes, ram_formatted, timestamp
+            FROM device_user_snapshot
+            WHERE name = ?
+            ORDER BY cpu_percent DESC
+        ''', (device_name,))
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_all_snapshots(self) -> dict:
+        """Current users for all devices. Returns {device_name: [user_rows]}."""
+        cur = self.db.execute('''
+            SELECT name, username, cpu_percent, ram_bytes, ram_formatted, timestamp
+            FROM device_user_snapshot
+            ORDER BY name, cpu_percent DESC
+        ''')
+        result = {}
+        for row in cur.fetchall():
+            d = dict(row)
+            result.setdefault(d.pop('name'), []).append(d)
+        return result
+
+    def get_history(self, device_name: str, username: str, limit: int = 200) -> list:
+        """Time-series rows for one user on one device."""
+        cur = self.db.execute('''
+            SELECT timestamp, cpu_percent, ram_bytes, ram_formatted
+            FROM user_metrics_history
+            WHERE device_name = ? AND username = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        ''', (device_name, username, limit))
+        return [dict(r) for r in cur.fetchall()]
