@@ -525,39 +525,7 @@ try {
     Write-Host "  Attempting to continue anyway..." -ForegroundColor Yellow
 }
 
-# --- WMI health probe -------------------------------------------------------
-# All New-ScheduledTask* cmdlets use the Root/Microsoft/Windows/TaskScheduler
-# WMI namespace. Test it now; if broken, attempt automatic repair via winmgmt.
-# If repair fails, fall back to schtasks.exe which does not use WMI.
-$WmiAvailable = $true
-try {
-    $null = New-ScheduledTaskSettingsSet -ErrorAction Stop
-} catch {
-    $WmiAvailable = $false
-    Write-Warn "ScheduledTasks WMI namespace unavailable (HRESULT 0x8004100e or similar)."
-    Write-Host "  Attempting automatic repair with: winmgmt /salvagerepository" -ForegroundColor Cyan
-    $repairOut = & winmgmt /salvagerepository 2>&1
-    Write-Host "  $repairOut" -ForegroundColor Gray
-    Start-Sleep -Seconds 5
-    try {
-        $null = New-ScheduledTaskSettingsSet -ErrorAction Stop
-        $WmiAvailable = $true
-        Write-Success "WMI repository repaired. ScheduledTasks cmdlets are available."
-    } catch {
-        Write-Warn "WMI repair did not resolve the issue. Will use schtasks.exe instead."
-        Write-Host "  To repair manually, run in an administrator cmd.exe:" -ForegroundColor Gray
-        Write-Host "    winmgmt /salvagerepository" -ForegroundColor Gray
-        Write-Host "    winmgmt /resetrepository" -ForegroundColor Gray
-    }
-}
-Write-Host ""
-
 # --- Determine logon mode ---------------------------------------------------
-# If Python is at a system-wide path (outside the per-user profile), register
-# tasks as SYSTEM so they run regardless of who is logged on.  If Python is
-# inside the per-user profile, offer to store the account password so the
-# task can run unattended; fall back to 'only when logged on' if skipped.
-
 $UseSystem    = $false
 $TaskPassword = $null
 $TaskPrincipal = $null
@@ -569,8 +537,14 @@ if (-not $PythonExeNorm.StartsWith($UserProfileNorm)) {
     $UseSystem = $true
     Write-Host "Python is at a system-wide path; tasks will run as SYSTEM (no login required)." -ForegroundColor Cyan
     Write-Host "  ($PythonExe)" -ForegroundColor Gray
-    if ($WmiAvailable) {
-        $TaskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    # Wrap in try/catch: New-ScheduledTaskPrincipal uses WMI and will throw
+    # if the repository is corrupted. A null principal causes Register-LabTask
+    # to throw, which triggers the schtasks.exe fallback in each task block.
+    try {
+        $TaskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
+    } catch {
+        Write-Warn "Could not create task principal via WMI ($_)."
+        Write-Host "  schtasks.exe fallback will be used for task registration." -ForegroundColor Yellow
     }
 } else {
     Write-Host "Python is inside the per-user profile:" -ForegroundColor Cyan
@@ -596,144 +570,151 @@ if (-not $PythonExeNorm.StartsWith($UserProfileNorm)) {
 
 Write-Host ""
 
-# Helper: register one task.
-# When WMI is available, uses New-ScheduledTask* cmdlets for full fidelity.
-# When WMI is broken, falls back to schtasks.exe which does not rely on WMI.
+# Helper: register via New-ScheduledTask* cmdlets (WMI path)
 function Register-LabTask {
     param(
         [string]$TaskName,
         [string]$Description,
-        # PowerShell ScheduledTasks path
-        $Action   = $null,
-        $Trigger  = $null,
-        $Settings = $null,
-        # schtasks.exe fallback path
+        $Action,
+        $Trigger,
+        $Settings
+    )
+    if ($script:UseSystem) {
+        if ($null -eq $script:TaskPrincipal) { throw "TaskPrincipal is null (WMI unavailable)" }
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -Principal   $script:TaskPrincipal `
+            -Force | Out-Null
+    } elseif ($script:TaskPassword) {
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -RunLevel    Highest `
+            -User        $script:CurrentUser `
+            -Password    $script:TaskPassword `
+            -Force | Out-Null
+    } else {
+        Register-ScheduledTask `
+            -TaskName    $TaskName `
+            -Description $Description `
+            -Action      $Action `
+            -Trigger     $Trigger `
+            -Settings    $Settings `
+            -RunLevel    Highest `
+            -User        $script:CurrentUser `
+            -Force | Out-Null
+    }
+}
+
+# Helper: register via schtasks.exe (does not use WMI - reliable fallback)
+function Register-LabTask-Schtasks {
+    param(
+        [string]$TaskName,
         [string]$BatPath,
         [string[]]$ScheduleArgs   # e.g. @("/sc","DAILY","/st","02:00") or @("/sc","MINUTE","/mo","5")
     )
-    if ($script:WmiAvailable) {
-        if ($script:UseSystem) {
-            Register-ScheduledTask `
-                -TaskName    $TaskName `
-                -Description $Description `
-                -Action      $Action `
-                -Trigger     $Trigger `
-                -Settings    $Settings `
-                -Principal   $script:TaskPrincipal `
-                -Force | Out-Null
-        } elseif ($script:TaskPassword) {
-            Register-ScheduledTask `
-                -TaskName    $TaskName `
-                -Description $Description `
-                -Action      $Action `
-                -Trigger     $Trigger `
-                -Settings    $Settings `
-                -RunLevel    Highest `
-                -User        $script:CurrentUser `
-                -Password    $script:TaskPassword `
-                -Force | Out-Null
-        } else {
-            Register-ScheduledTask `
-                -TaskName    $TaskName `
-                -Description $Description `
-                -Action      $Action `
-                -Trigger     $Trigger `
-                -Settings    $Settings `
-                -RunLevel    Highest `
-                -User        $script:CurrentUser `
-                -Force | Out-Null
-        }
+    $ruArgs = if ($script:UseSystem) {
+        @("/ru", "SYSTEM")
+    } elseif ($script:TaskPassword) {
+        @("/ru", $script:CurrentUser, "/rp", $script:TaskPassword)
     } else {
-        # schtasks.exe fallback - does not rely on WMI
-        $ruArgs = if ($script:UseSystem) {
-            @("/ru", "SYSTEM")
-        } elseif ($script:TaskPassword) {
-            @("/ru", $script:CurrentUser, "/rp", $script:TaskPassword)
-        } else {
-            @("/ru", $script:CurrentUser)
-        }
-        $schtasksArgs = @("/create", "/f", "/rl", "HIGHEST", "/tn", $TaskName,
-                          "/tr", "cmd.exe /c `"$BatPath`"") + $ruArgs + $ScheduleArgs
-        $out = & schtasks.exe @schtasksArgs 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "schtasks.exe exited $LASTEXITCODE`: $out"
-        }
-        Write-Host "  (registered via schtasks.exe)" -ForegroundColor Gray
+        @("/ru", $script:CurrentUser)
     }
+    $schtasksArgs = @("/create", "/f", "/rl", "HIGHEST",
+                      "/tn", $TaskName,
+                      "/tr", "cmd.exe /c `"$BatPath`"") + $ruArgs + $ScheduleArgs
+    $out = & schtasks.exe @schtasksArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "schtasks.exe exited $LASTEXITCODE`: $out" }
 }
 
 # -- Disk collection (daily at 2:00 AM) --------------------------------------
 try {
-    $DiskAction   = if ($WmiAvailable) {
-        New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$DiskBat`""
-    } else { $null }
+    $DiskAction   = New-ScheduledTaskAction `
+                        -Execute  "cmd.exe" `
+                        -Argument "/c `"$DiskBat`""
 
-    $DiskTrigger  = if ($WmiAvailable) {
-        New-ScheduledTaskTrigger -Daily -At "2:00 AM"
-    } else { $null }
+    $DiskTrigger  = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
 
-    $DiskSettings = if ($WmiAvailable) {
-        New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4) -StartWhenAvailable
-    } else { $null }
+    $DiskSettings = New-ScheduledTaskSettingsSet `
+                        -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+                        -StartWhenAvailable
 
     Register-LabTask `
-        -TaskName     "Lab Monitor - Disk Collection" `
-        -Description  "Lab Monitor daily disk-usage scan (runs at 2 AM)" `
-        -Action       $DiskAction `
-        -Trigger      $DiskTrigger `
-        -Settings     $DiskSettings `
-        -BatPath      $DiskBat `
-        -ScheduleArgs @("/sc", "DAILY", "/st", "02:00")
+        -TaskName    "Lab Monitor - Disk Collection" `
+        -Description "Lab Monitor daily disk-usage scan (runs at 2 AM)" `
+        -Action      $DiskAction `
+        -Trigger     $DiskTrigger `
+        -Settings    $DiskSettings
 
     Write-Success "Disk collection task registered (daily at 2:00 AM)"
     Write-Host "  Script: $DiskBat" -ForegroundColor Gray
 } catch {
-    Write-Warn "Could not register disk task: $_"
-    Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
+    Write-Warn "ScheduledTasks cmdlets failed ($_) - trying schtasks.exe..."
+    try {
+        Register-LabTask-Schtasks `
+            -TaskName     "Lab Monitor - Disk Collection" `
+            -BatPath      $DiskBat `
+            -ScheduleArgs @("/sc", "DAILY", "/st", "02:00")
+        Write-Success "Disk collection task registered via schtasks.exe (daily at 2:00 AM)"
+        Write-Host "  Script: $DiskBat" -ForegroundColor Gray
+    } catch {
+        Write-Warn "Could not register disk task: $_"
+        Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""
 
 # -- Metrics collection (every 5 minutes, indefinitely) ----------------------
 try {
-    $MetricsAction = if ($WmiAvailable) {
-        New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$MetricsBat`""
-    } else { $null }
+    $MetricsAction = New-ScheduledTaskAction `
+                         -Execute  "cmd.exe" `
+                         -Argument "/c `"$MetricsBat`""
 
     # Start 1 minute from now so the trigger fires immediately after
     # registration rather than anchoring to a past midnight time.
     # Repetition is set via .Repetition properties rather than the cmdlet
     # constructor parameters, which are silently ignored on some Windows
     # Server versions and would leave a one-shot task instead of a repeating one.
-    $MetricsTrigger = if ($WmiAvailable) {
-        $t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-        $t.Repetition.Interval          = "PT5M"
-        $t.Repetition.Duration          = "P9999D"
-        $t.Repetition.StopAtDurationEnd = $false
-        $t
-    } else { $null }
+    $MetricsTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+    $MetricsTrigger.Repetition.Interval          = "PT5M"
+    $MetricsTrigger.Repetition.Duration          = "P9999D"
+    $MetricsTrigger.Repetition.StopAtDurationEnd = $false
 
-    $MetricsSettings = if ($WmiAvailable) {
-        New-ScheduledTaskSettingsSet `
-            -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
-            -StartWhenAvailable `
-            -MultipleInstances IgnoreNew
-    } else { $null }
+    $MetricsSettings = New-ScheduledTaskSettingsSet `
+                           -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+                           -StartWhenAvailable `
+                           -MultipleInstances   IgnoreNew
 
     Register-LabTask `
-        -TaskName     "Lab Monitor - Metrics Collection" `
-        -Description  "Lab Monitor system-metrics collection (runs every 5 min)" `
-        -Action       $MetricsAction `
-        -Trigger      $MetricsTrigger `
-        -Settings     $MetricsSettings `
-        -BatPath      $MetricsBat `
-        -ScheduleArgs @("/sc", "MINUTE", "/mo", "5")
+        -TaskName    "Lab Monitor - Metrics Collection" `
+        -Description "Lab Monitor system-metrics collection (runs every 5 min)" `
+        -Action      $MetricsAction `
+        -Trigger     $MetricsTrigger `
+        -Settings    $MetricsSettings
 
     Write-Success "Metrics collection task registered (every 5 min, indefinite)"
     Write-Host "  Script: $MetricsBat" -ForegroundColor Gray
 } catch {
-    Write-Warn "Could not register metrics task: $_"
-    Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
+    Write-Warn "ScheduledTasks cmdlets failed ($_) - trying schtasks.exe..."
+    try {
+        Register-LabTask-Schtasks `
+            -TaskName     "Lab Monitor - Metrics Collection" `
+            -BatPath      $MetricsBat `
+            -ScheduleArgs @("/sc", "MINUTE", "/mo", "5")
+        Write-Success "Metrics collection task registered via schtasks.exe (every 5 min)"
+        Write-Host "  Script: $MetricsBat" -ForegroundColor Gray
+    } catch {
+        Write-Warn "Could not register metrics task: $_"
+        Write-Host "  See Step 10 for manual instructions." -ForegroundColor Yellow
+    }
 }
 
 # ==============================================================================
