@@ -21,8 +21,8 @@ Fields:
 Usage:
     python3 update_collectors.py --csv collectors.csv
     python3 update_collectors.py --csv collectors.csv --dry-run
-    python3 update_collectors.py --csv collectors.csv --skip-pip
-    python3 update_collectors.py --csv collectors.csv --timeout 60 --verbose
+    python3 update_collectors.py --csv collectors.csv --upgrade-pip
+    python3 update_collectors.py --csv collectors.csv --upgrade-pip --timeout 60 --verbose
 
 Requirements:
     pip install paramiko
@@ -273,8 +273,8 @@ def main():
                         help='Path to collectors CSV inventory file')
     parser.add_argument('--dry-run',  action='store_true',
                         help='Print commands without running them')
-    parser.add_argument('--skip-pip', action='store_true',
-                        help='Run git pull only; skip pip install')
+    parser.add_argument('--upgrade-pip', action='store_true',
+                        help='Also upgrade pip and install requirements (default: git pull only)')
     parser.add_argument('--timeout',  type=int, default=60,
                         help='SSH + command timeout in seconds (default 60)')
     parser.add_argument('--verbose',  action='store_true',
@@ -304,13 +304,13 @@ def main():
         print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
-    if 'python_path' not in fields and not args.skip_pip:
-        print("WARNING: 'python_path' column not found — pip install will be skipped.")
-        print("         Add python_path to your CSV or pass --skip-pip to suppress this warning.")
+    if 'python_path' not in fields and args.upgrade_pip:
+        print("ERROR: 'python_path' column not found but --upgrade-pip was requested.")
+        print("       Add python_path to your CSV to enable pip operations.")
         print()
-        args.skip_pip = True
+        sys.exit(1)
 
-    steps_desc = 'git pull' + ('' if args.skip_pip else ' + pip install -r requirements.txt')
+    steps_desc = 'git pull' + (' + pip install' if args.upgrade_pip else '')
     print("=" * 62)
     print("Lab Monitor — Remote Update")
     print(f"Systems : {len(rows)}")
@@ -323,7 +323,7 @@ def main():
     results = []
     for i, row in enumerate(rows, 1):
         result = update_system(row, dry_run=args.dry_run,
-                               skip_pip=args.skip_pip, timeout=args.timeout)
+                               skip_pip=(not args.upgrade_pip), timeout=args.timeout)
         results.append(result)
         print_result(result, i, len(rows))
 

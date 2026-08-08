@@ -102,11 +102,13 @@ python3 archive_all_collectors.py --csv collectors.csv --also-delete-queues
 ```bash
 python3 update_collectors.py --csv collectors.csv
 python3 update_collectors.py --csv collectors.csv --dry-run
-python3 update_collectors.py --csv /path/to/collectors.csv --timeout 60
+python3 update_collectors.py --csv collectors.csv --upgrade-pip
+python3 update_collectors.py --csv /path/to/collectors.csv --upgrade-pip --timeout 60
 ```
 
 **What it does:**
 - For each collector, SSHes in and runs `cd {git_path} && git pull origin main`
+- If `--upgrade-pip` is passed, also upgrades pip and installs requirements from `requirements.txt`
 - Shows per-system git output (e.g., files changed, new commits)
 - Summary with success/failure counts
 
@@ -115,8 +117,11 @@ python3 update_collectors.py --csv /path/to/collectors.csv --timeout 60
 # Make changes, commit, and push to GitHub
 git add . && git commit -m "fix: improve network stats" && git push
 
-# Update all collectors
+# Update all collectors (git pull only)
 python3 update_collectors.py
+
+# Or, update code AND pip requirements
+python3 update_collectors.py --upgrade-pip
 
 # Result:
 # [1/10] 192.168.1.42 ... [OK] (2.3s)
