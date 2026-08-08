@@ -795,7 +795,7 @@ Write-Host ""
 # ==============================================================================
 # Step 11: OpenSSH Server (enables remote update via update_collectors.py)
 # ==============================================================================
-Write-Step "Step 11: OpenSSH Server (optional — enables remote updates)"
+Write-Step "Step 11: OpenSSH Server (optional - enables remote updates)"
 Write-Host "The update_collectors.py tool uses SSH to push git + pip updates" -ForegroundColor Cyan
 Write-Host "to this server remotely. OpenSSH Server must be installed for this." -ForegroundColor Cyan
 Write-Host ""
