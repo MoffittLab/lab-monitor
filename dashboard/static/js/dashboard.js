@@ -130,7 +130,8 @@ function createSystemCard(systemName, sys) {
     card.className = 'nas-card';
 
     const deviceType = sys.device_type || 'unknown';
-    const timestamp  = formatTimestamp(sys.timestamp);
+    const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
+    const timestamp   = metricsTs ? ('Last report: ' + formatTimestamp(metricsTs)) : 'No metrics yet';
 
     // --- Metrics section ---
     let metricsHtml = '';
@@ -236,7 +237,7 @@ function createSystemCard(systemName, sys) {
                 <div class="nas-name">${escapeHtml(systemName)}</div>
                 <div class="device-type">${escapeHtml(deviceType)}</div>
             </div>
-            <div class="timestamp">${escapeHtml(timestamp)}</div>
+            <div class="timestamp">${timestamp}</div>
         </div>
         ${metricsHtml}
         ${storageOverviewHtml}
