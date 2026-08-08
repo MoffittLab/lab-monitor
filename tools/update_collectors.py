@@ -90,13 +90,37 @@ def ssh_connect(ip: str, username: str, password: str, timeout: int):
     return client
 
 
+# SSH daemon warning lines that are cosmetic and should not be treated as errors.
+# Common on Synology NAS when User Home Service is disabled.
+_SSHD_NOISE = (
+    'could not chdir to home directory',
+    'no such file or directory',
+    'permission denied',  # only suppress if it comes from sshd preamble
+)
+
+def _filter_sshd_preamble(stderr_text: str) -> str:
+    """
+    Remove known sshd preamble warnings from stderr so they are not
+    mistaken for command errors.  Lines are matched case-insensitively
+    against a known-noise prefix list.
+    """
+    filtered = []
+    for line in stderr_text.splitlines():
+        low = line.lower()
+        if any(low.startswith(noise) for noise in ('could not chdir',)):
+            vprint(f"  [sshd preamble, ignored] {line}")
+            continue
+        filtered.append(line)
+    return '\n'.join(filtered).strip()
+
+
 def run_remote(client, command: str, timeout: int) -> tuple:
     """Run a remote command. Returns (stdout, stderr, exit_code)."""
     vprint(f"→ {command}")
     _, stdout, stderr = client.exec_command(command, timeout=timeout)
     exit_code = stdout.channel.recv_exit_status()
     out = stdout.read().decode(errors='replace').strip()
-    err = stderr.read().decode(errors='replace').strip()
+    err = _filter_sshd_preamble(stderr.read().decode(errors='replace').strip())
     vprint(f"← exit {exit_code}")
     if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
     if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
