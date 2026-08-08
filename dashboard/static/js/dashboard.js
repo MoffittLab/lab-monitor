@@ -103,12 +103,41 @@ function updateDashboard(data) {
 
     updateSummary(globalTotals);
 
-    // Render summary strip
+    // Render summary strip — grouped by device type in fixed order
+    const GROUP_ORDER  = ['server', 'nas', 'nas-instrument', 'nas-backup'];
+    const GROUP_LABELS = {
+        'server':         'Servers',
+        'nas':            'NAS',
+        'nas-instrument': 'NAS Instrument',
+        'nas-backup':     'NAS Backup',
+    };
+
+    // Bucket systems into groups; unknown types collect under 'other'
+    const grouped = {};
+    for (const [name, sys] of Object.entries(systems)) {
+        const key = (sys.device_type || '').toLowerCase();
+        const bucket = GROUP_ORDER.includes(key) ? key : 'other';
+        (grouped[bucket] = grouped[bucket] || []).push([name, sys]);
+    }
+
     const strip = document.getElementById('systemSummaryStrip');
     strip.innerHTML = '';
-    for (const [name, sys] of Object.entries(systems)) {
-        strip.appendChild(createSummaryButton(name, sys));
-    }
+
+    const renderGroup = (key, label) => {
+        const items = grouped[key];
+        if (!items || items.length === 0) return;
+        const row = document.createElement('div');
+        row.className = 'sys-btn-group';
+        const lbl = document.createElement('div');
+        lbl.className = 'sys-btn-group-label';
+        lbl.textContent = label;
+        row.appendChild(lbl);
+        for (const [name, sys] of items) row.appendChild(createSummaryButton(name, sys));
+        strip.appendChild(row);
+    };
+
+    for (const key of GROUP_ORDER) renderGroup(key, GROUP_LABELS[key]);
+    if (grouped['other']) renderGroup('other', 'Other');
 
     // Render full cards
     nasGrid.innerHTML = '';
@@ -164,12 +193,14 @@ function createSummaryButton(systemName, sys) {
         const barClass = metricClass1(pct, 75, 90);
         outerClass     = barClass;
         if (pct !== null) {
+            const usedTB  = Math.round(usedBytes  / 1e12);
+            const totalTB = Math.round(totalBytes / 1e12);
             innerHtml = `
                 <div class="sys-btn-bar-row">
                     <div class="usage-bar ${barClass}"><div class="usage-fill" style="width:${pct}%"></div></div>
                     <span class="sys-btn-pct">${pct}%</span>
                 </div>
-                <div class="sys-btn-stat">${formatBytes(usedBytes)} / ${formatBytes(totalBytes)}</div>`;
+                <div class="sys-btn-stat">${usedTB} TB / ${totalTB} TB</div>`;
         } else {
             innerHtml = '<div class="sys-btn-stat" style="opacity:.6">No storage data</div>';
         }

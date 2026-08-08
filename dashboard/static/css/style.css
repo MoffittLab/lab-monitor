@@ -115,9 +115,26 @@ body {
 /* System Summary Strip */
 .system-summary-strip {
     display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
+    flex-direction: column;
+    gap: 12px;
     margin-bottom: 24px;
+}
+
+.sys-btn-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.sys-btn-group-label {
+    width: 100%;
+    font-size: 11px;
+    font-weight: 600;
+    color: #95a5a6;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: -2px;
 }
 
 .sys-btn {
