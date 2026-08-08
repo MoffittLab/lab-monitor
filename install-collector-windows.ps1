@@ -637,14 +637,16 @@ function Register-LabTask-Schtasks {
 # -- Disk collection (daily at 2:00 AM) --------------------------------------
 try {
     $DiskAction   = New-ScheduledTaskAction `
-                        -Execute  "cmd.exe" `
-                        -Argument "/c `"$DiskBat`""
+                        -Execute       "cmd.exe" `
+                        -Argument      "/c `"$DiskBat`"" `
+                        -ErrorAction   Stop
 
-    $DiskTrigger  = New-ScheduledTaskTrigger -Daily -At "2:00 AM"
+    $DiskTrigger  = New-ScheduledTaskTrigger -Daily -At "2:00 AM" -ErrorAction Stop
 
     $DiskSettings = New-ScheduledTaskSettingsSet `
                         -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
-                        -StartWhenAvailable
+                        -StartWhenAvailable `
+                        -ErrorAction       Stop
 
     Register-LabTask `
         -TaskName    "Lab Monitor - Disk Collection" `
@@ -675,15 +677,16 @@ Write-Host ""
 # -- Metrics collection (every 5 minutes, indefinitely) ----------------------
 try {
     $MetricsAction = New-ScheduledTaskAction `
-                         -Execute  "cmd.exe" `
-                         -Argument "/c `"$MetricsBat`""
+                         -Execute      "cmd.exe" `
+                         -Argument     "/c `"$MetricsBat`"" `
+                         -ErrorAction  Stop
 
     # Start 1 minute from now so the trigger fires immediately after
     # registration rather than anchoring to a past midnight time.
     # Repetition is set via .Repetition properties rather than the cmdlet
     # constructor parameters, which are silently ignored on some Windows
     # Server versions and would leave a one-shot task instead of a repeating one.
-    $MetricsTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+    $MetricsTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -ErrorAction Stop
     $MetricsTrigger.Repetition.Interval          = "PT5M"
     $MetricsTrigger.Repetition.Duration          = "P9999D"
     $MetricsTrigger.Repetition.StopAtDurationEnd = $false
@@ -691,7 +694,8 @@ try {
     $MetricsSettings = New-ScheduledTaskSettingsSet `
                            -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
                            -StartWhenAvailable `
-                           -MultipleInstances   IgnoreNew
+                           -MultipleInstances   IgnoreNew `
+                           -ErrorAction        Stop
 
     Register-LabTask `
         -TaskName    "Lab Monitor - Metrics Collection" `
