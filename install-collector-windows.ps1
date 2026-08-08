@@ -800,8 +800,7 @@ Write-Host "The update_collectors.py tool uses SSH to push git + pip updates" -F
 Write-Host "to this server remotely. OpenSSH Server must be installed for this." -ForegroundColor Cyan
 Write-Host ""
 
-$SshdInstalled = (Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue |`
-                  Where-Object State -eq Installed)
+$SshdInstalled = (Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue | Where-Object State -eq Installed)
 $SshdRunning   = (Get-Service sshd -ErrorAction SilentlyContinue | Where-Object Status -eq Running)
 
 if ($SshdInstalled -and $SshdRunning) {
