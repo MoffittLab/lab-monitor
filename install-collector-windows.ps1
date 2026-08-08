@@ -242,8 +242,13 @@ Write-Host "  (CONDA_PREFIX: $env:CONDA_PREFIX)" -ForegroundColor Gray
 # Step 3: Clone / update repository
 # ==============================================================================
 Write-Step "Step 3: Cloning/updating lab-monitor repository"
+# The canonical clone target is $ScriptsDir itself.  However a previous run
+# or manual clone may have used git's default behaviour and placed the repo in
+# a 'lab-monitor' subdirectory ($ScriptsDir\lab-monitor).  Detect both layouts
+# and update $CollectorDir / $ConfigFile so all subsequent steps resolve the
+# correct paths.
 if (Test-Path "$ScriptsDir\.git") {
-    # Full clone present - pull latest
+    # Repo cloned directly into $ScriptsDir
     Write-Host "Repository already present - pulling latest..." -ForegroundColor Cyan
     Push-Location "$ScriptsDir"
     $gitOut  = & git pull origin main 2>&1
@@ -255,15 +260,26 @@ if (Test-Path "$ScriptsDir\.git") {
     } else {
         Write-Success "Repository updated"
     }
-} elseif (Test-Path "$CollectorDir\collector.py") {
-    # collector.py is present but there is no .git at the expected location
-    # (e.g. a previous install left files, or the clone was interrupted).
-    # Skip cloning to avoid the 'destination already exists' git error.
-    Write-Warn "collector.py found at $CollectorDir but no .git in $ScriptsDir - skipping clone."
-    Write-Host "  To pull updates manually run:" -ForegroundColor Gray
-    Write-Host "    git -C `"$ScriptsDir`" pull origin main" -ForegroundColor Gray
-} else {
-    # Fresh install - clone into the (empty) scripts directory
+} elseif (Test-Path "$ScriptsDir\lab-monitor\.git") {
+    # Repo was cloned into the default 'lab-monitor' subdirectory (git's
+    # default when no target path is supplied).  Pull from there and redirect
+    # $CollectorDir / $ConfigFile so Steps 5-9 resolve the correct paths.
+    Write-Host "Repository found at $ScriptsDir\lab-monitor - pulling latest..." -ForegroundColor Cyan
+    Push-Location "$ScriptsDir\lab-monitor"
+    $gitOut  = & git pull origin main 2>&1
+    $gitExit = $LASTEXITCODE
+    Pop-Location
+    if ($gitExit -ne 0) {
+        Write-Warn "git pull exited with code $gitExit"
+        Write-Host ($gitOut | Out-String) -ForegroundColor Gray
+    } else {
+        Write-Success "Repository updated"
+    }
+    $CollectorDir = "$ScriptsDir\lab-monitor\collector"
+    $ConfigFile   = "$CollectorDir\local\config.json"
+    Write-Host "  Collector path: $CollectorDir" -ForegroundColor Gray
+} elseif ((Get-ChildItem -Path $ScriptsDir -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
+    # $ScriptsDir is empty - safe to clone directly into it
     Write-Host "Cloning from $RepoUrl into $ScriptsDir ..." -ForegroundColor Cyan
     $gitOut  = & git clone $RepoUrl "$ScriptsDir" 2>&1
     $gitExit = $LASTEXITCODE
@@ -271,11 +287,20 @@ if (Test-Path "$ScriptsDir\.git") {
         Write-Warn "git clone exited with code $gitExit"
         Write-Host ($gitOut | Out-String) -ForegroundColor Gray
     }
-}
-if (Test-Path "$ScriptsDir\collector\collector.py") {
-    Write-Success "Repository ready at $ScriptsDir"
 } else {
-    Write-Err "collector.py not found after clone/pull"
+    Write-Err "Cannot clone: $ScriptsDir is not empty and no .git was found"
+    Write-Host "  Expected locations checked:" -ForegroundColor Yellow
+    Write-Host "    $ScriptsDir\.git" -ForegroundColor Gray
+    Write-Host "    $ScriptsDir\lab-monitor\.git" -ForegroundColor Gray
+    Write-Host "  Options:" -ForegroundColor Yellow
+    Write-Host "    1. Remove $ScriptsDir and re-run this script" -ForegroundColor Yellow
+    Write-Host "    2. Clone the repo manually into an empty directory" -ForegroundColor Yellow
+    exit 1
+}
+if (Test-Path "$CollectorDir\collector.py") {
+    Write-Success "Repository ready at $CollectorDir"
+} else {
+    Write-Err "collector.py not found at $CollectorDir"
     Write-Host "  Verify that git is installed and $RepoUrl is reachable" -ForegroundColor Yellow
     exit 1
 }
