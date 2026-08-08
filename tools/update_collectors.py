@@ -2,26 +2,34 @@
 """
 Lab Monitor - Remote Collector Updater
 
-Reads a CSV of collector systems and runs 'git pull origin main' on each via SSH.
+Reads a CSV of collector systems, SSHes into each one, runs
+'git pull origin main', then reinstalls requirements from the
+repo-root requirements.txt.
 
 CSV format (one header row required):
-    ip,username,password,git_path
-    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor
-    192.168.1.43,john,secret456,/volume1/lab-monitor/scripts/lab-monitor
-    atlantis.med.harvard.edu,admin,secret789,E:/Users/lab-monitor/scripts/lab-monitor
+    ip,username,password,git_path,python_path
+    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
+    atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
+
+Fields:
+    ip          Hostname or IP address
+    username    SSH username
+    password    SSH password (leave blank to use key/agent auth)
+    git_path    Absolute path to the lab-monitor repo root on the remote system
+    python_path Absolute path to the Python executable in the lab-monitor conda env
 
 Usage:
-    python3 update_collectors.py                        # uses collectors.csv in same dir
-    python3 update_collectors.py --csv /path/to/file.csv
-    python3 update_collectors.py --dry-run              # print commands without running
-    python3 update_collectors.py --timeout 30           # SSH timeout in seconds
+    python3 update_collectors.py --csv collectors.csv
+    python3 update_collectors.py --csv collectors.csv --dry-run
+    python3 update_collectors.py --csv collectors.csv --skip-pip
+    python3 update_collectors.py --csv collectors.csv --timeout 60 --verbose
 
 Requirements:
     pip install paramiko
 
-Security note:
-    Keep your CSV file out of version control. It is listed in .gitignore by default.
-    Prefer SSH key auth where possible (leave password blank in CSV to use key auth).
+Security:
+    Keep collectors.csv out of version control (.gitignore covers it).
+    Prefer SSH key auth where possible (leave password blank).
 """
 
 import argparse
@@ -43,9 +51,22 @@ except ImportError:
 _verbose = False
 
 def vprint(msg: str):
-    """Print if verbose mode is enabled."""
     if _verbose:
         print(f"  [v] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+def is_windows_path(path: str) -> bool:
+    """Heuristic: Windows paths contain a drive letter or .exe extension."""
+    p = path.strip()
+    return (
+        p.lower().endswith('.exe') or
+        (len(p) >= 2 and p[1] == ':') or
+        '\\' in p
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +74,7 @@ def vprint(msg: str):
 # ---------------------------------------------------------------------------
 
 def ssh_connect(ip: str, username: str, password: str, timeout: int):
-    """Open an SSH connection. Uses key auth if password is blank."""
+    """Open an SSH connection. Uses key/agent auth when password is blank."""
     auth = 'password' if password else 'key/agent'
     vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
     client = paramiko.SSHClient()
@@ -70,12 +91,12 @@ def ssh_connect(ip: str, username: str, password: str, timeout: int):
 
 
 def run_remote(client, command: str, timeout: int) -> tuple:
-    """Run a command remotely. Returns (stdout, stderr, exit_code)."""
+    """Run a remote command. Returns (stdout, stderr, exit_code)."""
     vprint(f"→ {command}")
     _, stdout, stderr = client.exec_command(command, timeout=timeout)
     exit_code = stdout.channel.recv_exit_status()
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
+    out = stdout.read().decode(errors='replace').strip()
+    err = stderr.read().decode(errors='replace').strip()
     vprint(f"← exit {exit_code}")
     if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
     if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
@@ -86,51 +107,129 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 # Update logic
 # ---------------------------------------------------------------------------
 
-def update_system(row: dict, dry_run: bool, timeout: int) -> dict:
+def build_commands(row: dict, skip_pip: bool) -> list[tuple[str, str]]:
     """
-    SSH into one system and run git pull.
-    Returns a result dict with status, output, and timing.
+    Return a list of (label, shell_command) pairs for this system.
+    Handles path quoting and shell differences between Linux and Windows SSH.
     """
+    git_path    = row['git_path'].strip()
+    python_path = row.get('python_path', '').strip()
+    windows     = is_windows_path(git_path) or is_windows_path(python_path)
+
+    # Normalise path separators for shell usage
+    if windows:
+        # Windows OpenSSH uses cmd.exe; forward slashes work for most commands
+        gp = git_path.replace('\\', '/')
+        pp = python_path.replace('\\', '/')
+        git_cmd = f'cd /d "{gp}" && git pull origin main'
+        pip_cmd = f'"{pp}" -m pip install --upgrade pip -q && "{pp}" -m pip install -r requirements.txt -q'
+    else:
+        gp = git_path
+        pp = python_path
+        git_cmd = f'cd "{gp}" && git pull origin main'
+        pip_cmd = f'"{pp}" -m pip install --upgrade pip -q && "{pp}" -m pip install -r requirements.txt -q'
+
+    commands = [('git pull', git_cmd)]
+    if not skip_pip and python_path:
+        # pip install runs from repo root so requirements.txt is found
+        if windows:
+            pip_full = f'cd /d "{gp}" && {pip_cmd}'
+        else:
+            pip_full = f'cd "{gp}" && {pip_cmd}'
+        commands.append(('pip install', pip_full))
+
+    return commands
+
+
+def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int) -> dict:
+    """SSH into one system, run git pull + pip install. Returns result dict."""
     ip       = row['ip'].strip()
     username = row['username'].strip()
     password = row.get('password', '').strip()
-    git_path = row['git_path'].strip()
 
-    result = {'ip': ip, 'status': None, 'output': '', 'error': '', 'elapsed': 0.0}
+    result = {
+        'ip':      ip,
+        'status':  None,
+        'steps':   [],   # list of {label, status, output, error}
+        'elapsed': 0.0,
+    }
 
-    # Windows paths: convert backslash to forward slash for the cd command
-    git_path_cmd = git_path.replace('\\', '/')
-
-    command = f'cd "{git_path_cmd}" && git pull origin main'
+    commands = build_commands(row, skip_pip)
 
     if dry_run:
         result['status'] = 'dry-run'
-        result['output'] = f'Would run: {command}'
+        for label, cmd in commands:
+            result['steps'].append({'label': label, 'status': 'dry-run', 'output': cmd, 'error': ''})
         return result
 
     start = time.time()
     try:
-        vprint(f"--- {ip} ---")
         client = ssh_connect(ip, username, password, timeout)
         try:
-            stdout, stderr, exit_code = run_remote(client, command, timeout)
-            result['elapsed'] = time.time() - start
-            if exit_code == 0:
-                result['status'] = 'ok'
-                result['output'] = stdout or '(no output)'
-            else:
-                result['status'] = 'error'
-                result['output'] = stdout
-                result['error']  = stderr or f'exit code {exit_code}'
+            for label, cmd in commands:
+                out, err, code = run_remote(client, cmd, timeout)
+                step = {'label': label, 'output': out, 'error': err}
+                if code == 0:
+                    step['status'] = 'ok'
+                else:
+                    step['status'] = 'error'
+                result['steps'].append(step)
+                if code != 0:
+                    break   # stop on first failure
         finally:
             client.close()
+
+        result['elapsed'] = time.time() - start
+        failed = [s for s in result['steps'] if s['status'] == 'error']
+        result['status'] = 'error' if failed else 'ok'
 
     except Exception as e:
         result['elapsed'] = time.time() - start
         result['status']  = 'failed'
-        result['error']   = str(e)
+        result['steps'].append({'label': 'connect', 'status': 'failed',
+                                'output': '', 'error': str(e)})
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+OK    = '[OK]    '
+FAIL  = '[FAILED]'
+DRY   = '[DRY]   '
+
+
+def print_result(result: dict, index: int, total: int):
+    ip = result['ip']
+    header = f"[{index}/{total}] {ip}"
+
+    if result['status'] == 'dry-run':
+        print(f"{header}")
+        for step in result['steps']:
+            print(f"  {DRY} {step['label']}: {step['output']}")
+        print()
+        return
+
+    elapsed = f"({result['elapsed']:.1f}s)"
+    if result['status'] == 'ok':
+        print(f"{header}  {OK} {elapsed}")
+    else:
+        print(f"{header}  {FAIL} {elapsed}")
+
+    for step in result['steps']:
+        status_tag = OK if step['status'] == 'ok' else FAIL
+        print(f"  {status_tag} {step['label']}")
+        if step['status'] == 'ok' and step['output']:
+            for line in step['output'].splitlines():
+                print(f"           {line}")
+        if step['status'] != 'ok':
+            if step['output']:
+                print(f"           stdout: {step['output'][:300]}")
+            if step['error']:
+                print(f"           error:  {step['error'][:300]}")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +238,22 @@ def update_system(row: dict, dry_run: bool, timeout: int) -> dict:
 
 def main():
     if paramiko is None:
-        print("ERROR: paramiko is required. Install with: pip install paramiko")
+        print("ERROR: paramiko is required.")
+        print("       Install with: pip install paramiko")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description='Update lab-monitor collectors via SSH')
-    parser.add_argument('--csv',     required=True, metavar='PATH', help='Path to collectors.csv inventory file')
-    parser.add_argument('--dry-run', action='store_true',      help='Print commands without running')
-    parser.add_argument('--timeout', type=int, default=30,     help='SSH timeout in seconds (default 30)')
-    parser.add_argument('--verbose', action='store_true',      help='Log SSH connections, commands, and responses')
+    parser = argparse.ArgumentParser(
+        description='Update lab-monitor collectors via SSH: git pull + pip install')
+    parser.add_argument('--csv',      required=True, metavar='PATH',
+                        help='Path to collectors CSV inventory file')
+    parser.add_argument('--dry-run',  action='store_true',
+                        help='Print commands without running them')
+    parser.add_argument('--skip-pip', action='store_true',
+                        help='Run git pull only; skip pip install')
+    parser.add_argument('--timeout',  type=int, default=60,
+                        help='SSH + command timeout in seconds (default 60)')
+    parser.add_argument('--verbose',  action='store_true',
+                        help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
 
     global _verbose
@@ -157,68 +264,64 @@ def main():
         print(f"ERROR: CSV file not found: {csv_path}")
         sys.exit(1)
 
-    # Read CSV
-    with open(csv_path, newline='') as f:
+    with open(csv_path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        rows = list(reader)
+        rows   = list(reader)
+        fields = set(reader.fieldnames or [])
 
     if not rows:
-        print("ERROR: CSV file is empty or has no data rows")
+        print("ERROR: CSV is empty or has no data rows")
         sys.exit(1)
 
     required = {'ip', 'username', 'git_path'}
-    missing  = required - set(reader.fieldnames or [])
+    missing  = required - fields
     if missing:
-        print(f"ERROR: CSV missing required columns: {', '.join(missing)}")
+        print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
-    print("=" * 60)
-    print(f"Lab Monitor - Remote Update")
-    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Dry-run: {args.dry_run}")
-    print("=" * 60)
+    if 'python_path' not in fields and not args.skip_pip:
+        print("WARNING: 'python_path' column not found — pip install will be skipped.")
+        print("         Add python_path to your CSV or pass --skip-pip to suppress this warning.")
+        print()
+        args.skip_pip = True
+
+    steps_desc = 'git pull' + ('' if args.skip_pip else ' + pip install -r requirements.txt')
+    print("=" * 62)
+    print("Lab Monitor — Remote Update")
+    print(f"Systems : {len(rows)}")
+    print(f"Steps   : {steps_desc}")
+    print(f"Timeout : {args.timeout}s")
+    print(f"Dry-run : {args.dry_run}")
+    print("=" * 62)
     print()
 
     results = []
     for i, row in enumerate(rows, 1):
-        ip = row['ip'].strip()
-        print(f"[{i}/{len(rows)}] {ip} ... ", end='', flush=True)
-        result = update_system(row, dry_run=args.dry_run, timeout=args.timeout)
+        result = update_system(row, dry_run=args.dry_run,
+                               skip_pip=args.skip_pip, timeout=args.timeout)
         results.append(result)
-
-        if result['status'] == 'ok':
-            print(f"[OK] ({result['elapsed']:.1f}s)")
-            # Show git output on success (one line summary)
-            for line in result['output'].splitlines():
-                print(f"       {line}")
-        elif result['status'] == 'dry-run':
-            print(f"[DRY-RUN]")
-            print(f"       {result['output']}")
-        else:
-            print(f"[FAILED]")
-            if result['output']:
-                print(f"       stdout: {result['output'][:200]}")
-            if result['error']:
-                print(f"       error:  {result['error'][:200]}")
-        print()
+        print_result(result, i, len(rows))
 
     # Summary
-    ok      = [r for r in results if r['status'] == 'ok']
-    failed  = [r for r in results if r['status'] in ('error', 'failed')]
-    dry     = [r for r in results if r['status'] == 'dry-run']
+    ok_n     = sum(1 for r in results if r['status'] == 'ok')
+    fail_n   = sum(1 for r in results if r['status'] in ('error', 'failed'))
+    dry_n    = sum(1 for r in results if r['status'] == 'dry-run')
 
-    print("=" * 60)
+    print("=" * 62)
     print("Summary")
-    print("=" * 60)
-    if dry:
-        print(f"  Dry-run:  {len(dry)}")
+    print("=" * 62)
+    if dry_n:
+        print(f"  Dry-run : {dry_n} system(s)")
     else:
-        print(f"  [OK]:     {len(ok)}")
-        print(f"  Failed:   {len(failed)}")
-        if failed:
+        print(f"  {OK} : {ok_n}")
+        print(f"  {FAIL} : {fail_n}")
+        if fail_n:
             print()
             print("  Failed systems:")
-            for r in failed:
-                print(f"    {r['ip']} — {r['error']}")
+            for r in results:
+                if r['status'] in ('error', 'failed'):
+                    err = next((s['error'] for s in r['steps'] if s['status'] != 'ok'), '')
+                    print(f"    {r['ip']} — {err[:120]}")
     print()
 
 

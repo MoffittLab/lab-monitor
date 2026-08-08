@@ -1,0 +1,30 @@
+# ============================================================
+# Lab Monitor — Unified Requirements
+# Covers: collector, manager, dashboard, tools
+# ============================================================
+# Install with:
+#   pip install -r requirements.txt
+#
+# Component-level requirements.txt files in collector/, manager/,
+# and dashboard/ are kept for reference but this file is the
+# authoritative source used by all installers and the remote
+# update tool.
+# ============================================================
+
+# --- HTTP client (collector → manager, dashboard → manager) ---
+requests==2.31.0
+
+# --- System metrics (collector) ---
+psutil==5.9.6
+
+# --- NVIDIA GPU stats (collector) ---
+# Soft dependency: gracefully skipped at runtime if not installed
+# or if no NVIDIA GPU/driver is present.
+pynvml
+
+# --- Web framework (manager + dashboard) ---
+Flask==2.3.3
+Flask-CORS==4.0.0
+
+# --- Remote management (tools/update_collectors.py) ---
+paramiko

@@ -305,7 +305,8 @@ Write-Host "Upgrading pip..." -ForegroundColor Cyan
 & "$PythonExe" -m pip install --upgrade pip 2>&1 | Out-Null
 
 Write-Host "Installing from requirements.txt..." -ForegroundColor Cyan
-Push-Location $CollectorDir
+# Use the repo-root requirements.txt which covers all components
+Push-Location "$ScriptsDir\lab-monitor"
 $pipOut  = & "$PythonExe" -m pip install -r requirements.txt 2>&1
 $pipExit = $LASTEXITCODE
 Pop-Location

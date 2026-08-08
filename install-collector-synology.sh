@@ -124,8 +124,8 @@ source "$VENV_DIR/bin/activate"
 # Upgrade pip
 pip install --upgrade pip > /dev/null 2>&1
 
-# Install requirements
-cd "$SCRIPTS_DIR/lab-monitor/collector"
+# Install requirements from repo-root requirements.txt (covers all components)
+cd "$SCRIPTS_DIR/lab-monitor"
 pip install -r requirements.txt > /dev/null 2>&1 || {
     echo -e "${RED}ERROR: Could not install dependencies${NC}"
     deactivate
