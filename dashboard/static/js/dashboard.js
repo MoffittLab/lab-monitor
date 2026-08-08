@@ -103,7 +103,14 @@ function updateDashboard(data) {
 
     updateSummary(globalTotals);
 
-    // Render cards
+    // Render summary strip
+    const strip = document.getElementById('systemSummaryStrip');
+    strip.innerHTML = '';
+    for (const [name, sys] of Object.entries(systems)) {
+        strip.appendChild(createSummaryButton(name, sys));
+    }
+
+    // Render full cards
     nasGrid.innerHTML = '';
     for (const [name, sys] of Object.entries(systems)) {
         nasGrid.appendChild(createSystemCard(name, sys));
@@ -122,6 +129,63 @@ function updateSummary(globalTotals) {
 }
 
 // -------------------------------------------------------------------------
+// System summary button (compact strip above the full cards)
+// -------------------------------------------------------------------------
+
+const NAS_TYPES = new Set(['nas', 'nas-instrument', 'nas-backup']);
+
+function createSummaryButton(systemName, sys) {
+    const btn = document.createElement('div');
+
+    const deviceType = (sys.device_type || '').toLowerCase();
+    const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
+    const OFFLINE_MS = 7 * 60 * 1000;
+    const isOffline  = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
+
+    let colorClass = '';
+    let statHtml   = '';
+
+    if (NAS_TYPES.has(deviceType)) {
+        // Aggregate storage across all volumes
+        let usedBytes  = 0;
+        let totalBytes = 0;
+        for (const vol of ((sys.disk || {}).volumes || [])) {
+            usedBytes  += (vol.usage_bytes || 0);
+            totalBytes += (vol.total_bytes || 0);
+        }
+        const pct = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : null;
+        colorClass = pct === null ? '' : pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
+        statHtml   = pct !== null
+            ? `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)} &nbsp;<span style="opacity:.7">(${pct}%)</span>`
+            : '<span style="opacity:.6">No storage data</span>';
+    } else {
+        // Server: CPU + RAM
+        const m   = sys.metrics || {};
+        const cpu = parseFloat(m.cpu_percent);
+        const ram = parseFloat(m.ram_percent);
+        const max = Math.max(isNaN(cpu) ? 0 : cpu, isNaN(ram) ? 0 : ram);
+        colorClass = max >= 90 ? 'danger' : max >= 50 ? 'warning' : '';
+        const cpuTxt = isNaN(cpu) ? '—' : safeFixed(cpu, 1) + '%';
+        const ramTxt = isNaN(ram) ? '—' : safeFixed(ram, 1) + '%';
+        statHtml = `CPU&nbsp;${cpuTxt} &middot; RAM&nbsp;${ramTxt}`;
+    }
+
+    const classes = ['sys-btn', colorClass, isOffline ? 'offline' : ''].filter(Boolean).join(' ');
+    btn.className = classes;
+    btn.innerHTML = `
+        <div class="sys-btn-name">${escapeHtml(systemName)}</div>
+        <div class="sys-btn-stat">${isOffline ? 'Offline' : statHtml}</div>
+    `;
+
+    // Clicking the summary button scrolls to the full card
+    btn.addEventListener('click', () => {
+        const card = document.querySelector(`[data-system-name="${CSS.escape(systemName)}"]`);
+        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+
+    return btn;
+}
+
 // System card
 // -------------------------------------------------------------------------
 
@@ -235,6 +299,8 @@ function createSystemCard(systemName, sys) {
                 </div>`;
         }
     }
+
+    card.dataset.systemName = systemName;
 
     card.innerHTML = `
         <div class="nas-card-header">

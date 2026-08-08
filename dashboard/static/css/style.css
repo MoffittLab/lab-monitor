@@ -112,6 +112,61 @@ body {
     margin-left: 4px;
 }
 
+/* System Summary Strip */
+.system-summary-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 24px;
+}
+
+.sys-btn {
+    background: white;
+    border: 1px solid var(--light);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+    min-width: 160px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+    transition: box-shadow 0.15s;
+}
+
+.sys-btn:hover {
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
+}
+
+.sys-btn.warning {
+    background: #fff8e6;
+    border-color: #f39c12;
+}
+
+.sys-btn.danger {
+    background: #fdf0f0;
+    border-color: #e74c3c;
+}
+
+.sys-btn.offline {
+    background: #fdf0f0;
+    border-color: #e8a0a0;
+    opacity: 0.8;
+}
+
+.sys-btn-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--primary);
+    margin-bottom: 3px;
+}
+
+.sys-btn-stat {
+    font-size: 12px;
+    color: #666;
+}
+
+.sys-btn.warning .sys-btn-stat { color: #d68910; }
+.sys-btn.danger  .sys-btn-stat { color: #c0392b; }
+.sys-btn.offline .sys-btn-name { color: #c0392b; }
+
 /* NAS Grid */
 .nas-grid {
     display: grid;
