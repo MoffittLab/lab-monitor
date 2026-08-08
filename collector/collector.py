@@ -334,8 +334,11 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         uptime_formatted = format_uptime(uptime_seconds)
         
         gpu_stats = get_gpu_stats()
-        gpu_summary = f" | GPUs: {len(gpu_stats)} ({', '.join(f"{g.get('name', 'Unknown')} {g.get('gpu_percent', 'N/A')}%" for g in gpu_stats)})"\
-            if gpu_stats else " | GPUs: none/unavailable"
+        if gpu_stats:
+            gpu_list = [f"{g.get('name', 'Unknown')} {g.get('gpu_percent', 'N/A')}%" for g in gpu_stats]
+            gpu_summary = f" | GPUs: {len(gpu_stats)} ({', '.join(gpu_list)})"
+        else:
+            gpu_summary = " | GPUs: none/unavailable"
         logger.info(f"CPU: {cpu_percent}% | RAM: {ram_percent}% | Uptime: {uptime_formatted} | Network: {network_stats}{gpu_summary}")
 
         # Create message (header + data).
