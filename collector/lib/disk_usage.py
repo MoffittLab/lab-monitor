@@ -91,13 +91,13 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
                 except (OSError, PermissionError):
                     continue
         except (OSError, PermissionError) as e:
-            logger.warning(f"Cannot access {dir_path}: {e}")
+            logger.debug(f"Cannot access {dir_path}: {e}")  # Permission denied on system folders is expected
 
         return dir_size
     
     try:
         if not os.path.exists(path):
-            logger.warning(f"Path does not exist: {path}")
+            logger.debug(f"Path does not exist: {path}")  # Non-existent scan paths are handled gracefully
             return 0
         
         total_bytes = _scan(path)
@@ -121,6 +121,10 @@ def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
     - @* system directories
     - #recycle (trash)
     
+    Windows additionally skips:
+    - $RECYCLE.BIN (Windows recycle bin)
+    - ServiceProfiles (Windows service account directories)
+    
     Args:
         folder_name: Name of the folder to check
         nas_type: 'synology' or 'windows'
@@ -137,6 +141,14 @@ def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
             return True
         # Skip trash
         if folder_name == '#recycle':
+            return True
+    
+    if nas_type.lower() == "windows" or sys.platform == "win32":
+        # Skip Windows recycle bin
+        if folder_name == '$RECYCLE.BIN':
+            return True
+        # Skip Windows service profile directories
+        if 'ServiceProfiles' in folder_name:
             return True
     
     return False
