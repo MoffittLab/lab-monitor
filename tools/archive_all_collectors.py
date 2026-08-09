@@ -183,15 +183,16 @@ def archive_collector(client, git_path: str, config: dict, timeout: int) -> tupl
         # Windows path
         system_dir = f'{data_dir}\\{name}'
         backup_dir = f'{system_dir}\\{backup_folder}'
-        # PowerShell commands for Windows
-        commands = [
+        # PowerShell commands for Windows - must be wrapped in powershell.exe for SSH compatibility
+        ps_commands = [
             f'cd "{system_dir}"',
             f'if (!(Test-Path "{backup_folder}")) {{ mkdir "{backup_folder}" | Out-Null }}',
             f'$count = 0',
             f'Get-Item "????-??.jsonl" -ErrorAction SilentlyContinue | ForEach-Object {{ Move-Item $_.FullName "{backup_dir}\\$($_.Name)"; $count += 1 }}',
             f'Write-Output "MOVED: $count"'
         ]
-        command = ' ; '.join(commands)
+        ps_script = ' ; '.join(ps_commands)
+        command = f'powershell -Command "{ps_script}"'
     else:
         # Unix path (Synology/Linux)
         system_dir = f'{data_dir}/{name}'
@@ -243,7 +244,8 @@ def archive_queue_if_requested(client, git_path: str, config: dict, timeout: int
     
     if is_windows:
         queue_path = f'{data_dir}\\{name}\\queue.json'
-        command = f'if (Test-Path "{queue_path}") {{ Remove-Item "{queue_path}"; Write-Output "queue.json deleted" }} else {{ Write-Output "queue.json not found" }}'
+        ps_script = f'if (Test-Path "{queue_path}") {{ Remove-Item "{queue_path}"; Write-Output "queue.json deleted" }} else {{ Write-Output "queue.json not found" }}'
+        command = f'powershell -Command "{ps_script}"'
     else:
         queue_path = f'{data_dir}/{name}/queue.json'
         command = f'rm -f "{queue_path}" && echo "queue.json deleted" || echo "queue.json not found"'
