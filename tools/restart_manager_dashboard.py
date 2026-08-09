@@ -210,7 +210,7 @@ def start_processes(client: paramiko.SSHClient, work_dir: str) -> None:
 
 
 def verify_services(client: paramiko.SSHClient) -> None:
-    """Verify services are running on their ports."""
+    """Verify services are running on their ports and show process details."""
     logger.info("=== Verifying Services ===")
     
     ports = [5000, 5001]
@@ -218,18 +218,40 @@ def verify_services(client: paramiko.SSHClient) -> None:
     running = 0
     
     for port in ports:
-        out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
         label = port_labels[port]
-        if out.strip():
-            logger.info(f"✓ {label} is listening on port {port}")
-            running += 1
+        logger.info(f"\n{label} (Port {port}):")
+        
+        # Get netstat info
+        netstat_out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
+        
+        if netstat_out.strip():
+            logger.info(f"✓ Listening on port {port}")
+            
+            # Extract PID from netstat output
+            parts = netstat_out.strip().split()
+            if len(parts) > 0:
+                pid = parts[-1]
+                logger.info(f"  PID: {pid}")
+                
+                # Get process details
+                tasklist_out, _ = run_command(client, f'tasklist /FI "PID eq {pid}" /V /FO LIST', f"Get details for PID {pid}")
+                if tasklist_out.strip():
+                    # Parse tasklist output for process info
+                    for line in tasklist_out.split('\n'):
+                        if line.strip():
+                            logger.info(f"  {line}")
+                
+                running += 1
         else:
-            logger.warning(f"⚠ {label} not yet listening on port {port} (may take a moment)")
+            logger.warning(f"⚠ {label} not yet listening on port {port}")
     
+    # Summary
+    logger.info("\n" + "="*50)
     if running == len(ports):
-        logger.info(f"\n✓ All services verified and running!")
+        logger.info(f"✓ All services verified and running!")
     else:
-        logger.warning(f"\n⚠ {len(ports) - running} service(s) not yet responding")
+        logger.warning(f"⚠ {len(ports) - running} service(s) not yet responding")
+    logger.info("="*50)
 
 
 def main():
