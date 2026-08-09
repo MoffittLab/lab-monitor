@@ -533,6 +533,7 @@ def get_per_user_stats(config: dict) -> list:
         from collections import defaultdict
         import fnmatch
 
+        logger.debug(f"get_per_user_stats: Starting, cpu_count={psutil.cpu_count(logical=True)}")
         user_cpu = defaultdict(float)
         user_ram = defaultdict(int)
         cpu_count = psutil.cpu_count(logical=True) or 1
@@ -573,6 +574,7 @@ def get_per_user_stats(config: dict) -> list:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
+        logger.debug(f"get_per_user_stats: Collected {len(user_cpu)} unique users from processes")
         result = []
         for username, cpu_total in user_cpu.items():
             ram_b = user_ram[username]
@@ -582,9 +584,12 @@ def get_per_user_stats(config: dict) -> list:
                 'ram_bytes':     ram_b,
                 'ram_formatted': _format_bytes(ram_b),
             })
-        return sorted(result, key=lambda x: x['cpu_percent'], reverse=True)
+        final_result = sorted(result, key=lambda x: x['cpu_percent'], reverse=True)
+        logger.debug(f"get_per_user_stats: Returning {len(final_result)} users after filtering and sorting")
+        return final_result
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"get_per_user_stats: Exception occurred: {e}", exc_info=True)
         return []
 
 
