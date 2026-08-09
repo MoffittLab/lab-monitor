@@ -395,7 +395,7 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         entries.append(entry)
         
         # Per-user metrics (one message per user for normalized history storage)
-        user_stats = get_per_user_stats(config)
+        user_stats = get_per_user_stats(config, logger)
         for user in user_stats:
             user_entry = {
                 'header': build_header(name, system_id, device_type),
@@ -521,12 +521,16 @@ def get_ram_percent() -> float:
         return fallback_ram_percent()
 
 
-def get_per_user_stats(config: dict) -> list:
+def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
     """
     Aggregate CPU% and RAM (bytes) by Windows user account across all processes.
     Returns a list sorted by cpu_percent descending.
     Filters out blank/None usernames and accounts matching exclude_users patterns.
     Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
+    
+    Args:
+        config: Configuration dict
+        logger: Logger instance
     """
     try:
         import psutil
