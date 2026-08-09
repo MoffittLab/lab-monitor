@@ -8,9 +8,9 @@ uses config_tool.py to manage the 'active' field, and displays
 before/after config state for audit/verification.
 
 CSV format (one header row required):
-    ip,username,password,git_path
-    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor
-    atlantis.med.harvard.edu,admin,secret789,E:/Users/lab-monitor/scripts/lab-monitor
+    ip,username,password,git_path,python_path
+    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
+    atlantis.med.harvard.edu,admin,secret789,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
 
 Usage:
     python3 toggle_collectors.py --mode off                    # pause all
@@ -105,7 +105,7 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 # Config management via config_tool.py
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, timeout: int) -> tuple:
+def get_config(client, git_path: str, python_path: str, timeout: int) -> tuple:
     """
     Fetch full config via config_tool.py list --json.
     Returns (config_dict, None) on success, (None, error_str) on failure.
@@ -113,11 +113,13 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     # Normalize Windows paths
     if is_windows_path(git_path):
         git_path = git_path.replace('\\', '/')
+    if is_windows_path(python_path):
+        python_path = python_path.replace('\\', '/')
     
     config_tool_path = f"{git_path}/collector/config_tool.py"
     config_path = f"{git_path}/collector/local/config.json"
     vprint(f"Fetching config from {config_path}")
-    command = f'python3 "{config_tool_path}" --config "{config_path}" list --json'
+    command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" list --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code != 0:
@@ -133,16 +135,22 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
         return None, f'exception: {e}'
 
 
-def set_active(client, git_path: str, value: bool, timeout: int) -> tuple:
+def set_active(client, git_path: str, python_path: str, value: bool, timeout: int) -> tuple:
     """
     Set active field via config_tool.py set.
     Returns (True, None) on success, (False, error_str) on failure.
     """
+    # Normalize Windows paths
+    if is_windows_path(git_path):
+        git_path = git_path.replace('\\', '/')
+    if is_windows_path(python_path):
+        python_path = python_path.replace('\\', '/')
+    
     config_tool_path = f"{git_path}/collector/config_tool.py"
     config_path = f"{git_path}/collector/local/config.json"
     vprint(f"Setting active={value} on {config_path}")
     value_str = 'true' if value else 'false'
-    command = f'python3 "{config_tool_path}" --config "{config_path}" set active {value_str} --json'
+    command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" set active {value_str} --json'
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
         if exit_code != 0:
@@ -167,10 +175,11 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     SSH into one collector and toggle the 'active' field.
     Returns result dict with before/after config and status.
     """
-    ip       = row['ip'].strip()
-    username = row['username'].strip()
-    password = row.get('password', '').strip()
-    git_path = row['git_path'].strip()
+    ip         = row['ip'].strip()
+    username   = row['username'].strip()
+    password   = row.get('password', '').strip()
+    git_path   = row['git_path'].strip()
+    python_path = row['python_path'].strip()
 
     result = {
         'ip': ip,
@@ -195,7 +204,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         client = ssh_connect(ip, username, password, timeout)
         try:
             # Get before-state
-            config_before, err = get_config(client, git_path, timeout)
+            config_before, err = get_config(client, git_path, python_path, timeout)
             if config_before is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config before change: {err}'
@@ -205,7 +214,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
             result['config_before'] = config_before
 
             # Set active field
-            ok, err = set_active(client, git_path, target_value, timeout)
+            ok, err = set_active(client, git_path, python_path, target_value, timeout)
             if not ok:
                 result['status'] = 'failed'
                 result['error'] = f'Could not set active field: {err}'
@@ -213,7 +222,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
                 return result
 
             # Get after-state
-            config_after, err = get_config(client, git_path, timeout)
+            config_after, err = get_config(client, git_path, python_path, timeout)
             if config_after is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config after change: {err}'
@@ -294,7 +303,7 @@ def main():
         print("ERROR: CSV file is empty or has no data rows")
         sys.exit(1)
 
-    required = {'ip', 'username', 'git_path'}
+    required = {'ip', 'username', 'git_path', 'python_path'}
     missing = required - set(reader.fieldnames or [])
     if missing:
         print(f"ERROR: CSV missing required columns: {', '.join(missing)}")
