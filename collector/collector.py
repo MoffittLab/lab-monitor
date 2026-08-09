@@ -396,6 +396,7 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         
         # Per-user metrics (one message per user for normalized history storage)
         user_stats = get_per_user_stats(config, logger)
+        user_archive_path = get_archive_path(config, f"{name}_users")
         for user in user_stats:
             user_entry = {
                 'header': build_header(name, system_id, device_type),
@@ -408,8 +409,11 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
                 },
             }
             entries.append(user_entry)
+            # Archive user metrics locally (one line per user)
+            append_to_archive(user_archive_path, user_entry, logger)
         
         write_queue(queue_path, entries, logger)
+        logger.info(f"Archived {len(user_stats)} user metrics to {user_archive_path}")
         logger.info(f"Added {len(entries)} entries to queue (including {len(user_stats)} user metrics)")
         
         # Try to sync queue to manager
