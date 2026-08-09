@@ -129,10 +129,16 @@ def list_processes(client: paramiko.SSHClient) -> None:
         )
         if netstat_out.strip():
             logger.info(netstat_out)
-            # Extract PID from netstat output (last column)
-            parts = netstat_out.strip().split()
-            if len(parts) > 0:
-                pid = parts[-1].strip()
+            # Extract PID from LISTENING line (not TIME_WAIT lines)
+            pid = None
+            for line in netstat_out.split('\n'):
+                if 'LISTENING' in line:
+                    parts = line.split()
+                    if len(parts) > 0:
+                        pid = parts[-1].strip()
+                        break
+            
+            if pid and pid != '0':
                 logger.info(f"  PID: {pid}")
                 
                 # Get detailed process info
@@ -148,7 +154,7 @@ def list_processes(client: paramiko.SSHClient) -> None:
                     if tasklist_err:
                         logger.debug(f"  Error: {tasklist_err}")
             else:
-                logger.warning(f"  (unable to extract PID from netstat output)")
+                logger.warning(f"  (unable to extract valid PID from netstat output)")
         else:
             logger.info(f"  (no process listening)")
     
@@ -243,10 +249,16 @@ def verify_services(client: paramiko.SSHClient) -> None:
         if netstat_out.strip():
             logger.info(f"✓ Listening on port {port}")
             
-            # Extract PID from netstat output
-            parts = netstat_out.strip().split()
-            if len(parts) > 0:
-                pid = parts[-1].strip()
+            # Extract PID from LISTENING line (not TIME_WAIT lines)
+            pid = None
+            for line in netstat_out.split('\n'):
+                if 'LISTENING' in line:
+                    parts = line.split()
+                    if len(parts) > 0:
+                        pid = parts[-1].strip()
+                        break
+            
+            if pid and pid != '0':
                 logger.info(f"  PID: {pid}")
                 
                 # Get process details
@@ -262,7 +274,7 @@ def verify_services(client: paramiko.SSHClient) -> None:
                 
                 running += 1
             else:
-                logger.warning(f"  (unable to extract PID from netstat output)")
+                logger.warning(f"  (unable to extract valid PID from netstat output)")
         else:
             logger.warning(f"⚠ {label} not yet listening on port {port}")
     
