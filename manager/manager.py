@@ -25,6 +25,22 @@ from metrics import MetricsDB
 from data_store import TypedDataStore
 
 
+def write_pid_file():
+    """Write PID file to .pids/manager.pid in the repo root."""
+    try:
+        # Repo root is two levels up from this script (manager/manager.py -> lab-monitor/)
+        repo_root = Path(__file__).parent.parent
+        pids_dir = repo_root / '.pids'
+        pids_dir.mkdir(exist_ok=True)
+        
+        pid_file = pids_dir / 'manager.pid'
+        pid_file.write_text(str(os.getpid()))
+        return str(pid_file)
+    except Exception as e:
+        print(f"Warning: Failed to write PID file: {e}")
+        return None
+
+
 # Setup logging
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
     """Configure logging"""
@@ -968,6 +984,11 @@ def main():
     logger.info("Lab Monitor Manager starting")
     logger.info(f"Data directory: {config.get('data_dir')}")
     logger.info("=" * 60)
+    
+    # Write PID file for process management
+    pid_file = write_pid_file()
+    if pid_file:
+        logger.info(f"PID: {os.getpid()} (written to {pid_file})")
     
     # Run Flask app
     host = config.get("host", "0.0.0.0")

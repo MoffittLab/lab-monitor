@@ -112,51 +112,31 @@ def run_command(client: paramiko.SSHClient, command: str, description: str = Non
 
 
 def list_processes(client: paramiko.SSHClient) -> None:
-    """List manager and dashboard processes by port with details."""
+    """List manager and dashboard processes using PID files."""
     logger.info("=== Current Processes ===")
     
-    # Check what's listening on manager (5000) and dashboard (5001) ports
-    ports = [5000, 5001]
-    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
+    pid_map = {
+        'manager.pid': 'Manager',
+        'dashboard.pid': 'Dashboard'
+    }
     
-    for port in ports:
-        label = port_labels[port]
-        logger.info(f"\n{label} (Port {port}):")
-        netstat_out, netstat_err = run_command(
-            client,
-            f'netstat -ano | findstr :{port}',
-            f"Check port {port}"
-        )
-        if netstat_out.strip():
-            logger.info(netstat_out)
-            # Extract PID from LISTENING line (not TIME_WAIT lines)
-            pid = None
-            for line in netstat_out.split('\n'):
-                if 'LISTENING' in line:
-                    parts = line.split()
-                    if len(parts) > 0:
-                        pid = parts[-1].strip()
-                        break
+    for pid_filename, label in pid_map.items():
+        logger.info(f"\n{label}:")
+        pid = read_pid_file(client, pid_filename)
+        if pid:
+            logger.info(f"  PID: {pid}")
             
-            if pid and pid != '0':
-                logger.info(f"  PID: {pid}")
-                
-                # Get detailed process info
-                tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
-                tasklist_out, tasklist_err = run_command(client, tasklist_cmd, f"Get details for PID {pid}")
-                if tasklist_out.strip():
-                    logger.info(f"  Process Details:")
-                    for line in tasklist_out.split('\n'):
-                        if line.strip():
-                            logger.info(f"    {line}")
-                else:
-                    logger.warning(f"  (unable to get process details)")
-                    if tasklist_err:
-                        logger.debug(f"  Error: {tasklist_err}")
+            # Get detailed process info
+            tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
+            tasklist_out, _ = run_command(client, tasklist_cmd, f"Get details for {label}")
+            if tasklist_out.strip():
+                for line in tasklist_out.split('\n'):
+                    if line.strip():
+                        logger.info(f"  {line}")
             else:
-                logger.warning(f"  (unable to extract valid PID from netstat output)")
+                logger.warning(f"  (process may not be running)")
         else:
-            logger.info(f"  (no process listening)")
+            logger.warning(f"  (PID file not found - process may not have started yet)")
     
     # Also show all Python processes for context
     logger.info("\n" + "="*50)
@@ -169,41 +149,44 @@ def list_processes(client: paramiko.SSHClient) -> None:
     logger.info("="*50)
 
 
-def get_pids_on_ports(client: paramiko.SSHClient, ports: list) -> dict:
-    """Find PIDs listening on specific ports."""
-    pids = {}
-    for port in ports:
-        out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
-        if out.strip():
-            # Extract PID (last column)
-            parts = out.strip().split()
-            if parts:
-                pid = parts[-1]
-                pids[port] = pid
-    return pids
+def read_pid_file(client: paramiko.SSHClient, pid_filename: str) -> str:
+    """Read PID from .pids/[filename] in the lab-monitor repo."""
+    # Assume we're in the git repo or know where it is
+    # For now, assume standard Windows path from collectors.csv
+    cmd = f'type .pids\\{pid_filename}'
+    out, err = run_command(client, cmd, f"Read {pid_filename}")
+    pid = out.strip()
+    return pid if pid and pid.isdigit() else None
 
 def kill_processes(client: paramiko.SSHClient) -> None:
-    """Kill manager and dashboard processes by port (safe, specific targeting)."""
-    logger.info("=== Killing Processes on Ports 5000 & 5001 ===")
+    """Kill manager and dashboard processes using PID files."""
+    logger.info("=== Killing Processes ===")
     
-    ports = [5000, 5001]  # Manager and Dashboard ports
-    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
+    pid_map = {
+        'manager.pid': 'Manager',
+        'dashboard.pid': 'Dashboard'
+    }
     
-    pids = get_pids_on_ports(client, ports)
+    killed = 0
+    for pid_filename, label in pid_map.items():
+        pid = read_pid_file(client, pid_filename)
+        if pid:
+            logger.info(f"Killing {label} (PID {pid})...")
+            out, _ = run_command(
+                client,
+                f'taskkill /PID {pid} /F 2>nul',
+                f"Kill {label} PID {pid}"
+            )
+            if 'SUCCESS' in out.upper() or 'not found' in out.lower():
+                logger.info(f"✓ {label} process killed")
+                killed += 1
+        else:
+            logger.warning(f"Could not read PID from {pid_filename}")
     
-    for port, pid in pids.items():
-        label = port_labels.get(port, f'Port {port}')
-        logger.info(f"Killing {label} (PID {pid})...")
-        run_command(
-            client,
-            f'taskkill /PID {pid} /F 2>nul || echo "PID {pid} not found"',
-            f"Kill PID {pid}"
-        )
-    
-    if not pids:
-        logger.info("No processes found on target ports.")
+    if killed == 0:
+        logger.warning("No processes were killed (PID files may not exist yet).")
     else:
-        logger.info(f"✓ Killed {len(pids)} process(es)")
+        logger.info(f"✓ Killed {killed} process(es)")
 
 
 def start_processes(client: paramiko.SSHClient, work_dir: str) -> None:
@@ -232,58 +215,40 @@ def start_processes(client: paramiko.SSHClient, work_dir: str) -> None:
 
 
 def verify_services(client: paramiko.SSHClient) -> None:
-    """Verify services are running on their ports and show process details."""
+    """Verify services are running using PID files."""
     logger.info("=== Verifying Services ===")
     
-    ports = [5000, 5001]
-    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
-    running = 0
+    pid_map = {
+        'manager.pid': 'Manager',
+        'dashboard.pid': 'Dashboard'
+    }
     
-    for port in ports:
-        label = port_labels[port]
-        logger.info(f"\n{label} (Port {port}):")
-        
-        # Get netstat info
-        netstat_out, netstat_err = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
-        
-        if netstat_out.strip():
-            logger.info(f"✓ Listening on port {port}")
+    running = 0
+    for pid_filename, label in pid_map.items():
+        logger.info(f"\n{label}:")
+        pid = read_pid_file(client, pid_filename)
+        if pid:
+            logger.info(f"✓ Process running (PID {pid})")
             
-            # Extract PID from LISTENING line (not TIME_WAIT lines)
-            pid = None
-            for line in netstat_out.split('\n'):
-                if 'LISTENING' in line:
-                    parts = line.split()
-                    if len(parts) > 0:
-                        pid = parts[-1].strip()
-                        break
+            # Get process details
+            tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
+            tasklist_out, _ = run_command(client, tasklist_cmd, f"Get details for {label}")
+            if tasklist_out.strip():
+                logger.info(f"  Details:")
+                for line in tasklist_out.split('\n'):
+                    if line.strip():
+                        logger.info(f"    {line}")
             
-            if pid and pid != '0':
-                logger.info(f"  PID: {pid}")
-                
-                # Get process details
-                tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
-                tasklist_out, tasklist_err = run_command(client, tasklist_cmd, f"Get details for PID {pid}")
-                if tasklist_out.strip():
-                    logger.info(f"  Process Details:")
-                    for line in tasklist_out.split('\n'):
-                        if line.strip():
-                            logger.info(f"    {line}")
-                else:
-                    logger.warning(f"  (unable to get process details)")
-                
-                running += 1
-            else:
-                logger.warning(f"  (unable to extract valid PID from netstat output)")
+            running += 1
         else:
-            logger.warning(f"⚠ {label} not yet listening on port {port}")
+            logger.warning(f"⚠ Process not yet started")
     
     # Summary
     logger.info("\n" + "="*50)
-    if running == len(ports):
+    if running == len(pid_map):
         logger.info(f"✓ All services verified and running!")
     else:
-        logger.warning(f"⚠ {len(ports) - running} service(s) not yet responding")
+        logger.warning(f"⚠ {len(pid_map) - running} service(s) not yet running")
     logger.info("="*50)
 
 

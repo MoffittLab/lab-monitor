@@ -14,8 +14,25 @@ import logging
 import argparse
 import requests
 from datetime import datetime
+from pathlib import Path
 
 from flask import Flask, render_template, jsonify, request
+
+
+def write_pid_file():
+    """Write PID file to .pids/dashboard.pid in the repo root."""
+    try:
+        # Repo root is two levels up from this script (dashboard/app.py -> lab-monitor/)
+        repo_root = Path(__file__).parent.parent
+        pids_dir = repo_root / '.pids'
+        pids_dir.mkdir(exist_ok=True)
+        
+        pid_file = pids_dir / 'dashboard.pid'
+        pid_file.write_text(str(os.getpid()))
+        return str(pid_file)
+    except Exception as e:
+        print(f"Warning: Failed to write PID file: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +421,11 @@ def main():
     logger.info("Lab Monitor Dashboard starting")
     logger.info(f"Manager URL: {config.get('manager_url', 'http://localhost:5000')}")
     logger.info("=" * 60)
+
+    # Write PID file for process management
+    pid_file = write_pid_file()
+    if pid_file:
+        logger.info(f"PID: {os.getpid()} (written to {pid_file})")
 
     host  = config.get("host", "0.0.0.0")
     port  = config.get("port", 5001)
