@@ -122,7 +122,7 @@ def list_processes(client: paramiko.SSHClient) -> None:
     for port in ports:
         label = port_labels[port]
         logger.info(f"\n{label} (Port {port}):")
-        netstat_out, _ = run_command(
+        netstat_out, netstat_err = run_command(
             client,
             f'netstat -ano | findstr :{port}',
             f"Check port {port}"
@@ -132,15 +132,23 @@ def list_processes(client: paramiko.SSHClient) -> None:
             # Extract PID from netstat output (last column)
             parts = netstat_out.strip().split()
             if len(parts) > 0:
-                pid = parts[-1]
+                pid = parts[-1].strip()
                 logger.info(f"  PID: {pid}")
                 
                 # Get detailed process info
-                tasklist_out, _ = run_command(client, f'tasklist /FI "PID eq {pid}" /V /FO LIST', f"Get details for PID {pid}")
+                tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
+                tasklist_out, tasklist_err = run_command(client, tasklist_cmd, f"Get details for PID {pid}")
                 if tasklist_out.strip():
+                    logger.info(f"  Process Details:")
                     for line in tasklist_out.split('\n'):
                         if line.strip():
-                            logger.info(f"  {line}")
+                            logger.info(f"    {line}")
+                else:
+                    logger.warning(f"  (unable to get process details)")
+                    if tasklist_err:
+                        logger.debug(f"  Error: {tasklist_err}")
+            else:
+                logger.warning(f"  (unable to extract PID from netstat output)")
         else:
             logger.info(f"  (no process listening)")
     
@@ -230,7 +238,7 @@ def verify_services(client: paramiko.SSHClient) -> None:
         logger.info(f"\n{label} (Port {port}):")
         
         # Get netstat info
-        netstat_out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
+        netstat_out, netstat_err = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
         
         if netstat_out.strip():
             logger.info(f"✓ Listening on port {port}")
@@ -238,17 +246,23 @@ def verify_services(client: paramiko.SSHClient) -> None:
             # Extract PID from netstat output
             parts = netstat_out.strip().split()
             if len(parts) > 0:
-                pid = parts[-1]
+                pid = parts[-1].strip()
                 logger.info(f"  PID: {pid}")
                 
                 # Get process details
-                tasklist_out, _ = run_command(client, f'tasklist /FI "PID eq {pid}" /V /FO LIST', f"Get details for PID {pid}")
+                tasklist_cmd = f'tasklist /FI "PID eq {pid}" /V /FO LIST'
+                tasklist_out, tasklist_err = run_command(client, tasklist_cmd, f"Get details for PID {pid}")
                 if tasklist_out.strip():
+                    logger.info(f"  Process Details:")
                     for line in tasklist_out.split('\n'):
                         if line.strip():
-                            logger.info(f"  {line}")
+                            logger.info(f"    {line}")
+                else:
+                    logger.warning(f"  (unable to get process details)")
                 
                 running += 1
+            else:
+                logger.warning(f"  (unable to extract PID from netstat output)")
         else:
             logger.warning(f"⚠ {label} not yet listening on port {port}")
     
