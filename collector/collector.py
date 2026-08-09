@@ -260,7 +260,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 
                 # Detect glob pattern: may end with /* (forward slash) or \* (backslash)
                 # Check BEFORE normalization to handle both Windows and Unix styles
-                is_glob = spec.endswith('/*') or spec.endswith('\*')
+                is_glob = spec.endswith('/*') or spec.endswith('\\*')
                 
                 if is_glob:
                     # Glob mode: measure each immediate subfolder
@@ -536,14 +536,19 @@ def get_per_user_stats(config: dict) -> list:
         user_cpu = defaultdict(float)
         user_ram = defaultdict(int)
         cpu_count = psutil.cpu_count(logical=True) or 1
-        # Always exclude well-known Windows service accounts.
+        
+        # Always exclude well-known Windows service accounts and system users.
         # Additional patterns can be added via exclude_users in config.json.
+        # Patterns use wildcards: UMFD-*, NT AUTHORITY\*, etc.
         default_excludes = [
-            'UMFD-*',
-            'NT AUTHORITY\\*',
-            'NT SERVICE\\*',
-            'Window Manager\\*',
-            'Font Driver Host\\*',
+            'UMFD-*',              # User Mode Driver Framework (Windows service)
+            'NT AUTHORITY\\*',     # Windows system accounts
+            'NT SERVICE\\*',       # Windows service accounts
+            'Window Manager\\*',   # Windows display driver
+            'Font Driver Host\\*', # Windows font driver
+            'DWM.EXE',             # Desktop Window Manager
+            'System',              # Windows system process
+            'Idle',                # Idle process
         ]
         exclude_patterns = default_excludes + config.get('exclude_users', [])
 
@@ -552,8 +557,15 @@ def get_per_user_stats(config: dict) -> list:
                 username = proc.info.get('username') or ''
                 if not username:
                     continue
-                # Skip if matches any exclude pattern (e.g., 'UMFD*', 'SYSTEM')
-                if any(fnmatch.fnmatch(username, pattern) for pattern in exclude_patterns):
+                # Skip if matches any exclude pattern (case-insensitive for Windows)
+                # Use lower() for case-insensitive matching on Windows
+                username_lower = username.lower()
+                should_exclude = any(
+                    fnmatch.fnmatch(username_lower, pattern.lower())
+                    for pattern in exclude_patterns
+                )
+                if should_exclude:
+                    logger.debug(f"Skipping system account: {username}")
                     continue
                 user_cpu[username] += proc.info.get('cpu_percent') or 0.0
                 mem = proc.info.get('memory_info')
