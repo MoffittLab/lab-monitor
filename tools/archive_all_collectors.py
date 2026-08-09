@@ -126,7 +126,7 @@ def run_remote(client, command: str, timeout: int) -> tuple:
 # Config management
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, timeout: int) -> tuple:
+def get_config(client, git_path: str, python_path: str, timeout: int) -> tuple:
     """
     Fetch collector config via config_tool.py.
     Returns (config_dict, None) on success, (None, error_str) on failure.
@@ -138,7 +138,7 @@ def get_config(client, git_path: str, timeout: int) -> tuple:
     config_tool_path = f"{git_path}/collector/config_tool.py"
     config_path = f"{git_path}/collector/local/config.json"
     vprint(f"Reading config from {config_path}")
-    command = f'python3 "{config_tool_path}" --config "{config_path}" list --json'
+    command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" list --json'
     
     out, err, code = run_remote(client, command, timeout)
     
@@ -356,7 +356,8 @@ def main():
             vprint(f"Connected to {ip}")
 
             # Get config
-            config, err = get_config(client, git_path, args.timeout)
+            python_path = collector.get('python_path', 'python3')
+            config, err = get_config(client, git_path, python_path, args.timeout)
             if err:
                 print(f"[ERROR] {err}")
                 results.append((ip, False, f"Config error: {err}", ""))
