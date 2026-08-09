@@ -31,6 +31,9 @@ const METRIC_UNITS = {
     network_bytes_out:          { yLabel: 'Data Out (GB)',    unit: ' GB',   decimals: 2, scale: 1 / 1073741824, beginAtZero: false },
 };
 
+// GPU metric patterns (gpu_0_percent, gpu_1_percent, etc.)
+// Add dynamically using regex matching in metric chart
+
 function initDashboard(config) {
     refreshInterval = config.refreshInterval || 30000;
     setupChartCallout();
@@ -379,7 +382,7 @@ function createSystemCard(systemName, sys) {
     let gpuHtml = '';
     const gpus = (sys.metrics || {}).gpus || [];
     if (isServer && gpus.length > 0) {
-        const gpuRows = gpus.map(g => {
+        const gpuRows = gpus.map((g, idx) => {
             const vramPct   = g.vram_total_bytes > 0
                 ? Math.round((g.vram_used_bytes / g.vram_total_bytes) * 100) : 0;
             const gpuCls    = g.gpu_percent >= 90 ? 'danger'  : g.gpu_percent >= 70 ? 'warning' : '';
@@ -388,15 +391,17 @@ function createSystemCard(systemName, sys) {
                 ? ` &bull; ${g.temperature_c}\u00b0C` : '';
             const powerStr  = g.power_watts  !== null && g.power_watts  !== undefined
                 ? ` &bull; ${g.power_watts}W` : '';
+            // Use GPU index for metric field names (e.g., "gpu_0_percent", "gpu_0_vram_used")
+            const gpuMetricPrefix = `gpu_${idx}`;
             return `
                 <div class="gpu-row">
                     <div class="gpu-name">${escapeHtml(g.name)}${tempStr}${powerStr}</div>
                     <div class="metrics-stats">
-                        <div class="metric-item ${gpuCls}">
+                        <div class="metric-item ${gpuCls}" data-metric="${gpuMetricPrefix}_percent" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                             <span class="metric-label">GPU</span>
                             <span class="metric-value">${safeFixed(g.gpu_percent, 1)}%</span>
                         </div>
-                        <div class="metric-item ${vramCls}">
+                        <div class="metric-item ${vramCls}" data-metric="${gpuMetricPrefix}_vram_used" data-system="${escapeHtml(systemName)}" style="cursor:pointer;">
                             <span class="metric-label">VRAM</span>
                             <span class="metric-value">${escapeHtml(g.vram_used_formatted)} / ${escapeHtml(g.vram_total_formatted)}</span>
                         </div>
@@ -457,7 +462,14 @@ function createSystemCard(systemName, sys) {
             item.addEventListener('click', () => {
                 const system = item.getAttribute('data-system');
                 const metric = item.getAttribute('data-metric');
-                const label = item.querySelector('.metric-label')?.textContent || metric;
+                let label = item.querySelector('.metric-label')?.textContent || metric;
+                // For GPU metrics, append GPU index for clarity
+                if (metric.startsWith('gpu_')) {
+                    const parts = metric.split('_');
+                    const gpuIdx = parts[1];
+                    const metricType = parts.slice(2).join('_');
+                    label = `GPU ${gpuIdx} - ${label}`;
+                }
                 showMetricChart(system, metric, label);
             });
         });
@@ -499,9 +511,24 @@ function showMetricChart(systemName, metricField, metricLabel) {
 
             // Resolve display info: API unit takes priority, then field-name map
             const base = data.unit && BASE_UNIT_DISPLAY[data.unit];
-            const info = base
+            let info = base
                 ? { ...base, yLabel: `${metricLabel} (${base.unit.trim()})` }
-                : (METRIC_UNITS[metricField] || { yLabel: metricLabel, unit: '', decimals: 2, scale: 1, beginAtZero: true });
+                : (METRIC_UNITS[metricField] || null);
+            
+            // If no direct match, try GPU pattern matching
+            if (!info) {
+                if (metricField.match(/^gpu_\d+_percent$/)) {
+                    info = { yLabel: metricLabel, unit: '%', decimals: 1, scale: 1, beginAtZero: true };
+                } else if (metricField.match(/^gpu_\d+_vram_used$/)) {
+                    info = { yLabel: metricLabel, unit: ' GB', decimals: 2, scale: 1 / 1073741824, beginAtZero: true };
+                } else if (metricField.match(/^gpu_\d+_temp_c$/)) {
+                    info = { yLabel: metricLabel, unit: '°C', decimals: 1, scale: 1, beginAtZero: false };
+                } else if (metricField.match(/^gpu_\d+_power_w$/)) {
+                    info = { yLabel: metricLabel, unit: ' W', decimals: 1, scale: 1, beginAtZero: true };
+                } else {
+                    info = { yLabel: metricLabel, unit: '', decimals: 2, scale: 1, beginAtZero: true };
+                }
+            }
 
             const n = (data.data || []).length;
             title.textContent = `${systemName} — ${metricLabel} (${n} measurements)`;
@@ -533,6 +560,10 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         color = '#e74c3c';
     } else if (metricField.includes('bandwidth')) {
         color = '#27ae60';
+    } else if (metricField.match(/^gpu_\d+_(percent|temp_c|power_w)$/)) {
+        color = '#f39c12';  // Orange for GPU metrics
+    } else if (metricField.match(/^gpu_\d+_vram/)) {
+        color = '#9b59b6';  // Purple for VRAM metrics
     }
 
     metricChart = new Chart(ctx, {
