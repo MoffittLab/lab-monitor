@@ -112,42 +112,83 @@ def run_command(client: paramiko.SSHClient, command: str, description: str = Non
 
 
 def list_processes(client: paramiko.SSHClient) -> None:
-    """List manager and dashboard processes."""
+    """List manager and dashboard processes by port."""
     logger.info("=== Current Processes ===")
     
-    # Windows
-    out, _ = run_command(client, 'tasklist | findstr python', "List Python processes")
-    if out:
-        logger.info("Python processes:\n" + out)
+    # Check what's listening on manager (5000) and dashboard (5001) ports
+    ports = [5000, 5001]
+    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
     
-    # Check for manager/dashboard specifically
-    for proc_name in ['manager', 'dashboard', 'app.py']:
-        out, _ = run_command(client, f'tasklist | findstr /i {proc_name}', f"Search for {proc_name}")
+    for port in ports:
+        logger.info(f"\nPort {port} ({port_labels[port]}):")
+        out, _ = run_command(
+            client,
+            f'netstat -ano | findstr :{port}',
+            f"Check port {port}"
+        )
         if out.strip():
-            logger.info(f"{proc_name} found: {out.strip()}")
+            logger.info(out)
+            # Extract PID from netstat output (last column)
+            lines = out.strip().split('\n')
+            for line in lines:
+                parts = line.split()
+                if len(parts) > 0:
+                    pid = parts[-1]
+                    logger.info(f"  → PID {pid} is using this port")
+        else:
+            logger.info(f"  (no process listening)")
+    
+    # Also show all Python processes for context
+    logger.info("\nAll Python processes:")
+    out, _ = run_command(client, 'tasklist | findstr python', "List all Python processes")
+    if out:
+        logger.info(out)
+    else:
+        logger.info("  (none found)")
 
+
+def get_pids_on_ports(client: paramiko.SSHClient, ports: list) -> dict:
+    """Find PIDs listening on specific ports."""
+    pids = {}
+    for port in ports:
+        out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
+        if out.strip():
+            # Extract PID (last column)
+            parts = out.strip().split()
+            if parts:
+                pid = parts[-1]
+                pids[port] = pid
+    return pids
 
 def kill_processes(client: paramiko.SSHClient) -> None:
-    """Kill manager and dashboard processes on Windows."""
-    logger.info("=== Killing Existing Processes ===")
+    """Kill manager and dashboard processes by port (safe, specific targeting)."""
+    logger.info("=== Killing Processes on Ports 5000 & 5001 ===")
     
-    # Kill by process name (manager.py, app.py)
-    for proc_pattern in ['manager.py', 'app.py']:
-        logger.info(f"Killing {proc_pattern}...")
+    ports = [5000, 5001]  # Manager and Dashboard ports
+    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
+    
+    pids = get_pids_on_ports(client, ports)
+    
+    for port, pid in pids.items():
+        label = port_labels.get(port, f'Port {port}')
+        logger.info(f"Killing {label} (PID {pid})...")
         run_command(
-            client, 
-            f'taskkill /F /IM {proc_pattern} 2>nul || echo "Process not running"',
-            f"Kill {proc_pattern}"
+            client,
+            f'taskkill /PID {pid} /F 2>nul || echo "PID {pid} not found"',
+            f"Kill PID {pid}"
         )
     
-    logger.info("✓ Processes killed (or were not running)")
+    if not pids:
+        logger.info("No processes found on target ports.")
+    else:
+        logger.info(f"✓ Killed {len(pids)} process(es)")
 
 
 def start_processes(client: paramiko.SSHClient, work_dir: str) -> None:
     """Start manager and dashboard via Task Scheduler on Windows."""
-    logger.info("=== Restarting Services ===")
+    logger.info("=== Starting Services via Task Scheduler ===")
     
-    # Restart via Task Scheduler
+    # Start via Task Scheduler
     tasks = [
         'Lab Monitor Manager',
         'Lab Monitor Dashboard'
@@ -157,23 +198,38 @@ def start_processes(client: paramiko.SSHClient, work_dir: str) -> None:
         logger.info(f"Starting task: {task_name}...")
         out, err = run_command(
             client,
-            f'schtasks /run /tn "{task_name}" 2>nul || echo "Task not found"',
+            f'schtasks /run /tn "{task_name}"',
             f"Start {task_name}"
         )
-        logger.info(out.strip() if out.strip() else f"Task scheduled: {task_name}")
+        if 'successfully' in out.lower() or 'scheduled' in out.lower():
+            logger.info(f"✓ {task_name} started")
+        else:
+            logger.warning(f"Response: {out.strip() or err.strip()}")
     
-    logger.info("✓ Services restarted")
+    logger.info("✓ Services scheduled to start")
 
 
 def verify_services(client: paramiko.SSHClient) -> None:
-    """Verify services are running."""
+    """Verify services are running on their ports."""
     logger.info("=== Verifying Services ===")
     
-    out, _ = run_command(client, 'tasklist | findstr python', "Check for running Python processes")
-    if 'python' in out.lower():
-        logger.info("✓ Python processes are running")
+    ports = [5000, 5001]
+    port_labels = {5000: 'Manager', 5001: 'Dashboard'}
+    running = 0
+    
+    for port in ports:
+        out, _ = run_command(client, f'netstat -ano | findstr :{port}', f"Check port {port}")
+        label = port_labels[port]
+        if out.strip():
+            logger.info(f"✓ {label} is listening on port {port}")
+            running += 1
+        else:
+            logger.warning(f"⚠ {label} not yet listening on port {port} (may take a moment)")
+    
+    if running == len(ports):
+        logger.info(f"\n✓ All services verified and running!")
     else:
-        logger.warning("⚠ No Python processes found (may take a moment to start)")
+        logger.warning(f"\n⚠ {len(ports) - running} service(s) not yet responding")
 
 
 def main():
