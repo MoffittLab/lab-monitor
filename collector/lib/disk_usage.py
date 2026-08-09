@@ -112,11 +112,25 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
 
 def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
     """
-    Check if folder should be skipped based on NAS type.
+    Check if folder should be skipped based on NAS type and naming conventions.
     
-    Synology NAS: Skip @* system directories
-    Windows: No system exclusions (all user-accessible paths count)
+    Always skips:
+    - Folders starting with '.' (hidden/system folders like .git, .pids, .venv)
+    
+    Synology NAS additionally skips:
+    - @* system directories
+    - #recycle (trash)
+    
+    Args:
+        folder_name: Name of the folder to check
+        nas_type: 'synology' or 'windows'
+    
+    Returns: True if folder should be skipped, False otherwise
     """
+    # Skip hidden/system folders (start with '.')
+    if folder_name.startswith('.'):
+        return True
+    
     if nas_type.lower() == "synology":
         # Skip Synology system directories
         if folder_name.startswith('@'):
