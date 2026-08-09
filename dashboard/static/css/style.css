@@ -161,15 +161,32 @@ body {
 .sys-btn.danger  { background: #fdf0f0; border-color: #e74c3c; }
 .sys-btn.offline { background: #fdf0f0; border-color: #e8a0a0; opacity: 0.8; }
 
+.sys-btn-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
 .sys-btn-name {
     font-size: 13px;
     font-weight: 600;
     color: var(--primary);
-    margin-bottom: 6px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    flex: 1;
 }
+
+.sys-btn-offline-badge {
+    font-size: 10px;
+    font-weight: 700;
+    color: #c0392b;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+}
+
 .sys-btn.offline .sys-btn-name { color: #c0392b; }
 
 /* NAS bar row */

@@ -195,6 +195,7 @@ function createSummaryButton(systemName, sys) {
 
     let outerClass = '';
     let innerHtml  = '';
+    const offlineBadge = isOffline ? '<span class="sys-btn-offline-badge">Offline</span>' : '';
 
     if (NAS_TYPES.has(deviceType)) {
         // --- NAS: aggregate bar + used/total label ---
@@ -207,51 +208,18 @@ function createSummaryButton(systemName, sys) {
         const pct      = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : null;
         const barClass = metricClass1(pct, 75, 90);
         outerClass     = barClass;
-        if (pct !== null) {
-            const usedTB  = Math.round(usedBytes  / 1e12);
-            const totalTB = Math.round(totalBytes / 1e12);
-            innerHtml = `
-                <div class="sys-btn-bar-row">
-                    <div class="usage-bar ${barClass}"><div class="usage-fill" style="width:${pct}%"></div></div>
-                    <span class="sys-btn-pct">${pct}%</span>
-                </div>
-                <div class="sys-btn-stat">${usedTB} TB / ${totalTB} TB</div>`;
-        } else {
-            innerHtml = '<div class="sys-btn-stat" style="opacity:.6">No storage data</div>';
-        }
-    } else if (isOffline) {
-        // --- Server offline: show last known metrics if available ---
-        const m      = sys.metrics || {};
-        const cpu    = parseFloat(m.cpu_percent);
-        const ram    = parseFloat(m.ram_percent);
-        if (isNaN(cpu) && isNaN(ram)) {
-            innerHtml = '<div class="sys-btn-stat" style="color:#c0392b">Offline</div>';
-        } else {
-            const cpuCls = metricClass1(isNaN(cpu) ? null : cpu, 50, 90);
-            const ramCls = metricClass1(isNaN(ram) ? null : ram, 50, 90);
-            const max    = Math.max(isNaN(cpu) ? 0 : cpu, isNaN(ram) ? 0 : ram);
-            outerClass   = metricClass1(max, 50, 90);
-            const cpuW   = isNaN(cpu) ? 0 : Math.min(100, cpu);
-            const ramW   = isNaN(ram) ? 0 : Math.min(100, ram);
-            const cpuTxt = isNaN(cpu) ? '—' : safeFixed(cpu, 1) + '%';
-            const ramTxt = isNaN(ram) ? '—' : safeFixed(ram, 1) + '%';
-            innerHtml = `
-                <div class="sys-btn-metrics">
-                    <div class="sys-btn-metric ${cpuCls}">
-                        <div class="sys-btn-metric-label">CPU</div>
-                        <div class="sys-btn-metric-val">${cpuTxt}</div>
-                        <div class="usage-bar ${cpuCls}"><div class="usage-fill" style="width:${cpuW}%"></div></div>
-                    </div>
-                    <div class="sys-btn-metric ${ramCls}">
-                        <div class="sys-btn-metric-label">RAM</div>
-                        <div class="sys-btn-metric-val">${ramTxt}</div>
-                        <div class="usage-bar ${ramCls}"><div class="usage-fill" style="width:${ramW}%"></div></div>
-                    </div>
-                </div>
-                <div class="sys-btn-stat" style="color:#c0392b">Offline</div>`;
-        }
+        // Always render same structure for consistent sizing
+        const usedTB  = pct !== null ? Math.round(usedBytes  / 1e12) : 0;
+        const totalTB = pct !== null ? Math.round(totalBytes / 1e12) : 0;
+        const displayPct = pct !== null ? pct : 0;
+        innerHtml = `
+            <div class="sys-btn-bar-row">
+                <div class="usage-bar ${barClass}"><div class="usage-fill" style="width:${displayPct}%"></div></div>
+                <span class="sys-btn-pct">${displayPct}%</span>
+            </div>
+            <div class="sys-btn-stat">${usedTB} TB / ${totalTB} TB</div>`;
     } else {
-        // --- Server online: CPU + RAM sub-tiles ---
+        // --- Server: CPU + RAM sub-tiles (show last readings even if offline) ---
         const m      = sys.metrics || {};
         const cpu    = parseFloat(m.cpu_percent);
         const ram    = parseFloat(m.ram_percent);
@@ -279,7 +247,7 @@ function createSummaryButton(systemName, sys) {
     }
 
     btn.className = ['sys-btn', outerClass, isOffline ? 'offline' : ''].filter(Boolean).join(' ');
-    btn.innerHTML = `<div class="sys-btn-name">${escapeHtml(systemName)}</div>${innerHtml}`;
+    btn.innerHTML = `<div class="sys-btn-header">${offlineBadge}<div class="sys-btn-name">${escapeHtml(systemName)}</div></div>${innerHtml}`;
 
     // Click scrolls to the full card
     btn.onclick = () => {
