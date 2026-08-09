@@ -113,18 +113,18 @@ function updateDashboard(data) {
     };
 
     // Bucket systems into groups; unknown types collect under 'other'
-    const grouped = {};
+    const groupedButtons = {};
     for (const [name, sys] of Object.entries(systems)) {
         const key = (sys.device_type || '').toLowerCase();
         const bucket = GROUP_ORDER.includes(key) ? key : 'other';
-        (grouped[bucket] = grouped[bucket] || []).push([name, sys]);
+        (groupedButtons[bucket] = groupedButtons[bucket] || []).push([name, sys]);
     }
 
     const strip = document.getElementById('systemSummaryStrip');
     strip.innerHTML = '';
 
     const renderGroup = (key, label) => {
-        const items = grouped[key];
+        const items = groupedButtons[key];
         if (!items || items.length === 0) return;
         const row = document.createElement('div');
         row.className = 'sys-btn-group';
@@ -137,12 +137,29 @@ function updateDashboard(data) {
     };
 
     for (const key of GROUP_ORDER) renderGroup(key, GROUP_LABELS[key]);
-    if (grouped['other']) renderGroup('other', 'Other');
+    if (groupedButtons['other']) renderGroup('other', 'Other');
 
-    // Render full cards
+    // Render full cards — sorted by device type, then alphabetically within each type
     nasGrid.innerHTML = '';
+    const groupedCards = {};
     for (const [name, sys] of Object.entries(systems)) {
-        nasGrid.appendChild(createSystemCard(name, sys));
+        const key = (sys.device_type || '').toLowerCase();
+        const bucket = GROUP_ORDER.includes(key) ? key : 'other';
+        (groupedCards[bucket] = groupedCards[bucket] || []).push([name, sys]);
+    }
+    for (const key of GROUP_ORDER) {
+        if (groupedCards[key]) {
+            groupedCards[key].sort((a, b) => a[0].localeCompare(b[0]));
+            for (const [name, sys] of groupedCards[key]) {
+                nasGrid.appendChild(createSystemCard(name, sys));
+            }
+        }
+    }
+    if (groupedCards['other']) {
+        groupedCards['other'].sort((a, b) => a[0].localeCompare(b[0]));
+        for (const [name, sys] of groupedCards['other']) {
+            nasGrid.appendChild(createSystemCard(name, sys));
+        }
     }
 }
 
@@ -173,15 +190,13 @@ function createSummaryButton(systemName, sys) {
 
     const deviceType = (sys.device_type || '').toLowerCase();
     const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS = 7 * 60 * 1000;
+    const OFFLINE_MS = 10 * 60 * 1000;  // 10 minutes
     const isOffline  = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
 
     let outerClass = '';
     let innerHtml  = '';
 
-    if (isOffline) {
-        innerHtml = '<div class="sys-btn-stat" style="color:#c0392b">Offline</div>';
-    } else if (NAS_TYPES.has(deviceType)) {
+    if (NAS_TYPES.has(deviceType)) {
         // --- NAS: aggregate bar + used/total label ---
         let usedBytes  = 0;
         let totalBytes = 0;
@@ -204,8 +219,39 @@ function createSummaryButton(systemName, sys) {
         } else {
             innerHtml = '<div class="sys-btn-stat" style="opacity:.6">No storage data</div>';
         }
+    } else if (isOffline) {
+        // --- Server offline: show last known metrics if available ---
+        const m      = sys.metrics || {};
+        const cpu    = parseFloat(m.cpu_percent);
+        const ram    = parseFloat(m.ram_percent);
+        if (isNaN(cpu) && isNaN(ram)) {
+            innerHtml = '<div class="sys-btn-stat" style="color:#c0392b">Offline</div>';
+        } else {
+            const cpuCls = metricClass1(isNaN(cpu) ? null : cpu, 50, 90);
+            const ramCls = metricClass1(isNaN(ram) ? null : ram, 50, 90);
+            const max    = Math.max(isNaN(cpu) ? 0 : cpu, isNaN(ram) ? 0 : ram);
+            outerClass   = metricClass1(max, 50, 90);
+            const cpuW   = isNaN(cpu) ? 0 : Math.min(100, cpu);
+            const ramW   = isNaN(ram) ? 0 : Math.min(100, ram);
+            const cpuTxt = isNaN(cpu) ? '—' : safeFixed(cpu, 1) + '%';
+            const ramTxt = isNaN(ram) ? '—' : safeFixed(ram, 1) + '%';
+            innerHtml = `
+                <div class="sys-btn-metrics">
+                    <div class="sys-btn-metric ${cpuCls}">
+                        <div class="sys-btn-metric-label">CPU</div>
+                        <div class="sys-btn-metric-val">${cpuTxt}</div>
+                        <div class="usage-bar ${cpuCls}"><div class="usage-fill" style="width:${cpuW}%"></div></div>
+                    </div>
+                    <div class="sys-btn-metric ${ramCls}">
+                        <div class="sys-btn-metric-label">RAM</div>
+                        <div class="sys-btn-metric-val">${ramTxt}</div>
+                        <div class="usage-bar ${ramCls}"><div class="usage-fill" style="width:${ramW}%"></div></div>
+                    </div>
+                </div>
+                <div class="sys-btn-stat" style="color:#c0392b">Offline</div>`;
+        }
     } else {
-        // --- Server: CPU + RAM sub-tiles ---
+        // --- Server online: CPU + RAM sub-tiles ---
         const m      = sys.metrics || {};
         const cpu    = parseFloat(m.cpu_percent);
         const ram    = parseFloat(m.ram_percent);
@@ -236,10 +282,10 @@ function createSummaryButton(systemName, sys) {
     btn.innerHTML = `<div class="sys-btn-name">${escapeHtml(systemName)}</div>${innerHtml}`;
 
     // Click scrolls to the full card
-    btn.addEventListener('click', () => {
+    btn.onclick = () => {
         const card = document.querySelector(`[data-system-name="${CSS.escape(systemName)}"]`);
         if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    });
+    };
 
     return btn;
 }
@@ -252,11 +298,11 @@ function createSystemCard(systemName, sys) {
 
     const deviceType   = sys.device_type || 'unknown';
     const metricsTs    = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS   = 7 * 60 * 1000;
+    const OFFLINE_MS   = 10 * 60 * 1000;  // 10 minutes
     const isOffline    = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
-    const timestamp    = isOffline
-                            ? 'System offline'
-                            : ('Last report: ' + formatTimestamp(metricsTs));
+    const timestamp    = metricsTs
+                            ? ('Last report: ' + formatTimestamp(metricsTs))
+                            : 'No reports yet';
 
     card.className = 'nas-card' + (isOffline ? ' offline' : '');
 
@@ -417,13 +463,16 @@ function createSystemCard(systemName, sys) {
 
     card.dataset.systemName = systemName;
 
-    card.innerHTML = `
+    // Offline banner (top of card if offline)
+    const offlineBanner = isOffline ? `<div class="offline-banner">⚠️ Offline (no report for 10+ minutes)</div>` : '';
+
+    card.innerHTML = offlineBanner + `
         <div class="nas-card-header">
             <div>
                 <div class="nas-name">${escapeHtml(systemName)}</div>
                 <div class="device-type">${escapeHtml(deviceType)}</div>
             </div>
-            <div class="timestamp">${timestamp}</div>
+            <div class="timestamp${isOffline ? ' offline-timestamp' : ''}">${timestamp}</div>
         </div>
         ${metricsHtml}
         ${gpuHtml}
@@ -433,27 +482,29 @@ function createSystemCard(systemName, sys) {
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
 
-    // Attach click handlers to metric items
-    const metricItems = card.querySelectorAll('[data-metric]');
-    metricItems.forEach(item => {
-        item.addEventListener('click', () => {
-            const system = item.getAttribute('data-system');
-            const metric = item.getAttribute('data-metric');
-            const label = item.querySelector('.metric-label')?.textContent || metric;
-            showMetricChart(system, metric, label);
+    // Attach click handlers only if not offline
+    if (!isOffline) {
+        const metricItems = card.querySelectorAll('[data-metric]');
+        metricItems.forEach(item => {
+            item.addEventListener('click', () => {
+                const system = item.getAttribute('data-system');
+                const metric = item.getAttribute('data-metric');
+                const label = item.querySelector('.metric-label')?.textContent || metric;
+                showMetricChart(system, metric, label);
+            });
         });
-    });
 
-    // Attach click handlers to volume buttons
-    const volumeButtons = card.querySelectorAll('[data-volume]');
-    volumeButtons.forEach(btn => {
-        btn.addEventListener('click', () => {
-            const system = btn.getAttribute('data-system');
-            const volume = btn.getAttribute('data-volume');
-            const label = btn.querySelector('.volume-btn-name')?.textContent || volume;
-            showVolumeChart(system, volume, label);
+        // Attach click handlers to volume buttons
+        const volumeButtons = card.querySelectorAll('[data-volume]');
+        volumeButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const system = btn.getAttribute('data-system');
+                const volume = btn.getAttribute('data-volume');
+                const label = btn.querySelector('.volume-btn-name')?.textContent || volume;
+                showVolumeChart(system, volume, label);
+            });
         });
-    });
+    }
 
     return card;
 }

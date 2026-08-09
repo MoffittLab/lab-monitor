@@ -182,27 +182,35 @@ if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}Warning: '$DEVICE_TYPE' is not a recognised device type (expected NAS, NAS-Instrument, Server, or NAS-Backup). Continuing anyway.${NC}"
     fi
 
-    # Suggest a default scan_depth based on device type
-    if [ "$DEVICE_TYPE" = "NAS-Backup" ]; then
-        DEFAULT_DEPTH=1
-    elif [ "$DEVICE_TYPE" = "NAS-Instrument" ]; then
-        DEFAULT_DEPTH=3
-    else
-        DEFAULT_DEPTH=2
-    fi
-
     echo ""
-    echo "Scan depth controls how many folder levels the disk collector measures:"
-    echo "  1 = Volume only        (fast, filesystem stats  -- recommended for NAS-Backup)"
-    echo "  2 = Volume/Folder      (standard                -- recommended for NAS and Server)"
-    echo "  3 = Volume/Folder/Sub  (one level deeper        -- recommended for NAS-Instrument)"
-    read -p "Enter Scan Depth [1/2/3] (default: $DEFAULT_DEPTH): " SCAN_DEPTH
-    SCAN_DEPTH=${SCAN_DEPTH:-$DEFAULT_DEPTH}
-    if ! echo "$SCAN_DEPTH" | grep -qE '^[1-9][0-9]*$'; then
-        echo -e "${RED}ERROR: Scan Depth must be a positive integer${NC}"
-        exit 1
+    echo "Specify scan paths to monitor:"
+    echo "  Examples:"
+    echo "    /volume1/*             (monitor each subfolder of /volume1 separately)"
+    echo "    /volume1/Data          (monitor /volume1/Data as a single total)"
+    echo "    /volume2/*             (monitor each subfolder of /volume2 separately)"
+    read -p "Enter scan paths (comma-separated, or press Enter to use volume roots): " SCAN_PATHS_INPUT
+    
+    if [ -n "$SCAN_PATHS_INPUT" ]; then
+        # User provided custom scan paths
+        SCAN_PATHS_JSON=""
+        IFS=',' read -ra PATHS <<< "$SCAN_PATHS_INPUT"
+        for path in "${PATHS[@]}"; do
+            path=$(echo "$path" | xargs)  # trim whitespace
+            [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
+            SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$path\""
+        done
+        echo "[OK] Scan paths: $SCAN_PATHS_INPUT"
+    else
+        # Default: one level deep in each volume
+        SCAN_PATHS_JSON=""
+        for vol in /volume*; do
+            if [ -d "$vol" ]; then
+                [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
+                SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$vol/*\""
+            fi
+        done
+        echo "[OK] Defaulting to one level deep in each volume: $SCAN_PATHS_JSON"
     fi
-    echo "[OK] Scan depth: $SCAN_DEPTH"
     
     # Auto-detect volumes present on this NAS
     VOLUMES_JSON=""
@@ -223,7 +231,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "manager_url": "${MANAGER_URL}",
   "manager_token": "${MANAGER_TOKEN}",
   "volumes": [${VOLUMES_JSON}],
-  "scan_depth": ${SCAN_DEPTH},
+  "scan_paths": [${SCAN_PATHS_JSON}],
   "data_dir": "/volume1/lab-monitor/data",
   "log_file": "/volume1/lab-monitor/logs/collector.log",
   "log_level": "INFO",
@@ -235,8 +243,8 @@ EOF
     echo ""
     echo "Configuration saved with:"
     echo "  - Device Type:   $DEVICE_TYPE"
-    echo "  - Scan Depth:    $SCAN_DEPTH"
     echo "  - Volumes:       $VOLUMES_JSON"
+    echo "  - Scan Paths:    $SCAN_PATHS_JSON"
     echo "  - Manager URL:   $MANAGER_URL"
     echo "  - Manager Token: (set)"
     echo ""

@@ -119,8 +119,7 @@ E:\Users\lab-monitor\start-services.bat
   - Manager URL (e.g., `http://atlantis.med.harvard.edu:5000`)
   - Manager Token (copy from Manager config)
   - Device Type (`NAS`, `NAS-Instrument`, `NAS-Backup`, or `Server`)
-  - Scan Depth (1, 2, or 3 — auto-suggested based on device type)
-  - Volumes (auto-detected; defaults shown)
+  - Scan Paths (folders to monitor; auto-detects volumes and defaults to one level deep)
 - Tests metrics collection
 
 **Schedule jobs (Synology Control Panel):**
@@ -209,8 +208,8 @@ nano /volume1/lab-monitor/scripts/lab-monitor/collector/local/config.json
   - Manager URL (e.g., `http://atlantis.med.harvard.edu:5000`)
   - Manager Token (copy from Manager config)
   - Device Type (`NAS`, `NAS-Instrument`, `NAS-Backup`, or `Server`)
-  - Scan Depth (1, 2, or 3 — auto-suggested based on device type)
   - Volumes (e.g., `E:`, `F:`, `G:`, etc.)
+  - Scan Paths (folders/patterns to monitor; defaults to one level deep in each volume)
 - Tests metrics collection
 - Registers two Task Scheduler jobs (disk daily at 2 AM, metrics every 5 min)
 
@@ -242,10 +241,10 @@ All collectors use the same config format (created interactively by the installe
   "name":            "system-name",
   "id":              "unique-system-id",
   "device_type":     "NAS",
-  "scan_depth":      2,
   "manager_url":     "http://MANAGER-HOST:5000",
   "manager_token":   "YOUR-MANAGER-TOKEN",
   "volumes":         ["/volume1", "/volume2"],
+  "scan_paths":      ["/volume1/*", "/volume2/Data"],
   "data_dir":        "/volume1/lab-monitor/data",
   "log_file":        "/volume1/lab-monitor/logs/collector.log",
   "log_level":       "INFO",
@@ -258,10 +257,13 @@ All collectors use the same config format (created interactively by the installe
 - `name` — Display name shown on Dashboard (e.g., "Triton", "fileserver", "compute-01")
 - `id` — Stable unique identifier (e.g., `synology-triton`, `windows-fileserver`)
 - `device_type` — System type: `NAS`, `NAS-Instrument`, `NAS-Backup`, `Server`
-- `scan_depth` — Optional; folder recursion depth. Defaults: `NAS-Backup=1`, `NAS=2`, `Server=2`, `NAS-Instrument=3`
 - `manager_url` — URL of your Manager service (e.g., `http://manager-host:5000`)
 - `manager_token` — **Must match one of Manager's `auth_tokens`** (same token works for all collectors)
-- `volumes` — Base paths to monitor; collector measures immediate subdirectories of each
+- `volumes` — Base paths to monitor for capacity stats (e.g., `["/volume1", "/volume2"]` or `["E:", "F:"]`)
+- `scan_paths` — Folder monitoring patterns:
+  - `"/volume1/*"` — Monitor each immediate subfolder of /volume1 separately
+  - `"/volume1/Data"` — Monitor /volume1/Data as a single total
+  - Mix and match as needed; defaults to `["<volume>/*"]` for each volume if omitted
 
 ---
 

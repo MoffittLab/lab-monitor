@@ -154,7 +154,7 @@ body {
 }
 
 .sys-btn:hover {
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
+    /* No movement on hover */
 }
 
 .sys-btn.warning { background: #fff8e6; border-color: #f39c12; }
@@ -247,8 +247,8 @@ body {
 }
 
 .nas-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+    /* No movement on hover */
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
 }
 
 .nas-card-header {
@@ -294,6 +294,23 @@ body {
 .nas-card.offline .timestamp {
     color: #c0392b;
     font-weight: 600;
+}
+
+.offline-timestamp {
+    color: #c0392b;
+    font-weight: 600;
+}
+
+.offline-banner {
+    background: #fdf0f0;
+    border: 1px solid #e8a0a0;
+    border-radius: 4px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    color: #c0392b;
+    font-weight: 600;
+    font-size: 13px;
+    text-align: center;
 }
 
 .usage-bar {
@@ -373,6 +390,11 @@ body {
     border-radius: 4px;
     padding: 12px;
     text-align: center;
+    transition: none;
+}
+
+.metric-item:hover {
+    /* No movement on hover */
 }
 
 .metric-label {
@@ -522,6 +544,11 @@ body {
     border-radius: 6px;
     padding: 10px 12px;
     margin-bottom: 8px;
+    transition: none;
+}
+
+.volume-btn:hover {
+    /* No movement on hover */
 }
 
 .volume-btn-label {
@@ -591,6 +618,11 @@ body {
 
 .chart-close:hover {
     color: var(--dark);
+}
+
+/* Disable button/card hover movement */
+button:hover, input:hover, select:hover, textarea:hover {
+    /* No transform on hover */
 }
 
 .chart-container {

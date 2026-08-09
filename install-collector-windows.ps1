@@ -231,10 +231,6 @@ if (-not $PythonExe) {
 $DiskBat    = "$BatchDir\run-disk-collector.bat"
 $MetricsBat = "$BatchDir\run-metrics-collector.bat"
 
-# ScanDepth is initialised here so it is always defined even if config already
-# exists and the interactive block is skipped (avoids blank output in summary)
-$ScanDepth = 2
-
 # ==============================================================================
 # Step 1: Create directory structure
 # ==============================================================================
@@ -417,18 +413,6 @@ if (-not (Test-Path $ConfigFile)) {
         default          { 2 }
     }
     Write-Host ""
-    Write-Host "Scan depth controls how many folder levels are measured:" -ForegroundColor Cyan
-    Write-Host "  1 = Volume only        (fast  - recommended for NAS-Backup)" -ForegroundColor Gray
-    Write-Host "  2 = Volume + folders   (standard - recommended for NAS/Server)" -ForegroundColor Gray
-    Write-Host "  3 = Volume + sub-folders (detailed - recommended for NAS-Instrument)" -ForegroundColor Gray
-    $ScanDepthInput = Read-Host "Enter Scan Depth [1/2/3] (default: $DefaultDepth)"
-    $ScanDepth = if ([string]::IsNullOrWhiteSpace($ScanDepthInput)) { $DefaultDepth } else { [int]$ScanDepthInput }
-    if ($ScanDepth -lt 1 -or $ScanDepth -gt 10) {
-        Write-Err "Scan Depth must be between 1 and 10"
-        exit 1
-    }
-    Write-Success "Scan depth: $ScanDepth"
-
     # -- Volumes --------------------------------------------------------------
     Write-Host ""
     # Show only drives that actually exist on this machine (from Step 0)
@@ -447,27 +431,42 @@ if (-not (Test-Path $ConfigFile)) {
 
     # -- Disk profiling preview -----------------------------------------------
     Write-Host ""
-    Write-Host "Disk profiling preview (scan depth $ScanDepth):" -ForegroundColor Cyan
-    switch ($ScanDepth) {
-        1 {
-            Write-Host "  Level 1: Volume root only  (e.g., E:\)" -ForegroundColor Gray
-            Write-Host "  [OK] Fastest   [X] No per-folder breakdown" -ForegroundColor Gray
-        }
-        2 {
-            Write-Host "  Level 1: Volume root  (e.g., E:\)" -ForegroundColor Gray
-            Write-Host "  Level 2: Top-level folders  (e.g., E:\Data, E:\Backups, E:\Projects)" -ForegroundColor Gray
-            Write-Host "  [OK] Standard - captures main data areas" -ForegroundColor Gray
-        }
-        3 {
-            Write-Host "  Level 1: Volume root  (e.g., E:\)" -ForegroundColor Gray
-            Write-Host "  Level 2: Top-level folders  (e.g., E:\Data, E:\Backups, E:\Projects)" -ForegroundColor Gray
-            Write-Host "  Level 3: Sub-folders  (e.g., E:\Data\2024, E:\Data\2024\Experiments)" -ForegroundColor Gray
-            Write-Host "  [OK] Detailed breakdown   [X] Slower on deep hierarchies" -ForegroundColor Gray
-        }
-        default {
-            Write-Host "  Custom depth: $ScanDepth levels" -ForegroundColor Gray
+    Write-Host "Specify scan paths to monitor:" -ForegroundColor Cyan
+    Write-Host "  Format: use backslash (\) for path separators; append /* for glob pattern" -ForegroundColor Yellow
+    Write-Host "  Examples:" -ForegroundColor Gray
+    Write-Host "    E:\Users\*         (monitor each subfolder of E:\Users separately)" -ForegroundColor Gray
+    Write-Host "    E:\Data            (monitor E:\Data as a single total)" -ForegroundColor Gray
+    Write-Host "    F:\*               (monitor each subfolder of F: separately)" -ForegroundColor Gray
+    Write-Host "  Note: Paths must exist on your system." -ForegroundColor Gray
+    
+    # Show sample folders on first volume to help user
+    if ($Volumes.Count -gt 0) {
+        $FirstVol = $Volumes[0]
+        Write-Host "  Folders on $FirstVol (first 5):" -ForegroundColor Cyan
+        try {
+            $SampleFolders = Get-ChildItem -Path $FirstVol -Directory -ErrorAction Stop | Select-Object -First 5
+            if ($SampleFolders.Count -gt 0) {
+                foreach ($folder in $SampleFolders) {
+                    Write-Host "    $($folder.FullName)" -ForegroundColor DarkGray
+                }
+            } else {
+                Write-Host "    (no folders found)" -ForegroundColor DarkGray
+            }
+        } catch {
+            Write-Host "    (unable to list folders)" -ForegroundColor DarkGray
         }
     }
+    Write-Host ""
+    
+    $ScanPathsInput = Read-Host "Enter scan paths (comma-separated, or press Enter for default)"
+    if (-not [string]::IsNullOrWhiteSpace($ScanPathsInput)) {
+        $ScanPaths = @($ScanPathsInput -split ',' | ForEach-Object { $_.Trim() })
+    } else {
+        # Default: one level deep in each volume
+        $ScanPaths = @($Volumes | ForEach-Object { "${_}\*" })
+        Write-Host "No input - defaulting to: $($ScanPaths -join ', ')" -ForegroundColor Gray
+    }
+    Write-Host "Scan paths: $($ScanPaths -join ', ')" -ForegroundColor Cyan
     Write-Host ""
 
     # -- Write config.json ----------------------------------------------------
@@ -478,7 +477,7 @@ if (-not (Test-Path $ConfigFile)) {
         manager_url             = $ManagerUrl
         manager_token           = $ManagerToken
         volumes                 = $Volumes
-        scan_depth              = $ScanDepth
+        scan_paths              = $ScanPaths
         data_dir                = "$RootDir\data"
         log_file                = "$RootDir\logs\collector.log"
         log_level               = "INFO"
@@ -491,20 +490,14 @@ if (-not (Test-Path $ConfigFile)) {
     Write-Host ""
     Write-Host "  Server name: $ServerName"              -ForegroundColor Gray
     Write-Host "  Device type: $DeviceType"              -ForegroundColor Gray
-    Write-Host "  Scan depth:  $ScanDepth"               -ForegroundColor Gray
     Write-Host "  Volumes:     $($Volumes -join ', ')"   -ForegroundColor Gray
+    Write-Host "  Scan paths:  $($ScanPaths -join ', ')" -ForegroundColor Gray
     Write-Host "  Manager URL: $ManagerUrl"              -ForegroundColor Gray
     Write-Host "  Token:       (set)"                    -ForegroundColor Gray
 
 } else {
     Write-Success "Config already exists at $ConfigFile"
     Write-Host "  (Edit manually if needed: notepad `"$ConfigFile`")" -ForegroundColor Gray
-
-    # Read ScanDepth from existing config so the final summary is accurate
-    try {
-        $existingCfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-        if ($null -ne $existingCfg.scan_depth) { $ScanDepth = $existingCfg.scan_depth }
-    } catch {}
 }
 
 # ==============================================================================
@@ -879,7 +872,6 @@ Write-Host "  Config:          $ConfigFile"         -ForegroundColor Gray
 Write-Host "  Disk script:     $DiskBat"            -ForegroundColor Gray
 Write-Host "  Metrics script:  $MetricsBat"         -ForegroundColor Gray
 Write-Host "  Logs:            $LogsDir\collector.log" -ForegroundColor Gray
-Write-Host "  Scan depth:      $ScanDepth"          -ForegroundColor Gray
 Write-Host ""
 Write-Host "VERIFICATION:" -ForegroundColor Yellow
 Write-Host "=============" -ForegroundColor Yellow

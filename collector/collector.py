@@ -170,7 +170,11 @@ def delete_queue(queue_path: str, logger: logging.Logger):
 
 
 def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
-    """Collect disk usage (daily mode)"""
+    """
+    Collect disk usage (daily mode).
+    
+    Legacy scan_depth parameter in config is silently ignored; use scan_paths instead.
+    """
     logger.info("=== DISK USAGE COLLECTION ===")
 
     if not config.get('active', True):
@@ -188,9 +192,14 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     volumes   = config.get('volumes', [])
     scan_paths = config.get('scan_paths', [])
     timeout   = config.get('timeout_seconds', 3600)
+    # Note: legacy 'scan_depth' parameter is ignored; use 'scan_paths' instead
     nas_type  = 'synology' if sys.platform != 'win32' else 'windows'
 
     try:
+        # If legacy scan_depth is present, it's ignored (scan_paths takes precedence)
+        if config.get('scan_depth'):
+            logger.debug("Legacy 'scan_depth' parameter found in config; ignoring (use 'scan_paths' instead)")
+        
         logger.info(f"Measuring disk usage for {name} (device_type={device_type})")
 
         # ------------------------------------------------------------------
@@ -235,17 +244,37 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
             # Legacy fallback: one level deep in each volume
             logger.info("No scan_paths configured — falling back to one level deep in each volume.")
             for vol in volumes:
-                subfolders = discover_folders(vol, nas_type)
+                vol_normalized = os.path.normpath(vol)
+                if not os.path.isdir(vol_normalized):
+                    logger.warning(f"Volume does not exist: {vol_normalized}")
+                    continue
+                subfolders = discover_folders(vol_normalized, nas_type)
                 measured   = measure_leaf_folders(subfolders, timeout=timeout)
                 for f in measured:
                     folder_data[f['path']] = f['usage_bytes']
         else:
             for spec in scan_paths:
                 spec = spec.strip()
-                if spec.endswith('/*'):
+                # Normalize path separators for cross-platform compatibility
+                spec_normalized = os.path.normpath(spec)
+                
+                # Detect glob pattern: may end with /* (forward slash) or \* (backslash)
+                # Check BEFORE normalization to handle both Windows and Unix styles
+                is_glob = spec.endswith('/*') or spec.endswith('\*')
+                
+                if is_glob:
                     # Glob mode: measure each immediate subfolder
-                    root = spec[:-2].rstrip('/').rstrip('\\')
+                    # Remove glob pattern (/* or \*) to get root directory
+                    root = spec_normalized
+                    if root.endswith(os.sep + '*'):
+                        root = root[:-2]  # Remove the separator + asterisk
+                    elif root.endswith('/*'):
+                        root = root[:-2]  # Remove the / + asterisk (in case normpath didn't convert)
+                    root = os.path.normpath(root)
                     logger.info(f"Scanning subfolders of: {root}")
+                    if not os.path.isdir(root):
+                        logger.warning(f"Glob root does not exist or is not a directory: {root}")
+                        continue
                     subfolders = discover_folders(root, nas_type)
                     if not subfolders:
                         logger.warning(f"No subfolders found under {root}")
@@ -254,13 +283,13 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                         folder_data[f['path']] = f['usage_bytes']
                 else:
                     # Single-folder mode: measure this path as one total
-                    logger.info(f"Measuring folder: {spec}")
-                    if not os.path.exists(spec):
-                        logger.warning(f"scan_path does not exist: {spec}")
+                    logger.info(f"Measuring folder: {spec_normalized}")
+                    if not os.path.isdir(spec_normalized):
+                        logger.warning(f"Scan path does not exist or is not a directory: {spec_normalized}")
                         continue
-                    bytes_used, files_counted = measure_folder_recursive(spec, timeout=timeout)
-                    folder_data[spec] = bytes_used
-                    logger.info(f"  {spec}: {bytes_used:,} bytes ({files_counted:,} files)")
+                    bytes_used, files_counted = measure_folder_recursive(spec_normalized, timeout=timeout)
+                    folder_data[spec_normalized] = bytes_used
+                    logger.info(f"  {spec_normalized}: {bytes_used:,} bytes ({files_counted:,} files)")
 
         total_usage = sum(volume_used.values())
 
