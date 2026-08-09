@@ -112,7 +112,7 @@ def run_command(client: paramiko.SSHClient, command: str, description: str = Non
 
 
 def list_processes(client: paramiko.SSHClient) -> None:
-    """List manager and dashboard processes by port."""
+    """List manager and dashboard processes by port with details."""
     logger.info("=== Current Processes ===")
     
     # Check what's listening on manager (5000) and dashboard (5001) ports
@@ -120,31 +120,39 @@ def list_processes(client: paramiko.SSHClient) -> None:
     port_labels = {5000: 'Manager', 5001: 'Dashboard'}
     
     for port in ports:
-        logger.info(f"\nPort {port} ({port_labels[port]}):")
-        out, _ = run_command(
+        label = port_labels[port]
+        logger.info(f"\n{label} (Port {port}):")
+        netstat_out, _ = run_command(
             client,
             f'netstat -ano | findstr :{port}',
             f"Check port {port}"
         )
-        if out.strip():
-            logger.info(out)
+        if netstat_out.strip():
+            logger.info(netstat_out)
             # Extract PID from netstat output (last column)
-            lines = out.strip().split('\n')
-            for line in lines:
-                parts = line.split()
-                if len(parts) > 0:
-                    pid = parts[-1]
-                    logger.info(f"  → PID {pid} is using this port")
+            parts = netstat_out.strip().split()
+            if len(parts) > 0:
+                pid = parts[-1]
+                logger.info(f"  PID: {pid}")
+                
+                # Get detailed process info
+                tasklist_out, _ = run_command(client, f'tasklist /FI "PID eq {pid}" /V /FO LIST', f"Get details for PID {pid}")
+                if tasklist_out.strip():
+                    for line in tasklist_out.split('\n'):
+                        if line.strip():
+                            logger.info(f"  {line}")
         else:
             logger.info(f"  (no process listening)")
     
     # Also show all Python processes for context
-    logger.info("\nAll Python processes:")
+    logger.info("\n" + "="*50)
+    logger.info("All Python processes:")
     out, _ = run_command(client, 'tasklist | findstr python', "List all Python processes")
     if out:
         logger.info(out)
     else:
         logger.info("  (none found)")
+    logger.info("="*50)
 
 
 def get_pids_on_ports(client: paramiko.SSHClient, ports: list) -> dict:
@@ -236,7 +244,6 @@ def verify_services(client: paramiko.SSHClient) -> None:
                 # Get process details
                 tasklist_out, _ = run_command(client, f'tasklist /FI "PID eq {pid}" /V /FO LIST', f"Get details for PID {pid}")
                 if tasklist_out.strip():
-                    # Parse tasklist output for process info
                     for line in tasklist_out.split('\n'):
                         if line.strip():
                             logger.info(f"  {line}")
