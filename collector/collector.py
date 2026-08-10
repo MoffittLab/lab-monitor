@@ -657,12 +657,21 @@ def get_per_user_stats(config: dict, logger: logging.Logger,
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
+        # Normalize per-user CPU to the same 0-100% scale as the system-level
+        # cpu_percent metric.  psutil per-process cpu_percent() returns usage
+        # relative to ONE logical core (can exceed 100% for multi-threaded
+        # processes), while the system-level psutil.cpu_percent(interval=1)
+        # always reports 0-100% across all cores.  Dividing by cpu_count
+        # converts the per-core scale to the whole-system scale so the two
+        # numbers are directly comparable in the dashboard.
+        cpu_count = psutil.cpu_count(logical=True) or 1
+
         result = []
         for username, cpu_total in user_cpu.items():
             ram_b = user_ram[username]
             result.append({
                 'username':      username,
-                'cpu_percent':   round(cpu_total, 2),
+                'cpu_percent':   round(cpu_total / cpu_count, 2),
                 'ram_bytes':     ram_b,
                 'ram_formatted': _format_bytes(ram_b),
             })
