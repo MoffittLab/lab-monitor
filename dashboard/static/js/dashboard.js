@@ -417,22 +417,44 @@ function createSystemCard(systemName, sys) {
 
     let usersHtml = '';
     if (isServer && sys.users && sys.users.length > 0) {
-        // Sort by CPU usage descending, then take top 8
+        // Sort by CPU usage descending, show all users
         const sortedUsers = [...sys.users].sort((a, b) => (b.cpu_percent || 0) - (a.cpu_percent || 0));
-        const topUsers = sortedUsers.slice(0, 8);
-        const rows = topUsers.map(u => `
+        
+        // Estimate RAM as percentage of total system RAM (rough estimate using system metrics if available)
+        // For now, just display raw RAM value; future enhancement could normalize against system total
+        const rows = sortedUsers.map(u => {
+            // Color CPU based on thresholds: >75% red, >50% orange
+            const cpuClass = u.cpu_percent >= 75 ? 'danger' : u.cpu_percent >= 50 ? 'warning' : '';
+            
+            // Parse RAM formatted string to estimate percentage for coloring
+            // We don't have system total RAM, so we'll use a heuristic:
+            // If RAM is very high (>16GB), likely warning/danger territory
+            // This is approximate; ideally system_metrics would include total_ram
+            let ramClass = '';
+            const ramBytes = u.ram_bytes || 0;
+            // Heuristic: >8GB warning, >16GB danger (can be tuned based on actual systems)
+            if (ramBytes > 17179869184) { // 16 GB
+                ramClass = 'danger';
+            } else if (ramBytes > 8589934592) { // 8 GB
+                ramClass = 'warning';
+            }
+            
+            return `
             <div class="user-row">
                 <span class="user-name" title="${escapeHtml(u.username)}">${escapeHtml(u.username.split('\\').pop())}</span>
-                <span class="user-cpu ${u.cpu_percent >= 90 ? 'danger' : u.cpu_percent >= 50 ? 'warning' : ''}">${safeFixed(u.cpu_percent, 1)}%</span>
-                <span class="user-ram">${escapeHtml(u.ram_formatted)}</span>
-            </div>`).join('');
+                <span class="user-cpu ${cpuClass}">${safeFixed(u.cpu_percent, 1)}%</span>
+                <span class="user-ram ${ramClass}">${escapeHtml(u.ram_formatted)}</span>
+            </div>`;
+        }).join('');
+        
+        const scrollClass = sortedUsers.length > 8 ? 'user-list-scrollable' : '';
         usersHtml = `
             <div class="card-section">
-                <div class="section-label">User Activity</div>
+                <div class="section-label">User Activity (${sortedUsers.length})</div>
                 <div class="user-header">
                     <span>User</span><span>CPU</span><span>RAM</span>
                 </div>
-                <div class="user-list">${rows}</div>
+                <div class="user-list ${scrollClass}">${rows}</div>
             </div>`;
     }
 

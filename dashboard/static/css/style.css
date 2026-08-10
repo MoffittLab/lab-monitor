@@ -492,6 +492,42 @@ body {
     color: #666;
 }
 
+.user-ram.warning { color: #d68910; }
+.user-ram.danger  { color: #c0392b; }
+
+.user-list {
+    border-radius: 4px;
+    padding: 4px 0;
+}
+
+.user-list-scrollable {
+    max-height: 300px;
+    overflow-y: auto;
+    border: 1px solid #e9ecef;
+    border-radius: 4px;
+    padding: 4px 8px;
+    background: white;
+}
+
+/* Scrollbar styling for user-list-scrollable */
+.user-list-scrollable::-webkit-scrollbar {
+    width: 8px;
+}
+
+.user-list-scrollable::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+
+.user-list-scrollable::-webkit-scrollbar-thumb {
+    background: #cbd5e0;
+    border-radius: 4px;
+}
+
+.user-list-scrollable::-webkit-scrollbar-thumb:hover {
+    background: #a0aec0;
+}
+
 /* GPU section in server cards */
 .gpu-row {
     margin-bottom: 10px;
