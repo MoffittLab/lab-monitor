@@ -420,23 +420,23 @@ function createSystemCard(systemName, sys) {
         // Sort by CPU usage descending, show all users
         const sortedUsers = [...sys.users].sort((a, b) => (b.cpu_percent || 0) - (a.cpu_percent || 0));
         
-        // Estimate RAM as percentage of total system RAM (rough estimate using system metrics if available)
-        // For now, just display raw RAM value; future enhancement could normalize against system total
+        // Get total system RAM from metrics
+        const totalRamBytes = (sys.metrics && sys.metrics.total_ram_bytes) || 0;
+        
         const rows = sortedUsers.map(u => {
             // Color CPU based on thresholds: >75% red, >50% orange
             const cpuClass = u.cpu_percent >= 75 ? 'danger' : u.cpu_percent >= 50 ? 'warning' : '';
             
-            // Parse RAM formatted string to estimate percentage for coloring
-            // We don't have system total RAM, so we'll use a heuristic:
-            // If RAM is very high (>16GB), likely warning/danger territory
-            // This is approximate; ideally system_metrics would include total_ram
+            // Color RAM based on percentage of total system RAM
             let ramClass = '';
             const ramBytes = u.ram_bytes || 0;
-            // Heuristic: >8GB warning, >16GB danger (can be tuned based on actual systems)
-            if (ramBytes > 17179869184) { // 16 GB
-                ramClass = 'danger';
-            } else if (ramBytes > 8589934592) { // 8 GB
-                ramClass = 'warning';
+            if (totalRamBytes > 0) {
+                const ramPercent = (ramBytes / totalRamBytes) * 100;
+                if (ramPercent >= 75) {
+                    ramClass = 'danger';
+                } else if (ramPercent >= 50) {
+                    ramClass = 'warning';
+                }
             }
             
             return `

@@ -344,6 +344,7 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
     try:
         cpu_percent = get_cpu_percent()
         ram_percent = get_ram_percent()
+        total_ram_bytes = get_total_ram_bytes()
         network_stats = get_network_stats(config, name)
         uptime_seconds = get_uptime_seconds()
         uptime_formatted = format_uptime(uptime_seconds)
@@ -368,6 +369,8 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
                 'cpu_percent_unit':                 '%',
                 'ram_percent':                      ram_percent,
                 'ram_percent_unit':                 '%',
+                'total_ram_bytes':                  total_ram_bytes,
+                'total_ram_bytes_unit':             'bytes',
                 'uptime_seconds':                   uptime_seconds,
                 'uptime_seconds_unit':              's',
                 'uptime_formatted':                 uptime_formatted,
@@ -521,6 +524,38 @@ def get_ram_percent() -> float:
         return psutil.virtual_memory().percent
     except ImportError:
         return fallback_ram_percent()
+
+
+def get_total_ram_bytes() -> int:
+    """Get total system RAM in bytes"""
+    try:
+        import psutil
+        return psutil.virtual_memory().total
+    except ImportError:
+        return fallback_total_ram_bytes()
+
+
+def fallback_total_ram_bytes() -> int:
+    """Fallback to estimate total RAM without psutil"""
+    try:
+        if sys.platform == 'win32':
+            # Windows: using wmic
+            import subprocess
+            output = subprocess.check_output('wmic OS get TotalVisibleMemorySize /value').decode()
+            for line in output.split('\n'):
+                if 'TotalVisibleMemorySize' in line:
+                    # Value is in KB
+                    total_kb = int(line.split('=')[1].strip())
+                    return total_kb * 1024
+            return 0
+        else:
+            # Linux: from /proc/meminfo
+            with open('/proc/meminfo', 'r') as f:
+                lines = f.readlines()
+            mem_total_kb = int(lines[0].split()[1])
+            return mem_total_kb * 1024
+    except:
+        return 0
 
 
 def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
