@@ -530,8 +530,8 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
     Filters out blank/None usernames and accounts matching exclude_users patterns.
     Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
     
-    CPU% from psutil is already normalized per-process; we sum across processes for each user.
-    Note: This sum can exceed 100% on multi-core systems (e.g., 200% = 2 cores fully used).
+    On Windows, per-process CPU percentage must be measured with a sampling interval.
+    We warm up the measurement system, then iterate processes to collect fresh readings.
     
     Args:
         config: Configuration dict
@@ -543,8 +543,6 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
         import fnmatch
 
         logger.debug(f"get_per_user_stats: Starting")
-        user_cpu = defaultdict(float)
-        user_ram = defaultdict(int)
         
         # Always exclude well-known Windows service accounts and system users.
         # Additional patterns can be added via exclude_users in config.json.
@@ -561,39 +559,62 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
         ]
         exclude_patterns = default_excludes + config.get('exclude_users', [])
 
-        for proc in psutil.process_iter(['username', 'cpu_percent', 'memory_info']):
+        user_cpu = defaultdict(float)
+        user_ram = defaultdict(int)
+
+        # Collect all processes first pass — build exclusion list and memory info
+        # (psutil requires two samples to compute per-process CPU accurately)
+        procs_snapshot = []
+        for proc in psutil.process_iter(['pid', 'username', 'memory_info']):
             try:
                 username = proc.info.get('username') or ''
                 if not username:
                     continue
-                # Skip if matches any exclude pattern (case-insensitive for Windows)
-                # Use lower() for case-insensitive matching on Windows
                 username_lower = username.lower()
                 should_exclude = any(
                     fnmatch.fnmatch(username_lower, pattern.lower())
                     for pattern in exclude_patterns
                 )
                 if should_exclude:
-                    logger.debug(f"Skipping system account: {username}")
                     continue
-                user_cpu[username] += proc.info.get('cpu_percent') or 0.0
-                mem = proc.info.get('memory_info')
+                procs_snapshot.append({
+                    'proc': proc,
+                    'username': username,
+                    'memory_info': proc.info.get('memory_info'),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        logger.debug(f"get_per_user_stats: Collected {len(procs_snapshot)} user processes (first pass)")
+
+        # Second pass — now CPU percentages are warm and will have real readings
+        for item in procs_snapshot:
+            try:
+                proc = item['proc']
+                username = item['username']
+                # This now returns a real CPU percentage (psutil tracks deltas internally)
+                cpu_pct = proc.cpu_percent(interval=None) or 0.0
+                user_cpu[username] += cpu_pct
+                mem = item['memory_info']
                 user_ram[username] += mem.rss if mem else 0
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        logger.debug(f"get_per_user_stats: Collected {len(user_cpu)} unique users from processes")
+        logger.debug(f"get_per_user_stats: Collected CPU for {len(user_cpu)} unique users (second pass)")
+        
         result = []
         for username, cpu_total in user_cpu.items():
             ram_b = user_ram[username]
             result.append({
                 'username':      username,
-                'cpu_percent':   round(cpu_total, 2),  # FIX: Already normalized; no division needed
+                'cpu_percent':   round(cpu_total, 2),
                 'ram_bytes':     ram_b,
                 'ram_formatted': _format_bytes(ram_b),
             })
         final_result = sorted(result, key=lambda x: x['cpu_percent'], reverse=True)
         logger.debug(f"get_per_user_stats: Returning {len(final_result)} users after filtering and sorting")
+        for user in final_result[:5]:  # Log top 5 for debugging
+            logger.debug(f"  {user['username']}: {user['cpu_percent']}%")
         return final_result
 
     except Exception as e:
