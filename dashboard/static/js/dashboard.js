@@ -417,7 +417,9 @@ function createSystemCard(systemName, sys) {
 
     let usersHtml = '';
     if (isServer && sys.users && sys.users.length > 0) {
-        const topUsers = sys.users.slice(0, 8);  // cap at 8 rows
+        // Sort by CPU usage descending, then take top 8
+        const sortedUsers = [...sys.users].sort((a, b) => (b.cpu_percent || 0) - (a.cpu_percent || 0));
+        const topUsers = sortedUsers.slice(0, 8);
         const rows = topUsers.map(u => `
             <div class="user-row">
                 <span class="user-name" title="${escapeHtml(u.username)}">${escapeHtml(u.username.split('\\').pop())}</span>

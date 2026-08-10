@@ -530,6 +530,9 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
     Filters out blank/None usernames and accounts matching exclude_users patterns.
     Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
     
+    CPU% from psutil is already normalized per-process; we sum across processes for each user.
+    Note: This sum can exceed 100% on multi-core systems (e.g., 200% = 2 cores fully used).
+    
     Args:
         config: Configuration dict
         logger: Logger instance
@@ -539,10 +542,9 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
         from collections import defaultdict
         import fnmatch
 
-        logger.debug(f"get_per_user_stats: Starting, cpu_count={psutil.cpu_count(logical=True)}")
+        logger.debug(f"get_per_user_stats: Starting")
         user_cpu = defaultdict(float)
         user_ram = defaultdict(int)
-        cpu_count = psutil.cpu_count(logical=True) or 1
         
         # Always exclude well-known Windows service accounts and system users.
         # Additional patterns can be added via exclude_users in config.json.
@@ -586,7 +588,7 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
             ram_b = user_ram[username]
             result.append({
                 'username':      username,
-                'cpu_percent':   round(cpu_total / cpu_count, 2),
+                'cpu_percent':   round(cpu_total, 2),  # FIX: Already normalized; no division needed
                 'ram_bytes':     ram_b,
                 'ram_formatted': _format_bytes(ram_b),
             })
