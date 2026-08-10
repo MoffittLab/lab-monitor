@@ -342,7 +342,14 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         return False
     
     try:
-        cpu_percent = get_cpu_percent()
+        # Seed per-user CPU tracking BEFORE the system-level sleep.
+        # psutil.cpu_percent(interval=None) always returns 0.0 on the first call
+        # for a given process object — it needs two samples with elapsed time between
+        # them to compute a real percentage.  By seeding here, the 1-second blocking
+        # call inside get_cpu_percent() becomes our measurement window for free.
+        user_procs_seed = _seed_user_processes(config)
+
+        cpu_percent = get_cpu_percent()   # blocks ~1 s — this IS the measurement window
         ram_percent = get_ram_percent()
         total_ram_bytes = get_total_ram_bytes()
         network_stats = get_network_stats(config, name)
@@ -398,7 +405,8 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         entries.append(entry)
         
         # Per-user metrics (one message per user for normalized history storage)
-        user_stats = get_per_user_stats(config, logger)
+        # Pass the pre-seeded process list so cpu_percent() returns real values.
+        user_stats = get_per_user_stats(config, logger, seeded_procs=user_procs_seed)
         for user in user_stats:
             user_entry = {
                 'header': build_header(name, system_id, device_type),
@@ -558,76 +566,90 @@ def fallback_total_ram_bytes() -> int:
         return 0
 
 
-def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
+def _build_exclude_patterns(config: dict) -> list:
+    """Build the combined list of username exclusion glob patterns."""
+    import fnmatch  # noqa — imported here so callers don't need it
+    default_excludes = [
+        'UMFD-*',              # User Mode Driver Framework (Windows service)
+        'NT AUTHORITY\\*',     # Windows system accounts
+        'NT SERVICE\\*',       # Windows service accounts
+        'Window Manager\\*',   # Windows display driver
+        'Font Driver Host\\*', # Windows font driver
+        'DWM.EXE',             # Desktop Window Manager
+        'System',              # Windows system process
+        'Idle',                # Idle process
+    ]
+    return default_excludes + config.get('exclude_users', [])
+
+
+def _seed_user_processes(config: dict) -> list:
     """
-    Aggregate CPU% and RAM (bytes) by Windows user account across all processes.
-    Returns a list sorted by cpu_percent descending.
-    Filters out blank/None usernames and accounts matching exclude_users patterns.
-    Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
-    
-    On Windows, per-process CPU percentage must be measured with a sampling interval.
-    We warm up the measurement system, then iterate processes to collect fresh readings.
-    
-    Args:
-        config: Configuration dict
-        logger: Logger instance
+    First pass: iterate all user processes, call cpu_percent() once (returns 0 —
+    that is expected and intentional), and return the list of process dicts.
+
+    The caller must wait at least ~1 second before calling get_per_user_stats()
+    so that psutil can accumulate a meaningful CPU delta between the seed call
+    and the real measurement call.
     """
     try:
         import psutil
-        from collections import defaultdict
         import fnmatch
 
-        logger.debug(f"get_per_user_stats: Starting")
-        
-        # Always exclude well-known Windows service accounts and system users.
-        # Additional patterns can be added via exclude_users in config.json.
-        # Patterns use wildcards: UMFD-*, NT AUTHORITY\*, etc.
-        default_excludes = [
-            'UMFD-*',              # User Mode Driver Framework (Windows service)
-            'NT AUTHORITY\\*',     # Windows system accounts
-            'NT SERVICE\\*',       # Windows service accounts
-            'Window Manager\\*',   # Windows display driver
-            'Font Driver Host\\*', # Windows font driver
-            'DWM.EXE',             # Desktop Window Manager
-            'System',              # Windows system process
-            'Idle',                # Idle process
-        ]
-        exclude_patterns = default_excludes + config.get('exclude_users', [])
-
-        user_cpu = defaultdict(float)
-        user_ram = defaultdict(int)
-
-        # Collect all processes first pass — build exclusion list and memory info
-        # (psutil requires two samples to compute per-process CPU accurately)
-        procs_snapshot = []
+        exclude_patterns = _build_exclude_patterns(config)
+        seeded = []
         for proc in psutil.process_iter(['pid', 'username', 'memory_info']):
             try:
                 username = proc.info.get('username') or ''
                 if not username:
                     continue
                 username_lower = username.lower()
-                should_exclude = any(
-                    fnmatch.fnmatch(username_lower, pattern.lower())
-                    for pattern in exclude_patterns
-                )
-                if should_exclude:
+                if any(fnmatch.fnmatch(username_lower, p.lower()) for p in exclude_patterns):
                     continue
-                procs_snapshot.append({
-                    'proc': proc,
-                    'username': username,
+                proc.cpu_percent(interval=None)   # seed — always 0, intentionally discarded
+                seeded.append({
+                    'proc':        proc,
+                    'username':    username,
                     'memory_info': proc.info.get('memory_info'),
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+        return seeded
+    except Exception:
+        return []
 
-        logger.debug(f"get_per_user_stats: Collected {len(procs_snapshot)} user processes (first pass)")
 
-        # Second pass — now CPU percentages are warm and will have real readings
-        for item in procs_snapshot:
+def get_per_user_stats(config: dict, logger: logging.Logger,
+                       seeded_procs: list = None) -> list:
+    """
+    Aggregate CPU% and RAM (bytes) by user account across all processes.
+    Returns a list sorted by cpu_percent descending.
+
+    seeded_procs: list returned by _seed_user_processes(), called at least
+    ~1 second earlier.  If None, falls back to a fresh (unseeded) pass which
+    will produce 0% CPU — callers should always pass seeded_procs.
+
+    Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
+    """
+    try:
+        import psutil
+        from collections import defaultdict
+        import fnmatch
+
+        user_cpu = defaultdict(float)
+        user_ram = defaultdict(int)
+
+        if seeded_procs is None:
+            # Fallback: fresh unseeded pass (CPU will be 0 — caller should avoid this)
+            logger.warning("get_per_user_stats called without seeded_procs — CPU will read 0")
+            seeded_procs = _seed_user_processes(config)
+
+        logger.debug(f"get_per_user_stats: second pass over {len(seeded_procs)} seeded processes")
+
+        for item in seeded_procs:
             try:
-                proc = item['proc']
+                proc     = item['proc']
                 username = item['username']
-                # This now returns a real CPU percentage (psutil tracks deltas internally)
+                # Second call — psutil now has a real delta since the seed call
                 cpu_pct = proc.cpu_percent(interval=None) or 0.0
                 user_cpu[username] += cpu_pct
                 mem = item['memory_info']
@@ -635,8 +657,6 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        logger.debug(f"get_per_user_stats: Collected CPU for {len(user_cpu)} unique users (second pass)")
-        
         result = []
         for username, cpu_total in user_cpu.items():
             ram_b = user_ram[username]
@@ -647,9 +667,9 @@ def get_per_user_stats(config: dict, logger: logging.Logger) -> list:
                 'ram_formatted': _format_bytes(ram_b),
             })
         final_result = sorted(result, key=lambda x: x['cpu_percent'], reverse=True)
-        logger.debug(f"get_per_user_stats: Returning {len(final_result)} users after filtering and sorting")
-        for user in final_result[:5]:  # Log top 5 for debugging
-            logger.debug(f"  {user['username']}: {user['cpu_percent']}%")
+        logger.debug(f"get_per_user_stats: {len(final_result)} users")
+        for user in final_result[:5]:
+            logger.debug(f"  {user['username']}: {user['cpu_percent']}% | {user['ram_formatted']}")
         return final_result
 
     except Exception as e:

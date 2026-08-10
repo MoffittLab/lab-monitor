@@ -256,10 +256,16 @@ def get_all_systems_data() -> tuple:
             'first_seen': None, 'last_seen': None,
             'metrics': None, 'disk': None, 'totals': None,
         })
+        # total_ram_bytes lives in metrics_json (raw payload) on the manager;
+        # get_latest_for_all() doesn't promote it to a top-level column, so we
+        # pull it from the 'units' sibling dict that _extract_units() populates,
+        # but the value itself is in the raw metrics_json.  The manager returns
+        # it as a top-level key when present in the JSON blob.
         systems[name]['metrics'] = {
             'timestamp':                    data.get('timestamp'),
             'cpu_percent':                  data.get('cpu_percent', 0),
             'ram_percent':                  data.get('ram_percent', 0),
+            'total_ram_bytes':              data.get('total_ram_bytes', 0),
             'uptime_seconds':               data.get('uptime_seconds', 0),
             'uptime_formatted':             data.get('uptime_formatted', '0s'),
             'network_bytes_in':             data.get('network_bytes_in', 0),

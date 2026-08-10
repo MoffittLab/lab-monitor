@@ -385,8 +385,9 @@ class MetricsDB:
                 raw = json.loads(d.pop('metrics_json') or '{}')
             except Exception:
                 raw = {}
-            d['units'] = self._extract_units(raw)
-            d['gpus']  = raw.get('gpus', [])
+            d['units']           = self._extract_units(raw)
+            d['gpus']            = raw.get('gpus', [])
+            d['total_ram_bytes'] = raw.get('total_ram_bytes', 0)
             result[d['name']] = d
         return result
 
