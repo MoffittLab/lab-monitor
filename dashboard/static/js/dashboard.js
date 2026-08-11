@@ -193,7 +193,7 @@ function createSummaryButton(systemName, sys) {
 
     const deviceType = (sys.device_type || '').toLowerCase();
     const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS = 10 * 60 * 1000;  // 10 minutes
+    const OFFLINE_MS = 30 * 60 * 1000;  // 30 minutes
     const isOffline  = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
 
     let outerClass = '';
@@ -269,7 +269,7 @@ function createSystemCard(systemName, sys) {
 
     const deviceType   = sys.device_type || 'unknown';
     const metricsTs    = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS   = 10 * 60 * 1000;  // 10 minutes
+    const OFFLINE_MS   = 30 * 60 * 1000;  // 30 minutes
     const isOffline    = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
     const timestamp    = metricsTs
                             ? ('Last report: ' + formatTimestamp(metricsTs))
@@ -461,7 +461,7 @@ function createSystemCard(systemName, sys) {
     card.dataset.systemName = systemName;
 
     // Offline banner (top of card if offline)
-    const offlineBanner = isOffline ? `<div class="offline-banner">⚠️ Offline (no report for 10+ minutes)</div>` : '';
+    const offlineBanner = isOffline ? `<div class="offline-banner">⚠️ Offline (no report for 30+ minutes)</div>` : '';
 
     card.innerHTML = offlineBanner + `
         <div class="nas-card-header">
