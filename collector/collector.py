@@ -368,6 +368,24 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         # Each numeric field is accompanied by a sibling *_unit field so any
         # consumer (dashboard, downstream scripts) can interpret values
         # correctly without hardcoding field-name→unit mappings.
+        # Flat per-GPU columns for time-series chart history.
+        # gpu_N_percent and gpu_N_vram_used match the data-metric attribute
+        # names used by the dashboard JS. Keeping 'gpus' as a JSON blob
+        # preserves the rich struct needed for the current-metrics card display.
+        gpu_flat = {}
+        for i, g in enumerate(gpu_stats):
+            p = f'gpu_{i}'
+            gpu_flat[f'{p}_percent']          = g.get('gpu_percent', 0)
+            gpu_flat[f'{p}_percent_unit']     = '%'
+            gpu_flat[f'{p}_vram_used']        = g.get('vram_used_bytes', 0)
+            gpu_flat[f'{p}_vram_used_unit']   = 'bytes'
+            if g.get('temperature_c') is not None:
+                gpu_flat[f'{p}_temp_c']       = g['temperature_c']
+                gpu_flat[f'{p}_temp_c_unit']  = '\u00b0C'
+            if g.get('power_watts') is not None:
+                gpu_flat[f'{p}_power_w']      = g['power_watts']
+                gpu_flat[f'{p}_power_w_unit'] = 'W'
+
         entry = {
             'header': build_header(name, system_id, device_type),
             'data': {
@@ -391,6 +409,7 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
                 'network_bandwidth_out_mbps_unit':  'Mbps',
                 'gpus':                             gpu_stats,
                 'gpu_count':                        len(gpu_stats),
+                **gpu_flat,
             }
         }
         

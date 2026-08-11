@@ -15,6 +15,7 @@ import argparse
 import requests
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, render_template, jsonify, request
 
@@ -339,17 +340,22 @@ def get_data():
     })
 
 
-@app.route('/api/history/<system_name>/<data_type>/<field>')
+@app.route('/api/history/<system_name>/<data_type>/<path:field>')
 def get_metric_history(system_name, data_type, field):
     """Proxy metric time-series data from Manager for frontend charting."""
     try:
         limit = request.args.get('limit', 100, type=int)
         if limit < 1 or limit > 500:
             limit = min(limit, 500)
-        
+
+        # URL-encode field so that paths like /volume1 or E: survive the
+        # round-trip to the manager's <path:field> route without breaking
+        # URL structure or triggering slash-merging in Werkzeug.
+        encoded_field = quote(field, safe='')
+
         # Forward to Manager's history endpoint
         data = _manager_get(
-            f'/api/history/{system_name}/{data_type}/{field}',
+            f'/api/history/{system_name}/{data_type}/{encoded_field}',
             params={'limit': limit}
         )
         

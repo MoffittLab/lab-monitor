@@ -836,7 +836,7 @@ def get_totals():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/history/<system_name>/<data_type>/<field>', methods=['GET'])
+@app.route('/api/history/<system_name>/<data_type>/<path:field>', methods=['GET'])
 def get_metric_history(system_name: str, data_type: str, field: str):
     """
     Fetch time-series data for a specific field within a system's data_type table.
