@@ -112,6 +112,20 @@ body {
     margin-left: 4px;
 }
 
+.transfer-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: nowrap;
+}
+
+.transfer-divider {
+    color: #bdc3c7;
+    font-size: 16px;
+    line-height: 1;
+}
+
 /* System Summary Strip */
 .system-summary-strip {
     display: flex;
