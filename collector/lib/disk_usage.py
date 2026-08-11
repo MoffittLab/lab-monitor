@@ -13,7 +13,8 @@ Example:
   Reports: [{'path': '/volume1/JeffMoffitt', 'usage_bytes': 5000000}, ...]
 
 Cross-platform approach:
-- Python native os.scandir (faster and more reliable than subprocess du)
+- Windows: PowerShell Get-ChildItem (native Win32 batch enumeration, faster than os.scandir)
+- Linux/Synology: Python native os.scandir
 - Handles permission errors gracefully
 - Timeout support for large folders (100TB+)
 - Works on Windows, Linux, and Synology NAS
@@ -21,13 +22,60 @@ Cross-platform approach:
 import os
 import shutil
 import logging
+import subprocess
 import time
 import re
 import sys
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def measure_folder_powershell(path: str, timeout: int = 3600) -> Tuple[int, int]:
+    """
+    Measure folder size on Windows using PowerShell Get-ChildItem.
+
+    Uses native Win32 batch enumeration (FindFirstFileEx with LARGE_FETCH),
+    which is significantly faster than Python's per-entry os.scandir on
+    Windows filesystems with large file counts.
+
+    Args:
+        path: Folder path to measure
+        timeout: Max seconds to wait for PowerShell process
+
+    Returns: Tuple of (total_bytes, files_counted)
+             files_counted is -1 when PowerShell returns a result (count
+             not easily available without a second pipeline step).
+
+    Raises: RuntimeError if PowerShell is unavailable or returns an error.
+    """
+    # Escape single quotes in path for PowerShell string literal
+    ps_path = path.replace("'", "''")
+    ps_script = (
+        "$r = Get-ChildItem -LiteralPath '" + ps_path + "' "
+        "-Recurse -Force -ErrorAction SilentlyContinue "
+        "| Measure-Object -Property Length -Sum; "
+        "Write-Output \"$($r.Sum) $($r.Count)\""
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = result.stdout.strip()
+        if not output:
+            raise RuntimeError(f"PowerShell returned empty output for {path}")
+        parts = output.split()
+        total_bytes   = int(float(parts[0])) if parts[0] not in ('', 'None', None) else 0
+        files_counted = int(parts[1]) if len(parts) > 1 and parts[1] not in ('', 'None', None) else -1
+        return total_bytes, files_counted
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"PowerShell measurement of {path} exceeded {timeout}s")
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(f"Could not parse PowerShell output for {path}: {e}")
 
 
 def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
@@ -314,59 +362,88 @@ def discover_volumes(nas_type: str = None) -> List[str]:
     return volumes
 
 
+def _format_bytes(b: int) -> str:
+    """Human-readable byte string for log messages."""
+    if b > 1024 ** 3:
+        return f"{b / (1024 ** 3):.2f} GB"
+    if b > 1024 ** 2:
+        return f"{b / (1024 ** 2):.2f} MB"
+    return f"{b / 1024:.2f} KB"
+
+
+def _measure_one_folder(folder_path: str, timeout: int, use_powershell: bool) -> Tuple[int, int]:
+    """
+    Measure a single folder, using PowerShell on Windows when requested.
+
+    Falls back to the Python scanner if PowerShell fails.
+
+    Returns: (bytes_used, files_counted)
+    """
+    if use_powershell:
+        try:
+            return measure_folder_powershell(folder_path, timeout=timeout)
+        except Exception as ps_err:
+            logger.warning(
+                f"PowerShell measurement failed for {folder_path} ({ps_err}); "
+                f"falling back to Python scanner"
+            )
+    return measure_folder_recursive(folder_path, timeout=timeout)
+
+
 def measure_leaf_folders(leaf_folders: List[str], timeout: int = 3600) -> List[Dict]:
     """
     Measure usage for a pre-discovered list of leaf folders.
-    
+
+    On Windows, uses PowerShell Get-ChildItem for faster native enumeration.
+    Falls back to the Python os.scandir walker if PowerShell is unavailable
+    or returns an error.
+
     Does NOT discover subdirectories — measures each folder as-is.
     Use when you have already discovered the exact folders to measure via discover_at_depth.
-    
+
     Args:
         leaf_folders: List of folder paths already discovered (e.g., from discover_at_depth)
         timeout: Max seconds per folder measurement
-    
+
     Returns: List of folder reports with path and usage_bytes
     """
     results = []
     start_time = time.time()
-    
+    use_powershell = sys.platform == 'win32'
+
+    if use_powershell:
+        logger.info("Windows detected — using PowerShell for folder size measurement")
+
     for folder_path in leaf_folders:
         if not os.path.exists(folder_path):
             logger.warning(f"Folder does not exist: {folder_path}")
             continue
-        
+
         try:
             # Check overall timeout
             elapsed = time.time() - start_time
             if elapsed > timeout:
                 logger.warning(f"Overall timeout ({timeout}s) reached, stopping measurements")
                 break
-            
+
             logger.info(f"Measuring ... {folder_path}")
             folder_start = time.time()
-            
-            bytes_used, files_counted = measure_folder_recursive(folder_path, timeout=timeout)
-            
+
+            bytes_used, files_counted = _measure_one_folder(folder_path, timeout, use_powershell)
+
             results.append({
                 'path': folder_path,
                 'usage_bytes': bytes_used
             })
-            
-            # Format bytes nicely for completion log
-            if bytes_used > 1024**3:
-                size_str = f"{bytes_used / (1024**3):.2f} GB"
-            elif bytes_used > 1024**2:
-                size_str = f"{bytes_used / (1024**2):.2f} MB"
-            else:
-                size_str = f"{bytes_used / 1024:.2f} KB"
-            
+
             folder_elapsed = time.time() - folder_start
-            logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {size_str} ({files_counted} files)")
-        
+            count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
+            logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {_format_bytes(bytes_used)} ({count_str})")
+
         except Exception as e:
             logger.error(f"Failed to measure {folder_path}: {e}")
             continue
-    
+
     return results
 
 
@@ -387,12 +464,16 @@ def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
     """
     results = []
     start_time = time.time()
-    
+    use_powershell = sys.platform == 'win32'
+
+    if use_powershell:
+        logger.info("Windows detected — using PowerShell for folder size measurement")
+
     for volume in volumes:
         if not os.path.exists(volume):
             logger.warning(f"Volume does not exist: {volume}")
             continue
-        
+
         # Log progress
         elapsed = time.time() - start_time
         logger.info(f"Measuring volume {volume} (elapsed {elapsed:.1f}s)")
@@ -420,23 +501,16 @@ def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
                 folder_start = time.time()
 
                 # Measure this subdirectory (including all nested contents)
-                bytes_used, files_counted = measure_folder_recursive(folder_path, timeout=timeout)
+                bytes_used, files_counted = _measure_one_folder(folder_path, timeout, use_powershell)
 
                 results.append({
                     'path': folder_path,
                     'usage_bytes': bytes_used
                 })
 
-                # Format bytes nicely for completion log
-                if bytes_used > 1024**3:
-                    size_str = f"{bytes_used / (1024**3):.2f} GB"
-                elif bytes_used > 1024**2:
-                    size_str = f"{bytes_used / (1024**2):.2f} MB"
-                else:
-                    size_str = f"{bytes_used / 1024:.2f} KB"
-
                 folder_elapsed = time.time() - folder_start
-                logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {size_str} ({files_counted:,} files)")
+                count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
+                logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {_format_bytes(bytes_used)} ({count_str})")
             
             except TimeoutError as e:
                 logger.warning(f"Timeout measuring {folder_path}: {e}")
@@ -451,12 +525,6 @@ def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
     # Log summary
     total_time = time.time() - start_time
     total_bytes = sum(r.get('usage_bytes', 0) for r in results)
-    if total_bytes > 1024**3:
-        total_str = f"{total_bytes / (1024**3):.2f} GB"
-    elif total_bytes > 1024**2:
-        total_str = f"{total_bytes / (1024**2):.2f} MB"
-    else:
-        total_str = f"{total_bytes / 1024:.2f} KB"
-    logger.info(f"Measurement complete: {len(results)} subdirectories, {total_str} total, {total_time:.1f}s")
+    logger.info(f"Measurement complete: {len(results)} subdirectories, {_format_bytes(total_bytes)} total, {total_time:.1f}s")
     
     return results
