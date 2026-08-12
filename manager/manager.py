@@ -13,6 +13,7 @@ import json
 import logging
 import argparse
 import sqlite3
+import math
 from urllib.parse import unquote
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -864,75 +865,120 @@ def get_metric_history(system_name: str, data_type: str, field: str):
     """
     limit = request.args.get('limit', default=100, type=int)
     limit = min(limit, 500)  # cap at 500 to prevent abuse
-    
+
     try:
         if not _data_store:
             return jsonify({'error': 'Data store not initialized'}), 500
-        
-        _logger.info(f"Fetching history: {system_name}/{data_type}/{field} (limit={limit})")
+
+        # Normalise the field name up-front so it is available for both the
+        # TypedDataStore path and the metrics-DB fallback path below.
+        #
+        # Volume paths (e.g. /volume1) lose their leading slash during URL
+        # routing: %2Fvolume1 → 308 redirect → volume1.  The frontend strips
+        # the slash before encoding to avoid the double-slash, so 'volume1'
+        # arrives here.  We restore it by trying '/'+field when the direct
+        # lookup misses.  Do this against the first available record so we
+        # can peek at which column names actually exist.
+        field_norm = unquote(field)  # decode any residual %XX encoding
+
+        def _resolve_field(sample_record: dict, raw: str) -> str:
+            """Try raw, then /raw, then raw/  variants against a sample record."""
+            if raw in sample_record:
+                return raw
+            candidate = '/' + raw
+            if candidate in sample_record:
+                _logger.info(f"Field resolved with leading slash: '{raw}' -> '{candidate}'")
+                return candidate
+            return raw  # no match; return as-is for logging
+
+        _logger.info(f"Fetching history: {system_name}/{data_type}/{field_norm} (limit={limit})")
         records = _data_store.get_recent(system_name, data_type, limit=limit)
         _logger.info(f"Got {len(records)} records for {system_name}/{data_type}")
-        
-        if not records:
+
+        if records:
+            field_norm = _resolve_field(records[0], field_norm)
+
+        elif data_type == 'folder_usage' and _metrics_db:
+            # TypedDataStore is empty for this system/type (possible if the
+            # data_dir was inaccessible during earlier ingest, or if only one
+            # measurement exists and the write failed).  Fall back to the
+            # current snapshot stored in the metrics DB so the user sees at
+            # least one data point instead of an empty chart.
+            _logger.warning(
+                f"No TypedDataStore records for {system_name}/folder_usage — "
+                f"falling back to metrics-DB snapshot"
+            )
+            snapshot = _metrics_db.get_latest_disk_usage(system_name)
+            if snapshot:
+                ts  = snapshot.get('timestamp')
+                # Snapshot has flat folder keys inlined (see get_latest_disk_usage_for_all)
+                # Resolve the field name against the snapshot dict.
+                fn  = _resolve_field(snapshot, field_norm)
+                val_raw = snapshot.get(fn)
+                if ts and val_raw is not None:
+                    try:
+                        return jsonify({
+                            'system_name': system_name,
+                            'data_type':   data_type,
+                            'field':       fn,
+                            'unit':        'bytes',
+                            'data':        [{'timestamp': ts, 'value': float(val_raw)}],
+                        }), 200
+                    except (ValueError, TypeError):
+                        pass
+            _logger.warning(f"No data at all for {system_name}/folder_usage/{field_norm}")
+            return jsonify({
+                'system_name': system_name,
+                'data_type':   data_type,
+                'field':       field_norm,
+                'data':        [],
+            }), 200
+
+        else:
             _logger.warning(f"No records found for {system_name}/{data_type}")
             return jsonify({
                 'system_name': system_name,
-                'data_type': data_type,
-                'field': field,
-                'data': []
+                'data_type':   data_type,
+                'field':       field_norm,
+                'data':        [],
             }), 200
-        
+
         # Log what fields are available
         _logger.info(f"Available fields in first record: {list(records[0].keys())}")
 
-        # Normalise the field name:
-        #   - URL-decode any remaining percent-encoded chars (e.g. %2F that
-        #     Werkzeug didn't decode before routing)
-        #   - For volume paths the frontend strips the leading slash to avoid
-        #     the double-slash / merge_slashes problem, so try '/'+field as a
-        #     fallback so that 'volume1' resolves to the '/volume1' column.
-        field_norm = unquote(field)
-        sample = records[0]
-        if field_norm not in sample and not field_norm.startswith('/'):
-            candidate = '/' + field_norm
-            if candidate in sample:
-                field_norm = candidate
-                _logger.info(f"Field resolved with leading slash: '{field}' -> '{field_norm}'")
-
-        # Extract timestamps and the requested field
+        # Extract timestamps and the requested field (oldest first)
         data = []
-        for record in reversed(records):  # oldest first
+        for record in reversed(records):
             ts = record.get('timestamp')
             val = record.get(field_norm)
             if ts is not None and val is not None:
-                # Handle stored values (might be JSON strings for complex types)
                 if isinstance(val, str):
                     try:
                         val = float(val)
                     except (ValueError, TypeError):
                         continue
-                data.append({
-                    'timestamp': ts,
-                    'value': float(val) if val is not None else None
-                })
-        
+                try:
+                    fval = float(val)
+                except (ValueError, TypeError):
+                    continue
+                if not math.isnan(fval):  # SQLite may echo NaN as NULL; guard anyway
+                    data.append({'timestamp': ts, 'value': fval})
+
         _logger.info(f"Returning {len(data)} data points for {field_norm}")
 
         # Two-tier unit lookup (records are DESC — newest first):
-        #   1. {field}_unit  — per-field sibling (system_metrics style)
-        #   2. _unit         — message-level default (folder_usage style)
-        unit = None
-        if records:
-            unit = records[0].get(f"{field_norm}_unit") or records[0].get("_unit")
+        #   1. {field_norm}_unit — per-field sibling (system_metrics style)
+        #   2. _unit             — message-level default (folder_usage style)
+        unit = records[0].get(f"{field_norm}_unit") or records[0].get("_unit")
 
         return jsonify({
             'system_name': system_name,
             'data_type':   data_type,
             'field':       field_norm,
             'unit':        unit,
-            'data':        data
+            'data':        data,
         }), 200
-    
+
     except Exception as e:
         _logger.error(f"Error fetching history for {system_name}/{data_type}/{field}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
