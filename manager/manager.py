@@ -13,6 +13,7 @@ import json
 import logging
 import argparse
 import sqlite3
+from urllib.parse import unquote
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -883,12 +884,26 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         
         # Log what fields are available
         _logger.info(f"Available fields in first record: {list(records[0].keys())}")
-        
+
+        # Normalise the field name:
+        #   - URL-decode any remaining percent-encoded chars (e.g. %2F that
+        #     Werkzeug didn't decode before routing)
+        #   - For volume paths the frontend strips the leading slash to avoid
+        #     the double-slash / merge_slashes problem, so try '/'+field as a
+        #     fallback so that 'volume1' resolves to the '/volume1' column.
+        field_norm = unquote(field)
+        sample = records[0]
+        if field_norm not in sample and not field_norm.startswith('/'):
+            candidate = '/' + field_norm
+            if candidate in sample:
+                field_norm = candidate
+                _logger.info(f"Field resolved with leading slash: '{field}' -> '{field_norm}'")
+
         # Extract timestamps and the requested field
         data = []
         for record in reversed(records):  # oldest first
             ts = record.get('timestamp')
-            val = record.get(field)
+            val = record.get(field_norm)
             if ts is not None and val is not None:
                 # Handle stored values (might be JSON strings for complex types)
                 if isinstance(val, str):
@@ -901,19 +916,19 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                     'value': float(val) if val is not None else None
                 })
         
-        _logger.info(f"Returning {len(data)} data points for {field}")
+        _logger.info(f"Returning {len(data)} data points for {field_norm}")
 
         # Two-tier unit lookup (records are DESC — newest first):
         #   1. {field}_unit  — per-field sibling (system_metrics style)
         #   2. _unit         — message-level default (folder_usage style)
         unit = None
         if records:
-            unit = records[0].get(f"{field}_unit") or records[0].get("_unit")
+            unit = records[0].get(f"{field_norm}_unit") or records[0].get("_unit")
 
         return jsonify({
             'system_name': system_name,
             'data_type':   data_type,
-            'field':       field,
+            'field':       field_norm,
             'unit':        unit,
             'data':        data
         }), 200

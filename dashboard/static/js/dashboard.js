@@ -641,8 +641,13 @@ function showVolumeChart(systemName, volumePath, volumeLabel) {
     
     callout.classList.add('active');
     
+    // Strip leading slashes before encoding so that paths like /volume1 don't
+    // produce a double-slash in the URL (%2F + route separator) which Werkzeug's
+    // merge_slashes would collapse, dropping the leading slash and causing the
+    // manager's field lookup to miss the column.  The manager restores the slash.
+    const safeVolumePath = volumePath.replace(/^\/+/, '');
     // Fetch volume usage history from folder_usage table
-    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(volumePath)}?limit=200`)
+    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(safeVolumePath)}?limit=200`)
         .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return r.json();
