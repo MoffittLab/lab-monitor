@@ -897,12 +897,13 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
                 time_delta = (curr_dt - prev_dt).total_seconds()
                 
                 if time_delta > 0:
-                    # Calculate bytes/sec, then convert to Mbps
+                    # Calculate bytes/sec, then convert to Mbps (bits/sec / 1,000,000)
                     bytes_in_delta = max(0, current_bytes_in - prev_bytes_in)
                     bytes_out_delta = max(0, current_bytes_out - prev_bytes_out)
                     
-                    bandwidth_in_mbps = (bytes_in_delta / time_delta) / (1024 * 1024)
-                    bandwidth_out_mbps = (bytes_out_delta / time_delta) / (1024 * 1024)
+                    # bytes/sec * 8 bits/byte / 1,000,000 bits/Mbps = Mbps
+                    bandwidth_in_mbps = (bytes_in_delta / time_delta) * 8 / 1_000_000
+                    bandwidth_out_mbps = (bytes_out_delta / time_delta) * 8 / 1_000_000
             except Exception:
                 pass  # Silently fail on timestamp parsing, just report 0 bandwidth
         

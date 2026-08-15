@@ -80,13 +80,13 @@ Keys classified by depth:
   "uptime_formatted":           "9d 23h",
   "network_bytes_in":           847392719104,
   "network_bytes_out":          123847392012,
-  "network_bandwidth_in_mbps":  3.84,
-  "network_bandwidth_out_mbps": 0.21
+  "network_bandwidth_in_mbps":  30.72,
+  "network_bandwidth_out_mbps": 1.68
 }
 ```
 
 `network_bytes_in/out` — cumulative OS counters since last boot.
-`network_bandwidth_*_mbps` — average rate computed against the previous metrics run snapshot.
+`network_bandwidth_in_mbps` / `network_bandwidth_out_mbps` — **megabits per second** (not MB/s), computed as the average rate between the previous and current metrics run snapshot. Conversion: `(bytes_delta / time_delta_sec) * 8 bits/byte / 1,000,000 bits/Mbit`.
 
 ---
 
