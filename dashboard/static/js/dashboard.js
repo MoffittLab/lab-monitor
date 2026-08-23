@@ -760,7 +760,10 @@ function updateChartInfo(data) {
 
 // Time range control functions
 function setTimeRange(hours) {
-    const limit = hours === null ? 500 : 200;
+    // Calculate limit based on time range
+    // Assuming 5-minute collection intervals: points_needed = hours * 60 / 5 = hours * 12
+    // Cap at 500 to avoid excessive data transfer
+    const limit = hours === null ? 500 : Math.min(500, Math.ceil(hours * 12));
     
     if (currentChartType === 'metric') {
         fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
