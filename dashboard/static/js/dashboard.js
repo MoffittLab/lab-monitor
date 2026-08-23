@@ -652,8 +652,11 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         responsive: true,
         displayModeBar: true,
         displaylogo: false,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        modeBarButtonsToAdd: [[csvModeBarButton(), hoverToggleModeBarButton()]],
+        modeBarButtons: [
+            ['zoom2d', 'pan2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+            ['toImage', csvModeBarButton()],
+            [hoverClosestButton(), hoverCompareButton()],
+        ],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -756,8 +759,11 @@ function renderVolumeChart(volumeLabel, data) {
         responsive: true,
         displayModeBar: true,
         displaylogo: false,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        modeBarButtonsToAdd: [[csvModeBarButton(), hoverToggleModeBarButton()]],
+        modeBarButtons: [
+            ['zoom2d', 'pan2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+            ['toImage', csvModeBarButton()],
+            [hoverClosestButton(), hoverCompareButton()],
+        ],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -823,24 +829,32 @@ function applyCustomRange() {
     }
 }
 
-// Returns a Plotly modeBar button that toggles the hover tooltip on/off.
-function hoverToggleModeBarButton() {
+// Hover closest point — press again to turn off.
+function hoverClosestButton() {
     return {
-        name: 'Toggle hover',
-        title: 'Toggle hover tooltip on/off',
-        // Eye icon (1000x1000 SVG, flipped to match Plotly coord system)
-        icon: {
-            width: 1000,
-            height: 1000,
-            path: 'M500,200 C200,200 50,500 50,500 C50,500 200,800 500,800 C800,800 950,500 950,500 C950,500 800,200 500,200 Z M500,350 C430,350 375,405 375,475 C375,545 430,600 500,600 C570,600 625,545 625,475 C625,405 570,350 500,350 Z',
-            transform: 'matrix(1 0 0 -1 0 1000)',
-        },
+        name: 'Hover: data point',
+        title: 'Show closest data point · press again to hide',
+        icon: Plotly.Icons['tooltip_basic'],
         click: function(gd) {
             const current = gd.layout.hovermode;
-            Plotly.relayout(gd, { hovermode: current ? false : 'x unified' });
+            Plotly.relayout(gd, { hovermode: current === 'closest' ? false : 'closest' });
         },
     };
 }
+
+// Hover x-unified (data point + time) — press again to turn off.
+function hoverCompareButton() {
+    return {
+        name: 'Hover: data point + time',
+        title: 'Show data point and time · press again to hide',
+        icon: Plotly.Icons['tooltip_compare'],
+        click: function(gd) {
+            const current = gd.layout.hovermode;
+            Plotly.relayout(gd, { hovermode: current === 'x unified' ? false : 'x unified' });
+        },
+    };
+}
+
 
 // Returns a Plotly modeBar button definition that downloads current chart data as CSV.
 function csvModeBarButton() {
