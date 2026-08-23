@@ -782,14 +782,16 @@ function setTimeRange(hours) {
     let fromISO = null;
     let toISO   = null;
 
+    const toDate = new Date();
+    toISO = toDate.toISOString();
+
     if (hours !== null) {
         // Specific window: compute ISO timestamps
-        const to   = new Date();
-        const from = new Date(to.getTime() - hours * 60 * 60 * 1000);
-        fromISO = from.toISOString();
-        toISO   = to.toISOString();
+        fromISO = new Date(toDate.getTime() - hours * 60 * 60 * 1000).toISOString();
+    } else {
+        // All Available: anchor far enough back to capture everything
+        fromISO = '2020-01-01T00:00:00.000Z';
     }
-    // hours === null means "All Available" — no from/to, backend returns all rows
 
     if (currentChartType === 'metric') {
         fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, fromISO, toISO);
