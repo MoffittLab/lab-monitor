@@ -653,6 +653,7 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         displayModeBar: true,
         displaylogo: false,
         modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+        modeBarButtonsToAdd: [csvModeBarButton()],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -756,6 +757,7 @@ function renderVolumeChart(volumeLabel, data) {
         displayModeBar: true,
         displaylogo: false,
         modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+        modeBarButtonsToAdd: [csvModeBarButton()],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -821,20 +823,20 @@ function applyCustomRange() {
     }
 }
 
-function exportChartPNG() {
-    const chartDiv = document.getElementById('metricChart');
-    if (!chartDiv) {
-        alert('Chart not found. Please refresh and try again.');
-        return;
-    }
-    
-    // Use Plotly's built-in export
-    Plotly.downloadImage('metricChart', {
-        format: 'png',
-        width: 1200,
-        height: 600,
-        filename: `chart-${Date.now()}.png`
-    });
+// Returns a Plotly modeBar button definition that downloads current chart data as CSV.
+function csvModeBarButton() {
+    return {
+        name: 'Download CSV',
+        title: 'Download data as CSV',
+        // Download-arrow icon (1000x1000 SVG, flipped to match Plotly coord system)
+        icon: {
+            width: 1000,
+            height: 1000,
+            path: 'M450,150 L450,580 L550,580 L550,150 Z M180,530 L500,820 L820,530 L680,530 L680,580 L550,580 L550,580 L450,580 L450,530 Z M150,860 L850,860 L850,960 L150,960 Z',
+            transform: 'matrix(1 0 0 -1 0 1000)',
+        },
+        click: function() { exportChartCSV(); },
+    };
 }
 
 function exportChartCSV() {
