@@ -624,7 +624,7 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         title: null,  // We use h3 instead
         xaxis: {
             type: 'date',
-            rangeslider: { visible: true, thickness: 0.05 },
+            rangeslider: { visible: false },
             rangeselector: { buttons: [] },
             title: 'Time',
         },
@@ -720,7 +720,7 @@ function renderVolumeChart(volumeLabel, data) {
         title: null,
         xaxis: {
             type: 'date',
-            rangeslider: { visible: true, thickness: 0.05 },
+            rangeslider: { visible: false },
             rangeselector: { buttons: [] },
             title: 'Time',
         },
@@ -760,22 +760,16 @@ function updateChartInfo(data) {
 
 // Time range control functions
 function setTimeRange(hours) {
-    if (hours === null) {
-        // "All Available" - use a very large limit
-        const limit = 500;
-        if (currentChartType === 'metric') {
-            fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
-        } else if (currentChartType === 'volume') {
-            const safeVolumePath = currentVolumeInfo.path.replace(/^\+/, '');
-            fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, limit);
-        }
-    } else {
-        // Store current time range for reference
-        currentTimeRangeHours = hours;
-        // TODO: Implement backend time-range filtering
-        // For now, this serves as a UI indicator of intended range
-        console.log(`Time range set to last ${hours} hours (backend filtering needed for full implementation)`);
+    const limit = hours === null ? 500 : 200;
+    
+    if (currentChartType === 'metric') {
+        fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
+    } else if (currentChartType === 'volume') {
+        const safeVolumePath = currentVolumeInfo.path.replace(/^\+/, '');
+        fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, limit);
     }
+    
+    currentTimeRangeHours = hours;
 }
 
 function applyCustomRange() {
