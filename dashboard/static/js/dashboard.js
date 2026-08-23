@@ -653,7 +653,7 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         displayModeBar: true,
         displaylogo: false,
         modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        modeBarButtonsToAdd: [csvModeBarButton()],
+        modeBarButtonsToAdd: [[csvModeBarButton(), hoverToggleModeBarButton()]],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -757,7 +757,7 @@ function renderVolumeChart(volumeLabel, data) {
         displayModeBar: true,
         displaylogo: false,
         modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        modeBarButtonsToAdd: [csvModeBarButton()],
+        modeBarButtonsToAdd: [[csvModeBarButton(), hoverToggleModeBarButton()]],
     };
 
     Plotly.newPlot('metricChart', [trace], layout, config);
@@ -821,6 +821,25 @@ function applyCustomRange() {
         const safeVolumePath = currentVolumeInfo.path.replace(/^\/+/, '');
         fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, fromISO, toISO);
     }
+}
+
+// Returns a Plotly modeBar button that toggles the hover tooltip on/off.
+function hoverToggleModeBarButton() {
+    return {
+        name: 'Toggle hover',
+        title: 'Toggle hover tooltip on/off',
+        // Eye icon (1000x1000 SVG, flipped to match Plotly coord system)
+        icon: {
+            width: 1000,
+            height: 1000,
+            path: 'M500,200 C200,200 50,500 50,500 C50,500 200,800 500,800 C800,800 950,500 950,500 C950,500 800,200 500,200 Z M500,350 C430,350 375,405 375,475 C375,545 430,600 500,600 C570,600 625,545 625,475 C625,405 570,350 500,350 Z',
+            transform: 'matrix(1 0 0 -1 0 1000)',
+        },
+        click: function(gd) {
+            const current = gd.layout.hovermode;
+            Plotly.relayout(gd, { hovermode: current ? false : 'x unified' });
+        },
+    };
 }
 
 // Returns a Plotly modeBar button definition that downloads current chart data as CSV.
