@@ -762,8 +762,8 @@ function updateChartInfo(data) {
 function setTimeRange(hours) {
     // Calculate limit based on time range
     // Assuming 5-minute collection intervals: points_needed = hours * 60 / 5 = hours * 12
-    // Cap at 500 to avoid excessive data transfer
-    const limit = hours === null ? 500 : Math.min(500, Math.ceil(hours * 12));
+    // For "All Available", request the max (backend enforces its own cap)
+    const limit = hours === null ? 10000 : Math.min(500, Math.ceil(hours * 12));
     
     if (currentChartType === 'metric') {
         fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
@@ -773,6 +773,7 @@ function setTimeRange(hours) {
     }
     
     currentTimeRangeHours = hours;
+    console.log(`Time range: ${hours === null ? 'All Available' : hours + 'h'} → requesting ${limit} points`);
 }
 
 function applyCustomRange() {

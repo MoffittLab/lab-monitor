@@ -864,7 +864,7 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         }
     """
     limit = request.args.get('limit', default=100, type=int)
-    limit = min(limit, 500)  # cap at 500 to prevent abuse
+    limit = min(limit, 2000)  # cap at 2000 to allow full history while preventing abuse
 
     try:
         if not _data_store:
