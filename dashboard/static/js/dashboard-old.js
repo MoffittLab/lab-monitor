@@ -1,6 +1,5 @@
 /**
  * Lab Monitor Dashboard - Frontend Logic
- * Upgraded with Plotly.js for interactive charts
  */
 
 let refreshInterval = 30000;
@@ -13,10 +12,7 @@ let metricChart = null;  // Global Plotly.js instance
 let currentChartData = null;  // Store current chart data for exports
 let currentChartLabel = null;  // Store current chart label
 let currentChartInfo = null;   // Store current chart info
-let currentSystemName = null;  // Store current system for reload
-let currentMetricField = null;  // Store metric field for reload
-let currentVolumeInfo = null;   // Store volume info for reload
-let currentTimeRangeHours = null;  // Current time range selection
+let currentTimeRangeHours = 200 * 5 / 60;  // Start with ~200 5-min samples ≈ 16.7 hours
 let currentChartType = null;   // 'metric' or 'volume'
 
 // Base-unit → display parameters.  The collector declares what unit it
@@ -39,6 +35,9 @@ const METRIC_UNITS = {
     network_bytes_in:           { yLabel: 'Data In (GB)',     unit: ' GB',   decimals: 2, scale: 1 / 1073741824, beginAtZero: false },
     network_bytes_out:          { yLabel: 'Data Out (GB)',    unit: ' GB',   decimals: 2, scale: 1 / 1073741824, beginAtZero: false },
 };
+
+// GPU metric patterns (gpu_0_percent, gpu_1_percent, etc.)
+// Add dynamically using regex matching in metric chart
 
 function initDashboard(config) {
     refreshInterval = config.refreshInterval || 30000;
@@ -526,30 +525,18 @@ function createSystemCard(systemName, sys) {
 }
 
 // -------------------------------------------------------------------------
-// Metric Chart (Plotly.js)
+// Metric Chart
 // -------------------------------------------------------------------------
 
 function showMetricChart(systemName, metricField, metricLabel) {
     const callout = document.getElementById('chartCallout');
     const title = document.getElementById('chartTitle');
-    title.textContent = `${systemName} — ${metricLabel}`;
+    title.textContent = `${systemName} - ${metricLabel}`;
 
     callout.classList.add('active');
-    currentChartType = 'metric';
-    currentSystemName = systemName;
-    currentMetricField = metricField;
-    currentTimeRangeHours = null;  // Reset to default
-    currentChartLabel = metricLabel;
 
-    // Fetch with default limit
-    fetchAndRenderMetric(systemName, metricField, metricLabel, 200);
-}
-
-function fetchAndRenderMetric(systemName, metricField, metricLabel, limit) {
-    const title = document.getElementById('chartTitle');
-    
     // Fetch historical data
-    fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?limit=${limit}`)
+    fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?limit=200`)
         .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return r.json();
@@ -581,19 +568,25 @@ function fetchAndRenderMetric(systemName, metricField, metricLabel, limit) {
             const n = (data.data || []).length;
             title.textContent = `${systemName} — ${metricLabel} (${n} measurements)`;
             renderMetricChart(metricField, metricLabel, info, data.data);
-            currentChartInfo = info;
         })
         .catch(err => {
             console.error('Error fetching metric history:', err);
-            document.getElementById('metricChart').innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            const chartContainer = document.querySelector('.chart-container');
+            if (chartContainer) {
+                chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            }
         });
 }
 
 function renderMetricChart(metricField, metricLabel, info, data) {
-    // Store data for exports
-    currentChartData = data;
-    
-    const timestamps = data.map(d => d.timestamp);
+    // info is pre-resolved by the caller: BASE_UNIT_DISPLAY (from API unit)
+    // or METRIC_UNITS (field-name fallback for older data).
+    const canvas = document.getElementById('metricChart');
+    const ctx = canvas.getContext('2d');
+
+    if (metricChart) metricChart.destroy();
+
+    const labels = formatChartTimestamps(data);
     const values = data.map(d => (d.value != null) ? +(d.value * info.scale) : null);
 
     // Color by metric type
@@ -608,45 +601,48 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         color = '#9b59b6';  // Purple for VRAM metrics
     }
 
-    const trace = {
-        x: timestamps,
-        y: values,
-        name: metricLabel,
-        mode: 'lines+markers',
-        line: { color: color, width: 2 },
-        marker: { size: 5 },
-        fill: 'tozeroy',
-        fillcolor: color + '33',
-        hovertemplate: '<b>%{x}</b><br>' + metricLabel + ': %{y:.' + info.decimals + 'f}' + info.unit + '<extra></extra>',
-    };
-
-    const layout = {
-        title: null,  // We use h3 instead
-        xaxis: {
-            type: 'date',
-            rangeslider: { visible: true, thickness: 0.05 },
-            rangeselector: { buttons: [] },
-            title: 'Time',
+    metricChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: metricLabel,
+                data: values,
+                borderColor: color,
+                backgroundColor: color + '22',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 2,
+                pointBackgroundColor: color,
+            }]
         },
-        yaxis: {
-            title: info.yLabel,
-            zeroline: info.beginAtZero,
-        },
-        hovermode: 'x unified',
-        margin: { l: 60, r: 20, t: 10, b: 80 },
-        plot_bgcolor: 'rgba(245, 245, 245, 0.5)',
-        paper_bgcolor: 'white',
-    };
-
-    const config = {
-        responsive: true,
-        displayModeBar: true,
-        displaylogo: false,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-    };
-
-    Plotly.newPlot('metricChart', [trace], layout, config);
-    updateChartInfo(data);
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: true, position: 'top' },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${(+ctx.parsed.y).toFixed(info.decimals)}${info.unit}`
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: info.beginAtZero,
+                    title: { display: true, text: info.yLabel },
+                    ticks: {
+                        callback: v => `${(+v).toFixed(info.decimals)}${info.unit}`
+                    }
+                },
+                x: {
+                    display: true,
+                    ticks: { maxRotation: 45, minRotation: 0 }
+                }
+            }
+        }
+    });
 }
 
 function showVolumeChart(systemName, volumePath, volumeLabel) {
@@ -655,21 +651,14 @@ function showVolumeChart(systemName, volumePath, volumeLabel) {
     title.textContent = `${systemName} — ${volumeLabel} Usage`;
     
     callout.classList.add('active');
-    currentChartType = 'volume';
-    currentSystemName = systemName;
-    currentVolumeInfo = { path: volumePath, label: volumeLabel };
-    currentTimeRangeHours = null;
-
-    // Strip leading slashes before encoding
-    const safeVolumePath = volumePath.replace(/^\+/, '');
-    fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, 200);
-}
-
-function fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, limit) {
-    const title = document.getElementById('chartTitle');
     
+    // Strip leading slashes before encoding so that paths like /volume1 don't
+    // produce a double-slash in the URL (%2F + route separator) which Werkzeug's
+    // merge_slashes would collapse, dropping the leading slash and causing the
+    // manager's field lookup to miss the column.  The manager restores the slash.
+    const safeVolumePath = volumePath.replace(/^\/+/, '');
     // Fetch volume usage history from folder_usage table
-    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(safeVolumePath)}?limit=${limit}`)
+    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(safeVolumePath)}?limit=200`)
         .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return r.json();
@@ -684,18 +673,23 @@ function fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, limit) {
         })
         .catch(err => {
             console.error('Error fetching volume history:', err);
-            document.getElementById('metricChart').innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            const chartContainer = document.querySelector('.chart-container');
+            if (chartContainer) {
+                chartContainer.innerHTML = `<p style="color:#e74c3c;">Error: ${escapeHtml(err.message)}</p>`;
+            }
         });
 }
 
 function renderVolumeChart(volumeLabel, data) {
-    // Store data for exports
-    currentChartData = data;
-    
-    const timestamps = data.map(d => d.timestamp);
-    const rawValues = data.map(d => d.value || 0);
+    const canvas = document.getElementById('metricChart');
+    const ctx = canvas.getContext('2d');
+
+    if (metricChart) metricChart.destroy();
+
+    const labels = formatChartTimestamps(data);
 
     // Auto-scale: use TB if any value >= 1 TB, else GB
+    const rawValues = data.map(d => d.value || 0);
     const maxBytes  = Math.max(...rawValues, 0);
     const useTB     = maxBytes >= 1099511627776;  // 1 TiB
     const divisor   = useTB ? 1099511627776 : 1073741824;
@@ -704,131 +698,48 @@ function renderVolumeChart(volumeLabel, data) {
 
     const scaledValues = rawValues.map(v => +(v / divisor).toFixed(decimals));
 
-    const trace = {
-        x: timestamps,
-        y: scaledValues,
-        name: `${volumeLabel} Used`,
-        mode: 'lines+markers',
-        line: { color: '#3498db', width: 2 },
-        marker: { size: 5 },
-        fill: 'tozeroy',
-        fillcolor: '#3498db33',
-        hovertemplate: '<b>%{x}</b><br>' + volumeLabel + ' Usage: %{y:.' + decimals + 'f} ' + unitStr + '<extra></extra>',
-    };
-
-    const layout = {
-        title: null,
-        xaxis: {
-            type: 'date',
-            rangeslider: { visible: true, thickness: 0.05 },
-            rangeselector: { buttons: [] },
-            title: 'Time',
+    metricChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: `${volumeLabel} Used`,
+                data: scaledValues,
+                borderColor: '#3498db',
+                backgroundColor: '#3498db22',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 2,
+                pointBackgroundColor: '#3498db',
+            }]
         },
-        yaxis: {
-            title: `Usage (${unitStr})`,
-            zeroline: false,
-        },
-        hovermode: 'x unified',
-        margin: { l: 60, r: 20, t: 10, b: 80 },
-        plot_bgcolor: 'rgba(245, 245, 245, 0.5)',
-        paper_bgcolor: 'white',
-    };
-
-    const config = {
-        responsive: true,
-        displayModeBar: true,
-        displaylogo: false,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-    };
-
-    Plotly.newPlot('metricChart', [trace], layout, config);
-    updateChartInfo(data);
-}
-
-function updateChartInfo(data) {
-    if (!data || data.length === 0) {
-        document.getElementById('chartInfo').textContent = 'No data';
-        return;
-    }
-    const n = data.length;
-    const firstTime = new Date(data[0].timestamp);
-    const lastTime = new Date(data[n - 1].timestamp);
-    const spanHours = (lastTime - firstTime) / (1000 * 60 * 60);
-    const info = `Showing ${n} measurements spanning ${spanHours.toFixed(1)} hours`;
-    document.getElementById('chartInfo').textContent = info;
-}
-
-// Time range control functions
-function setTimeRange(hours) {
-    if (hours === null) {
-        // "All Available" - use a very large limit
-        const limit = 500;
-        if (currentChartType === 'metric') {
-            fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
-        } else if (currentChartType === 'volume') {
-            const safeVolumePath = currentVolumeInfo.path.replace(/^\+/, '');
-            fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, limit);
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: true, position: 'top' },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${(+ctx.parsed.y).toFixed(decimals)} ${unitStr}`
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: false,
+                    title: { display: true, text: `Usage (${unitStr})` },
+                    ticks: {
+                        callback: v => `${(+v).toFixed(decimals)} ${unitStr}`
+                    }
+                },
+                x: {
+                    display: true,
+                    ticks: { maxRotation: 45, minRotation: 0 }
+                }
+            }
         }
-    } else {
-        // Store current time range for reference
-        currentTimeRangeHours = hours;
-        // TODO: Implement backend time-range filtering
-        // For now, this serves as a UI indicator of intended range
-        console.log(`Time range set to last ${hours} hours (backend filtering needed for full implementation)`);
-    }
-}
-
-function applyCustomRange() {
-    const from = document.getElementById('customFrom').value;
-    const to = document.getElementById('customTo').value;
-    if (!from || !to) {
-        alert('Please select both From and To dates');
-        return;
-    }
-    // TODO: Implement backend date-range filtering
-    console.log(`Custom range: ${from} to ${to} (backend filtering needed for full implementation)`);
-}
-
-function exportChartPNG() {
-    const chartDiv = document.getElementById('metricChart');
-    if (!chartDiv) {
-        alert('Chart not found. Please refresh and try again.');
-        return;
-    }
-    
-    // Use Plotly's built-in export
-    Plotly.downloadImage('metricChart', {
-        format: 'png',
-        width: 1200,
-        height: 600,
-        filename: `chart-${Date.now()}.png`
     });
-}
-
-function exportChartCSV() {
-    if (!currentChartData || currentChartData.length === 0) {
-        alert('No chart data to export');
-        return;
-    }
-    
-    // Build CSV
-    let csv = 'timestamp,value\n';
-    for (const row of currentChartData) {
-        const ts = row.timestamp || '';
-        const val = row.value !== null && row.value !== undefined ? row.value : '';
-        csv += `"${ts}",${val}\n`;
-    }
-    
-    // Download
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `chart-data-${Date.now()}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
 }
 
 // -------------------------------------------------------------------------
@@ -875,6 +786,19 @@ function unitSuffix(unitStr) {
     if (!unitStr) return '';
     const base = BASE_UNIT_DISPLAY[unitStr];
     return base ? base.unit : ` ${unitStr}`;
+}
+
+// Smart timestamp labels: date-only for multi-day spans (e.g. daily disk), time-only for intraday
+function formatChartTimestamps(data) {
+    if (!data.length) return [];
+    const times  = data.map(d => new Date(d.timestamp));
+    const spanMs = times[times.length - 1] - times[0];
+    if (spanMs > 18 * 3600 * 1000) {
+        // Multi-day: show "Aug 4" style
+        return times.map(d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+    }
+    // Intraday: show HH:MM
+    return times.map(d => d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }));
 }
 
 function escapeHtml(text) {

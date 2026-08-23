@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Moffitt Laboratory Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -47,8 +47,34 @@
             <div class="chart-callout-content">
                 <span class="chart-close">&times;</span>
                 <h3 id="chartTitle"></h3>
+                
+                <!-- Time Range Controls -->
+                <div class="chart-controls">
+                    <div class="control-group">
+                        <span class="control-label">Time Range:</span>
+                        <button class="range-btn" onclick="setTimeRange(24)">Last 24h</button>
+                        <button class="range-btn" onclick="setTimeRange(168)">Last 7d</button>
+                        <button class="range-btn" onclick="setTimeRange(720)">Last 30d</button>
+                        <button class="range-btn" onclick="setTimeRange(null)">All Available</button>
+                    </div>
+                    <div class="control-group">
+                        <span class="control-label">Custom:</span>
+                        <input type="date" id="customFrom" class="date-input" />
+                        <span class="date-separator">to</span>
+                        <input type="date" id="customTo" class="date-input" />
+                        <button class="range-btn" onclick="applyCustomRange()">Apply</button>
+                    </div>
+                </div>
+                
+                <!-- Export Controls -->
+                <div class="chart-exports">
+                    <button class="export-btn" onclick="exportChartPNG()" title="Download chart as PNG">📥 PNG</button>
+                    <button class="export-btn" onclick="exportChartCSV()" title="Download data as CSV">📥 CSV</button>
+                </div>
+                
+                <div class="chart-info" id="chartInfo"></div>
                 <div class="chart-container">
-                    <canvas id="metricChart"></canvas>
+                    <div id="metricChart"></div>
                 </div>
             </div>
         </div>
