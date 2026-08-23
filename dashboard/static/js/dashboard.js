@@ -627,7 +627,7 @@ function renderMetricChart(metricField, metricLabel, info, data) {
         marker: { size: 5 },
         fill: 'tozeroy',
         fillcolor: color + '33',
-        hovertemplate: '<b>%{x}</b><br>' + metricLabel + ': %{y:.' + info.decimals + 'f}' + info.unit + '<extra></extra>',
+        hovertemplate: metricLabel + ': %{y:.' + info.decimals + 'f}' + info.unit + '<extra></extra>'
     };
 
     const layout = {
@@ -731,7 +731,7 @@ function renderVolumeChart(volumeLabel, data) {
         marker: { size: 5 },
         fill: 'tozeroy',
         fillcolor: '#3498db33',
-        hovertemplate: '<b>%{x}</b><br>' + volumeLabel + ' Usage: %{y:.' + decimals + 'f} ' + unitStr + '<extra></extra>',
+        hovertemplate: volumeLabel + ' Usage: %{y:.' + decimals + 'f} ' + unitStr + '<extra></extra>'
     };
 
     const layout = {
