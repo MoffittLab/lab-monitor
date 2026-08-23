@@ -344,19 +344,27 @@ def get_data():
 def get_metric_history(system_name, data_type, field):
     """Proxy metric time-series data from Manager for frontend charting."""
     try:
-        limit = request.args.get('limit', 100, type=int)
-        if limit < 1 or limit > 500:
-            limit = min(limit, 500)
-
         # URL-encode field so that paths like /volume1 or E: survive the
         # round-trip to the manager's <path:field> route without breaking
         # URL structure or triggering slash-merging in Werkzeug.
         encoded_field = quote(field, safe='')
 
+        # Build params: prefer from/to time range over limit
+        params = {}
+        from_param = request.args.get('from', None)
+        to_param   = request.args.get('to',   None)
+        if from_param:
+            params['from'] = from_param
+        if to_param:
+            params['to'] = to_param
+        if not from_param:
+            # Fall back to limit-based tail query
+            params['limit'] = request.args.get('limit', 500, type=int)
+
         # Forward to Manager's history endpoint
         data = _manager_get(
             f'/api/history/{system_name}/{data_type}/{encoded_field}',
-            params={'limit': limit}
+            params=params
         )
         
         if data is None:

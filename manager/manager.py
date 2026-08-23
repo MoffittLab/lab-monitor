@@ -849,7 +849,13 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         field:       Column name (e.g., "cpu_percent", "ram_percent")
     
     Optional query params:
-        ?limit=100   Return last N records (default 100)
+        ?from=<ISO8601>   Start of time range (inclusive). When both from and
+                          to are supplied, returns all records in that window
+                          with no row cap. Omit for a tail query.
+        ?to=<ISO8601>     End of time range (exclusive). Defaults to now when
+                          from is provided but to is omitted.
+        ?limit=500        When from/to are absent: return last N records.
+                          Ignored when from/to are present.
     
     Returns:
         {
@@ -863,8 +869,15 @@ def get_metric_history(system_name: str, data_type: str, field: str):
             ]
         }
     """
-    limit = request.args.get('limit', default=100, type=int)
-    limit = min(limit, 2000)  # cap at 2000 to allow full history while preventing abuse
+    from_param  = request.args.get('from',  None)
+    to_param    = request.args.get('to',    None)
+    limit       = request.args.get('limit', default=500, type=int)
+
+    # When a time window is supplied, use get_between() — no row cap needed.
+    # Fall back to get_recent() (tail query) when no window is given.
+    use_window = bool(from_param)
+    if use_window and not to_param:
+        to_param = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
     try:
         if not _data_store:
@@ -891,8 +904,12 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                 return candidate
             return raw  # no match; return as-is for logging
 
-        _logger.info(f"Fetching history: {system_name}/{data_type}/{field_norm} (limit={limit})")
-        records = _data_store.get_recent(system_name, data_type, limit=limit)
+        if use_window:
+            _logger.info(f"Fetching history: {system_name}/{data_type}/{field_norm} (from={from_param} to={to_param})")
+            records = _data_store.get_between(system_name, data_type, from_param, to_param)
+        else:
+            _logger.info(f"Fetching history: {system_name}/{data_type}/{field_norm} (limit={limit})")
+            records = _data_store.get_recent(system_name, data_type, limit=limit)
         _logger.info(f"Got {len(records)} records for {system_name}/{data_type}")
 
         if records:
@@ -946,9 +963,11 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         # Log what fields are available
         _logger.info(f"Available fields in first record: {list(records[0].keys())}")
 
-        # Extract timestamps and the requested field (oldest first)
+        # Extract timestamps and the requested field (oldest first).
+        # get_recent() returns DESC; get_between() returns ASC — normalise here.
+        ordered = records if use_window else list(reversed(records))
         data = []
-        for record in reversed(records):
+        for record in ordered:
             ts = record.get('timestamp')
             val = record.get(field_norm)
             if ts is not None and val is not None:

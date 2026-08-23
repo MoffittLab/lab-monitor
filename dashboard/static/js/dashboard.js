@@ -538,18 +538,28 @@ function showMetricChart(systemName, metricField, metricLabel) {
     currentChartType = 'metric';
     currentSystemName = systemName;
     currentMetricField = metricField;
-    currentTimeRangeHours = null;  // Reset to default
+    currentTimeRangeHours = 24;  // Default: last 24 hours
     currentChartLabel = metricLabel;
 
-    // Fetch with default limit
-    fetchAndRenderMetric(systemName, metricField, metricLabel, 200);
+    // Default: last 24 hours
+    const to   = new Date();
+    const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
+    fetchAndRenderMetric(systemName, metricField, metricLabel, from.toISOString(), to.toISOString());
 }
 
-function fetchAndRenderMetric(systemName, metricField, metricLabel, limit) {
+function fetchAndRenderMetric(systemName, metricField, metricLabel, fromISO, toISO) {
     const title = document.getElementById('chartTitle');
-    
+
+    // Build query string: use time-range when available, else tail limit
+    let qs;
+    if (fromISO) {
+        qs = `from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`;
+    } else {
+        qs = `limit=500`;
+    }
+
     // Fetch historical data
-    fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?limit=${limit}`)
+    fetch(`/api/history/${encodeURIComponent(systemName)}/system_metrics/${encodeURIComponent(metricField)}?${qs}`)
         .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return r.json();
@@ -658,18 +668,25 @@ function showVolumeChart(systemName, volumePath, volumeLabel) {
     currentChartType = 'volume';
     currentSystemName = systemName;
     currentVolumeInfo = { path: volumePath, label: volumeLabel };
-    currentTimeRangeHours = null;
+    currentTimeRangeHours = null;  // Default: all available (volumes are daily — not many points)
 
     // Strip leading slashes before encoding
-    const safeVolumePath = volumePath.replace(/^\+/, '');
-    fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, 200);
+    const safeVolumePath = volumePath.replace(/^\/+/, '');
+    fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, null, null);
 }
 
-function fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, limit) {
+function fetchAndRenderVolume(systemName, safeVolumePath, volumeLabel, fromISO, toISO) {
     const title = document.getElementById('chartTitle');
-    
+
+    let qs;
+    if (fromISO) {
+        qs = `from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`;
+    } else {
+        qs = `limit=500`;
+    }
+
     // Fetch volume usage history from folder_usage table
-    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(safeVolumePath)}?limit=${limit}`)
+    fetch(`/api/history/${encodeURIComponent(systemName)}/folder_usage/${encodeURIComponent(safeVolumePath)}?${qs}`)
         .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return r.json();
@@ -760,31 +777,46 @@ function updateChartInfo(data) {
 
 // Time range control functions
 function setTimeRange(hours) {
-    // Calculate limit based on time range
-    // Assuming 5-minute collection intervals: points_needed = hours * 60 / 5 = hours * 12
-    // For "All Available", request the max (backend enforces its own cap)
-    const limit = hours === null ? 10000 : Math.min(500, Math.ceil(hours * 12));
-    
-    if (currentChartType === 'metric') {
-        fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, limit);
-    } else if (currentChartType === 'volume') {
-        const safeVolumePath = currentVolumeInfo.path.replace(/^\+/, '');
-        fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, limit);
-    }
-    
     currentTimeRangeHours = hours;
-    console.log(`Time range: ${hours === null ? 'All Available' : hours + 'h'} → requesting ${limit} points`);
+
+    let fromISO = null;
+    let toISO   = null;
+
+    if (hours !== null) {
+        // Specific window: compute ISO timestamps
+        const to   = new Date();
+        const from = new Date(to.getTime() - hours * 60 * 60 * 1000);
+        fromISO = from.toISOString();
+        toISO   = to.toISOString();
+    }
+    // hours === null means "All Available" — no from/to, backend returns all rows
+
+    if (currentChartType === 'metric') {
+        fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, fromISO, toISO);
+    } else if (currentChartType === 'volume') {
+        const safeVolumePath = currentVolumeInfo.path.replace(/^\/+/, '');
+        fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, fromISO, toISO);
+    }
 }
 
 function applyCustomRange() {
-    const from = document.getElementById('customFrom').value;
-    const to = document.getElementById('customTo').value;
-    if (!from || !to) {
+    const fromVal = document.getElementById('customFrom').value;
+    const toVal   = document.getElementById('customTo').value;
+    if (!fromVal || !toVal) {
         alert('Please select both From and To dates');
         return;
     }
-    // TODO: Implement backend date-range filtering
-    console.log(`Custom range: ${from} to ${to} (backend filtering needed for full implementation)`);
+    // Date inputs give YYYY-MM-DD; treat as start/end of day in UTC
+    const fromISO = new Date(fromVal + 'T00:00:00Z').toISOString();
+    const toISO   = new Date(toVal   + 'T23:59:59Z').toISOString();
+    currentTimeRangeHours = null;  // Custom range, not a preset
+
+    if (currentChartType === 'metric') {
+        fetchAndRenderMetric(currentSystemName, currentMetricField, currentChartLabel, fromISO, toISO);
+    } else if (currentChartType === 'volume') {
+        const safeVolumePath = currentVolumeInfo.path.replace(/^\/+/, '');
+        fetchAndRenderVolume(currentSystemName, safeVolumePath, currentVolumeInfo.label, fromISO, toISO);
+    }
 }
 
 function exportChartPNG() {
