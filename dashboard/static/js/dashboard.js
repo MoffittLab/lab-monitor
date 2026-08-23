@@ -205,7 +205,7 @@ function createSummaryButton(systemName, sys) {
 
     const deviceType = (sys.device_type || '').toLowerCase();
     const metricsTs  = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS = 30 * 60 * 1000;  // 30 minutes
+    const OFFLINE_MS = 2 * 60 * 60 * 1000;  // 2 hours
     const isOffline  = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
 
     let outerClass = '';
@@ -281,7 +281,7 @@ function createSystemCard(systemName, sys) {
 
     const deviceType   = sys.device_type || 'unknown';
     const metricsTs    = sys.metrics ? sys.metrics.timestamp : null;
-    const OFFLINE_MS   = 30 * 60 * 1000;  // 30 minutes
+    const OFFLINE_MS   = 2 * 60 * 60 * 1000;  // 2 hours
     const isOffline    = !metricsTs || (Date.now() - new Date(metricsTs).getTime()) > OFFLINE_MS;
     const timestamp    = metricsTs
                             ? ('Last report: ' + formatTimestamp(metricsTs))
@@ -473,7 +473,7 @@ function createSystemCard(systemName, sys) {
     card.dataset.systemName = systemName;
 
     // Offline banner (top of card if offline)
-    const offlineBanner = isOffline ? `<div class="offline-banner">⚠️ Offline (no report for 30+ minutes)</div>` : '';
+    const offlineBanner = isOffline ? `<div class="offline-banner">⚠️ Offline (no report for 2+ hours)</div>` : '';
 
     card.innerHTML = offlineBanner + `
         <div class="nas-card-header">
@@ -491,36 +491,34 @@ function createSystemCard(systemName, sys) {
         ${!sys.metrics && !sys.disk ? '<div class="folder-item">No data yet</div>' : ''}
     `;
 
-    // Attach click handlers only if not offline
-    if (!isOffline) {
-        const metricItems = card.querySelectorAll('[data-metric]');
-        metricItems.forEach(item => {
-            item.addEventListener('click', () => {
-                const system = item.getAttribute('data-system');
-                const metric = item.getAttribute('data-metric');
-                let label = item.querySelector('.metric-label')?.textContent || metric;
-                // For GPU metrics, append GPU index for clarity
-                if (metric.startsWith('gpu_')) {
-                    const parts = metric.split('_');
-                    const gpuIdx = parts[1];
-                    const metricType = parts.slice(2).join('_');
-                    label = `GPU ${gpuIdx} - ${label}`;
-                }
-                showMetricChart(system, metric, label);
-            });
+    // Attach click handlers for metric and volume history — always active,
+    // even when offline, so historical data can still be investigated.
+    const metricItems = card.querySelectorAll('[data-metric]');
+    metricItems.forEach(item => {
+        item.addEventListener('click', () => {
+            const system = item.getAttribute('data-system');
+            const metric = item.getAttribute('data-metric');
+            let label = item.querySelector('.metric-label')?.textContent || metric;
+            // For GPU metrics, append GPU index for clarity
+            if (metric.startsWith('gpu_')) {
+                const parts = metric.split('_');
+                const gpuIdx = parts[1];
+                label = `GPU ${gpuIdx} - ${label}`;
+            }
+            showMetricChart(system, metric, label);
         });
+    });
 
-        // Attach click handlers to volume buttons
-        const volumeButtons = card.querySelectorAll('[data-volume]');
-        volumeButtons.forEach(btn => {
-            btn.addEventListener('click', () => {
-                const system = btn.getAttribute('data-system');
-                const volume = btn.getAttribute('data-volume');
-                const label = btn.querySelector('.volume-btn-name')?.textContent || volume;
-                showVolumeChart(system, volume, label);
-            });
+    // Attach click handlers to volume buttons
+    const volumeButtons = card.querySelectorAll('[data-volume]');
+    volumeButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const system = btn.getAttribute('data-system');
+            const volume = btn.getAttribute('data-volume');
+            const label = btn.querySelector('.volume-btn-name')?.textContent || volume;
+            showVolumeChart(system, volume, label);
         });
-    }
+    });
 
     return card;
 }
