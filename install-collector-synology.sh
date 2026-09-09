@@ -146,36 +146,41 @@ fi
 echo ""
 
 echo -e "${YELLOW}Step 5: Installing dependencies${NC}"
-# Use the lightweight collector-only requirements (requests + psutil).
-# The repo-root requirements.txt also pulls Flask/paramiko, which the
-# collector does not need and which can fail to build on a NAS.
-REQ_FILE="$SCRIPTS_DIR/lab-monitor/collector/requirements.txt"
-if [ ! -f "$REQ_FILE" ]; then
-    # Fallback for older checkouts without the component requirements file.
-    REQ_FILE="$SCRIPTS_DIR/lab-monitor/requirements.txt"
+# The collector needs 'requests' (required) and optionally 'psutil'.
+# On Synology armv7l, psutil has no prebuilt wheel and must be compiled,
+# which fails without gcc. psutil is therefore installed best-effort: if it
+# can't be installed, the collector uses pure-Python /proc fallbacks for
+# CPU, RAM, uptime, and network. Only 'requests' is treated as fatal.
+
+# Choose install-mode flags once (venv vs. system --user).
+if [ "$USE_VENV" = "1" ]; then
+    PIP_USER_FLAG=""
+else
+    PIP_USER_FLAG="--user"
 fi
 
 cd "$SCRIPTS_DIR/lab-monitor"
-if [ "$USE_VENV" = "1" ]; then
-    # Install into the venv without relying on 'source activate' (which can
-    # exit the script under 'set -e' if activation misbehaves).
-    "$COLLECTOR_PYTHON" -m pip install --upgrade pip > /dev/null 2>&1 || true
-    "$COLLECTOR_PYTHON" -m pip install -r "$REQ_FILE" > /tmp/pip-install.log 2>&1 || {
-        echo -e "${RED}ERROR: Could not install dependencies into venv${NC}"
-        echo "See /tmp/pip-install.log"
-        exit 1
-    }
-else
-    # Per-user install against system python3.
-    "$COLLECTOR_PYTHON" -m pip install --user --upgrade pip > /dev/null 2>&1 || true
-    "$COLLECTOR_PYTHON" -m pip install --user -r "$REQ_FILE" > /tmp/pip-install.log 2>&1 || {
-        echo -e "${RED}ERROR: Could not install dependencies (--user)${NC}"
-        echo "See /tmp/pip-install.log"
-        echo "If pip is missing, install it: python3 -m ensurepip --user"
-        exit 1
-    }
+# Upgrade pip (best-effort; don't fail the install if this can't run).
+"$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG --upgrade pip > /dev/null 2>&1 || true
+
+# --- requests (REQUIRED) ---
+if ! "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG 'requests==2.31.0' > /tmp/pip-install.log 2>&1; then
+    echo -e "${RED}ERROR: Could not install 'requests' (required)${NC}"
+    echo "See /tmp/pip-install.log"
+    [ -z "$PIP_USER_FLAG" ] || echo "If pip is missing, install it: python3 -m ensurepip --user"
+    exit 1
 fi
-echo "[OK] Dependencies installed (requests, psutil) using $COLLECTOR_PYTHON"
+echo "[OK] requests installed"
+
+# --- psutil (OPTIONAL, best-effort) ---
+if "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG 'psutil==5.9.6' >> /tmp/pip-install.log 2>&1; then
+    echo "[OK] psutil installed (full metrics)"
+else
+    echo -e "${YELLOW}Note: psutil could not be installed (no ARM wheel / no compiler).${NC}"
+    echo "      The collector will use pure-Python /proc fallbacks for CPU,"
+    echo "      RAM, uptime, and network. This is expected on Synology armv7l."
+fi
+echo "[OK] Dependencies ready using $COLLECTOR_PYTHON"
 echo ""
 
 echo -e "${YELLOW}Step 6: Gathering configuration${NC}"

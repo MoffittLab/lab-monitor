@@ -846,6 +846,13 @@ def get_uptime_seconds() -> int:
         current_time = time.time()
         uptime_seconds = int(current_time - boot_time)
         return max(0, uptime_seconds)  # Ensure non-negative
+    except ImportError:
+        # Pure-Python fallback: /proc/uptime first field is seconds since boot.
+        try:
+            with open('/proc/uptime', 'r') as f:
+                return max(0, int(float(f.read().split()[0])))
+        except Exception:
+            return 0
     except Exception:
         return 0
 
@@ -896,14 +903,50 @@ def write_network_snapshot(snapshot_path: str, data: dict) -> bool:
         return False
 
 
+def fallback_network_counters() -> tuple:
+    """
+    Read cumulative network byte counters without psutil.
+
+    Sums Receive/Transmit bytes across all non-loopback interfaces from
+    /proc/net/dev (Linux/Synology). Used when psutil is unavailable, which
+    is the norm on Synology armv7l where psutil has no prebuilt wheel and
+    cannot be compiled (no gcc).
+
+    Returns:
+        (bytes_in, bytes_out). Returns (0, 0) if /proc/net/dev is unreadable.
+    """
+    try:
+        total_in = 0
+        total_out = 0
+        with open('/proc/net/dev', 'r') as f:
+            lines = f.readlines()[2:]  # skip the two header rows
+        for line in lines:
+            iface, _, data = line.partition(':')
+            if iface.strip() == 'lo':
+                continue  # ignore loopback
+            cols = data.split()
+            if len(cols) >= 16:
+                total_in += int(cols[0])   # Receive bytes
+                total_out += int(cols[8])  # Transmit bytes
+        return total_in, total_out
+    except Exception as e:
+        logger.debug(f"Network fallback (/proc/net/dev) failed: {e}")
+        return 0, 0
+
+
 def get_network_stats(config: dict, nas_name: str) -> dict:
     """Get network traffic (cumulative + bandwidth)"""
     try:
-        import psutil
-        net = psutil.net_io_counters()
-        
-        current_bytes_in = net.bytes_recv
-        current_bytes_out = net.bytes_sent
+        # Prefer psutil; fall back to /proc/net/dev when it isn't installed
+        # (common on Synology armv7l where psutil can't be built).
+        try:
+            import psutil
+            net = psutil.net_io_counters()
+            current_bytes_in = net.bytes_recv
+            current_bytes_out = net.bytes_sent
+        except ImportError:
+            current_bytes_in, current_bytes_out = fallback_network_counters()
+
         current_timestamp = datetime.utcnow().isoformat() + 'Z'
         
         # Read previous snapshot
@@ -949,7 +992,8 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
             'bandwidth_in_mbps': bandwidth_in_mbps,
             'bandwidth_out_mbps': bandwidth_out_mbps
         }
-    except ImportError:
+    except Exception as e:
+        logger.debug(f"Network stats failed: {e}")
         return {
             'bytes_in': 0,
             'bytes_out': 0,
