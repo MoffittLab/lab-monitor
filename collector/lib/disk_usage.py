@@ -78,7 +78,7 @@ def measure_folder_powershell(path: str, timeout: int = 3600) -> Tuple[int, int]
         raise RuntimeError(f"Could not parse PowerShell output for {path}: {e}")
 
 
-def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
+def measure_folder_recursive(path: str, timeout: int = 3600) -> Tuple[int, int]:
     """
     Measure folder size recursively (cross-platform).
     
@@ -146,7 +146,7 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> int:
     try:
         if not os.path.exists(path):
             logger.debug(f"Path does not exist: {path}")  # Non-existent scan paths are handled gracefully
-            return 0
+            return 0, 0  # keep tuple contract; a bare int here crashes unpacking callers
         
         total_bytes = _scan(path)
         return total_bytes, files_counted

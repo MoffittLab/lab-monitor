@@ -43,6 +43,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
 from disk_usage import measure_all_folders, measure_leaf_folders, discover_volumes, measure_volume_capacity, discover_at_depth, discover_folders, measure_folder_recursive
 
+# Module-level logger for standalone helpers (e.g. fallback_* functions) that
+# are not passed a logger. Child of the root logger configured by
+# setup_logging(), so it inherits the same console/file handlers.
+logger = logging.getLogger("collector")
+
 
 def setup_logging(log_file: str = None, log_level: str = "INFO"):
     """Configure logging to console and file"""
@@ -553,7 +558,8 @@ def fallback_cpu_percent() -> float:
             loadavg = os.getloadavg()[0]
             cpu_count = os.cpu_count() or 1
             return min(100.0, (loadavg / cpu_count) * 100)
-    except:
+    except Exception as e:
+        logger.debug(f"CPU fallback measurement failed: {e}")
         return 0.0
 
 
@@ -598,7 +604,8 @@ def fallback_total_ram_bytes() -> int:
                 lines = f.readlines()
             mem_total_kb = int(lines[0].split()[1])
             return mem_total_kb * 1024
-    except:
+    except Exception as e:
+        logger.debug(f"Total-RAM fallback measurement failed: {e}")
         return 0
 
 
@@ -826,7 +833,8 @@ def fallback_ram_percent() -> float:
             mem_total = int(lines[0].split()[1])
             mem_avail = int(lines[2].split()[1])
             return ((mem_total - mem_avail) / mem_total) * 100
-    except:
+    except Exception as e:
+        logger.debug(f"RAM-percent fallback measurement failed: {e}")
         return 0.0
 
 
