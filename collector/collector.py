@@ -72,11 +72,11 @@ def get_local_ip() -> str:
     Falls back to hostname resolution, then 'unknown' on failure.
     """
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        # Context manager guarantees the socket fd is closed even if
+        # getsockname() raises, preventing fd leaks on repeated failures.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
     except Exception:
         pass
     try:
@@ -581,7 +581,11 @@ def fallback_total_ram_bytes() -> int:
         if sys.platform == 'win32':
             # Windows: using wmic
             import subprocess
-            output = subprocess.check_output('wmic OS get TotalVisibleMemorySize /value').decode()
+            # timeout guards against wmic hanging, which would otherwise block
+            # the entire metrics collection run indefinitely.
+            output = subprocess.check_output(
+                'wmic OS get TotalVisibleMemorySize /value', timeout=10
+            ).decode()
             for line in output.split('\n'):
                 if 'TotalVisibleMemorySize' in line:
                     # Value is in KB
@@ -800,7 +804,11 @@ def fallback_ram_percent() -> float:
         if sys.platform == 'win32':
             # Windows: using wmic
             import subprocess
-            output = subprocess.check_output('wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value').decode()
+            # timeout guards against wmic hanging (see fallback_total_ram_bytes).
+            output = subprocess.check_output(
+                'wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value',
+                timeout=10,
+            ).decode()
             total = 0
             free = 0
             for line in output.split('\n'):

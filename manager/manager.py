@@ -255,12 +255,26 @@ def cleanup_old_reports(days: int = None):
                         # Keep unparseable lines
                         kept_reports.append(line)
             
-            # Write back
-            with open(log_path, 'w') as f:
+            # Nothing pruned -> don't rewrite the file at all (avoids a
+            # needless read-modify-write window against concurrent appends).
+            if deleted_count == 0:
+                continue
+
+            # Write kept lines to a temp file in the same dir, then atomically
+            # replace. os.replace is atomic on POSIX and Windows, so a reader
+            # never sees a half-written file. NOTE: this still races with an
+            # append that lands between our read and the replace (that append
+            # would be lost). A fully correct fix needs a shared lock between
+            # ingest_reports() and cleanup; atomic replace is the pragmatic
+            # mitigation for the common single-writer cleanup schedule.
+            tmp_path = log_path + ".tmp"
+            with open(tmp_path, 'w') as f:
                 f.writelines(kept_reports)
-            
-            if deleted_count > 0:
-                _logger.info(f"Cleaned {deleted_count} old reports from {nas_name}")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, log_path)
+
+            _logger.info(f"Cleaned {deleted_count} old reports from {nas_name}")
     
     except Exception as e:
         _logger.error(f"Error during cleanup: {e}")
