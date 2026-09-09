@@ -287,6 +287,7 @@ def health():
 
 
 @app.route('/api/usage/report', methods=['POST'])
+@require_auth
 def ingest_reports():
     """
     Receive and store usage reports from collectors.
@@ -839,6 +840,7 @@ def get_totals():
 
 
 @app.route('/api/history/<system_name>/<data_type>/<path:field>', methods=['GET'])
+@require_auth
 def get_metric_history(system_name: str, data_type: str, field: str):
     """
     Fetch time-series data for a specific field within a system's data_type table.
