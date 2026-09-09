@@ -290,16 +290,18 @@ class TypedDataStore:
         Closes any open connection first, then removes the .db file.
         Returns True if the file was deleted, False if it didn't exist.
         """
-        system_key = name.lower()
-        # Close open connection if any
-        if system_key in self._dbs:
+        # Close open connection if any. The connection cache is keyed by the
+        # raw system name (see _get_db), so look it up by that exact key.
+        if name in self._dbs:
             try:
-                self._dbs[system_key].close()
+                self._dbs[name].close()
             except Exception:
                 pass
-            del self._dbs[system_key]
+            del self._dbs[name]
 
-        db_path = os.path.join(self.data_dir, name, 'data.db')
+        # Resolve the on-disk path the same way writes do (sanitized name),
+        # otherwise mixed-case or special-char names never match the real file.
+        db_path = os.path.join(self.data_dir, _sanitize_table(name), 'data.db')
         if os.path.exists(db_path):
             try:
                 os.remove(db_path)

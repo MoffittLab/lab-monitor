@@ -497,9 +497,22 @@ def sync_queue_to_manager(config: dict, name: str, system_id: str, queue_path: s
         if response.status_code == 200:
             result = response.json()
             if result.get('status') == 'ok' and result.get('queue_id') == queue_id:
-                logger.info(f"Queue synced successfully ({result.get('stored')} entries stored)")
-                delete_queue(queue_path, logger)
-                return True
+                stored = result.get('stored')
+                sent = len(entries)
+                # Only delete the local queue once the Manager confirms it
+                # persisted every entry we sent. A 200/ok with a missing or
+                # short 'stored' count means partial (or zero) persistence, so
+                # keep the queue for retry. The append-only archive still holds
+                # the data regardless.
+                if stored == sent:
+                    logger.info(f"Queue synced successfully ({stored} entries stored)")
+                    delete_queue(queue_path, logger)
+                    return True
+                logger.warning(
+                    f"Manager ACK stored count mismatch: sent {sent}, "
+                    f"stored {stored!r} \u2014 keeping queue for retry"
+                )
+                return False
             elif result.get('status') == 'ok' and result.get('queue_id') != queue_id:
                 logger.warning(
                     f"Manager ACK queue_id mismatch: sent {queue_id!r}, "

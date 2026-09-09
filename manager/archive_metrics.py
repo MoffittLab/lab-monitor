@@ -14,6 +14,7 @@ Or from Task Scheduler:
     python.exe E:\Users\lab-monitor\scripts\lab-monitor\manager\archive_metrics.py
 """
 import os
+import re
 import sys
 import json
 import logging
@@ -26,6 +27,15 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from metrics import MetricsDB
+
+
+def _sanitize_name(name: str) -> str:
+    """
+    Convert a system name into a safe single path segment.
+    Mirrors data_store._sanitize_table so archive paths line up with the
+    per-system DB directories and cannot escape data_dir via traversal.
+    """
+    return re.sub(r'[^a-z0-9_]', '_', str(name).lower())[:64]
 
 
 def setup_logging(log_file: str = None):
@@ -127,8 +137,8 @@ def archive_old_metrics(db: MetricsDB, data_dir: str, logger: logging.Logger, da
                     'network_bytes_out': row[4]
                 })
             
-            # Write to JSONL monthly files
-            system_dir = os.path.join(data_dir, name)
+            # Write to JSONL monthly files (sanitize name to prevent traversal)
+            system_dir = os.path.join(data_dir, _sanitize_name(name))
             os.makedirs(system_dir, exist_ok=True)
             
             for year_month, entries in sorted(months.items()):
