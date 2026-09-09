@@ -89,6 +89,15 @@ PYTHON_VERSION=$(python3 --version 2>&1)
 echo "[OK] $PYTHON_VERSION found"
 echo ""
 
+echo -e "${YELLOW}Step 2b: Checking git installation${NC}"
+if ! command -v git > /dev/null 2>&1; then
+    echo -e "${RED}ERROR: git not found${NC}"
+    echo "Install Git Server via Control Panel → Package Center → Git Server"
+    exit 1
+fi
+echo "[OK] git found"
+echo ""
+
 echo -e "${YELLOW}Step 3: Cloning/updating lab-monitor repository${NC}"
 if [ -d "$SCRIPTS_DIR/lab-monitor" ]; then
     echo "Repository already exists, pulling latest..."
@@ -105,35 +114,68 @@ fi
 echo "[OK] Repository ready at $SCRIPTS_DIR/lab-monitor"
 echo ""
 
-echo -e "${YELLOW}Step 4: Creating Python virtual environment${NC}"
-if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR" || {
-        echo -e "${RED}ERROR: Could not create virtual environment${NC}"
-        exit 1
-    }
-    echo "[OK] Virtual environment created"
-else
+echo -e "${YELLOW}Step 4: Creating Python environment${NC}"
+# DSM's Package Center Python frequently ships a broken/absent venv module.
+# Try venv first; if it fails, fall back to a --user install against the
+# system python3. USE_VENV tracks which path we took so later steps and the
+# printed Task Scheduler commands use the correct interpreter.
+USE_VENV=0
+# A prior failed run can leave a broken venv whose bin/python3 exists but
+# has no working pip. Require pip to import before trusting an existing venv.
+if [ -x "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -m pip --version > /dev/null 2>&1; then
     echo "[OK] Virtual environment already exists"
+    USE_VENV=1
+elif rm -rf "$VENV_DIR" 2>/dev/null; python3 -m venv "$VENV_DIR" > /tmp/venv-create.log 2>&1 && "$VENV_DIR/bin/python3" -m pip --version > /dev/null 2>&1; then
+    echo "[OK] Virtual environment created"
+    USE_VENV=1
+else
+    echo -e "${YELLOW}Warning: could not create a virtualenv (common on DSM).${NC}"
+    echo "Falling back to a per-user install against system python3."
+    echo "(venv error log: /tmp/venv-create.log)"
+    rm -rf "$VENV_DIR" 2>/dev/null || true
+    USE_VENV=0
+fi
+
+# Resolve the python interpreter used for all subsequent steps and for the
+# scheduled tasks the user creates at the end.
+if [ "$USE_VENV" = "1" ]; then
+    COLLECTOR_PYTHON="$VENV_DIR/bin/python3"
+else
+    COLLECTOR_PYTHON="$(command -v python3)"
 fi
 echo ""
 
 echo -e "${YELLOW}Step 5: Installing dependencies${NC}"
-# Activate virtual environment
-source "$VENV_DIR/bin/activate"
+# Use the lightweight collector-only requirements (requests + psutil).
+# The repo-root requirements.txt also pulls Flask/paramiko, which the
+# collector does not need and which can fail to build on a NAS.
+REQ_FILE="$SCRIPTS_DIR/lab-monitor/collector/requirements.txt"
+if [ ! -f "$REQ_FILE" ]; then
+    # Fallback for older checkouts without the component requirements file.
+    REQ_FILE="$SCRIPTS_DIR/lab-monitor/requirements.txt"
+fi
 
-# Upgrade pip
-pip install --upgrade pip > /dev/null 2>&1
-
-# Install requirements from repo-root requirements.txt (covers all components)
 cd "$SCRIPTS_DIR/lab-monitor"
-pip install -r requirements.txt > /dev/null 2>&1 || {
-    echo -e "${RED}ERROR: Could not install dependencies${NC}"
-    deactivate
-    exit 1
-}
-echo "[OK] Dependencies installed (requests, psutil)"
-
-deactivate
+if [ "$USE_VENV" = "1" ]; then
+    # Install into the venv without relying on 'source activate' (which can
+    # exit the script under 'set -e' if activation misbehaves).
+    "$COLLECTOR_PYTHON" -m pip install --upgrade pip > /dev/null 2>&1 || true
+    "$COLLECTOR_PYTHON" -m pip install -r "$REQ_FILE" > /tmp/pip-install.log 2>&1 || {
+        echo -e "${RED}ERROR: Could not install dependencies into venv${NC}"
+        echo "See /tmp/pip-install.log"
+        exit 1
+    }
+else
+    # Per-user install against system python3.
+    "$COLLECTOR_PYTHON" -m pip install --user --upgrade pip > /dev/null 2>&1 || true
+    "$COLLECTOR_PYTHON" -m pip install --user -r "$REQ_FILE" > /tmp/pip-install.log 2>&1 || {
+        echo -e "${RED}ERROR: Could not install dependencies (--user)${NC}"
+        echo "See /tmp/pip-install.log"
+        echo "If pip is missing, install it: python3 -m ensurepip --user"
+        exit 1
+    }
+fi
+echo "[OK] Dependencies installed (requests, psutil) using $COLLECTOR_PYTHON"
 echo ""
 
 echo -e "${YELLOW}Step 6: Gathering configuration${NC}"
@@ -201,25 +243,40 @@ if [ ! -f "$CONFIG_FILE" ]; then
         done
         echo "[OK] Scan paths: $SCAN_PATHS_INPUT"
     else
-        # Default: one level deep in each volume
+        # Default: one level deep in each data volume (match /volumeN only)
         SCAN_PATHS_JSON=""
-        for vol in /volume*; do
-            if [ -d "$vol" ]; then
-                [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
-                SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$vol/*\""
-            fi
+        for vol in /volume[0-9]*; do
+            [ -d "$vol" ] || continue
+            case "$vol" in
+                *\**) continue ;;
+            esac
+            [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
+            SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$vol/*\""
         done
+        if [ -z "$SCAN_PATHS_JSON" ]; then
+            SCAN_PATHS_JSON="\"/volume1/*\""
+        fi
         echo "[OK] Defaulting to one level deep in each volume: $SCAN_PATHS_JSON"
     fi
     
-    # Auto-detect volumes present on this NAS
+    # Auto-detect data volumes present on this NAS. Match /volume<number>
+    # only, skipping /volumeUSB*, /volumeSATA*, and the literal glob when
+    # nothing matches (nullglob is not reliable in DSM's ash/bash).
     VOLUMES_JSON=""
-    for vol in /volume*; do
-        if [ -d "$vol" ]; then
-            [ -n "$VOLUMES_JSON" ] && VOLUMES_JSON="$VOLUMES_JSON, "
-            VOLUMES_JSON="$VOLUMES_JSON\"$vol\""
-        fi
+    for vol in /volume[0-9]*; do
+        # Guard against the no-match case where the glob stays literal.
+        [ -d "$vol" ] || continue
+        case "$vol" in
+            *\**) continue ;;  # literal '/volume[0-9]*' — no volumes matched
+        esac
+        [ -n "$VOLUMES_JSON" ] && VOLUMES_JSON="$VOLUMES_JSON, "
+        VOLUMES_JSON="$VOLUMES_JSON\"$vol\""
     done
+    if [ -z "$VOLUMES_JSON" ]; then
+        echo -e "${YELLOW}Warning: no /volumeN data volumes auto-detected.${NC}"
+        echo "Defaulting to /volume1; edit the config afterward if that is wrong."
+        VOLUMES_JSON="\"/volume1\""
+    fi
     echo "Auto-detected volumes: $VOLUMES_JSON"
     echo ""
 
@@ -260,15 +317,13 @@ echo ""
 echo -e "${YELLOW}Step 7: Testing collector (metrics mode)${NC}"
 cd "$SCRIPTS_DIR/lab-monitor/collector"
 echo "Testing metrics collection..."
-source "$VENV_DIR/bin/activate"
-if $VENV_DIR/bin/python3 collector.py --config local/config.json --mode metrics > /tmp/collector-test.log 2>&1; then
+if "$COLLECTOR_PYTHON" collector.py --config local/config.json --mode metrics > /tmp/collector-test.log 2>&1; then
     echo "[OK] Metrics collection test passed"
 else
     echo -e "${RED}⚠️  Metrics collection test failed${NC}"
     echo "Log: /tmp/collector-test.log"
     echo "This may be normal if Manager isn't running yet"
 fi
-deactivate
 echo ""
 
 echo "=========================================="
@@ -289,14 +344,14 @@ echo "   - Task name: 'Lab Monitor - Disk Collection'"
 echo "   - User: your admin user (e.g., 'jeff')"
 echo "   - Schedule: Daily at 02:00 (2 AM)"
 echo "   - User-defined script:"
-echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode disk"
+echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $COLLECTOR_PYTHON collector.py --config local/config.json --mode disk"
 echo ""
 echo "   Task 2: Lab Monitor - Metrics Collection"
 echo "   - Task name: 'Lab Monitor - Metrics Collection'"
 echo "   - User: your admin user (e.g., 'jeff')"
 echo "   - Schedule: Daily at 00:00, repeat every 5 minutes"
 echo "   - User-defined script:"
-echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $VENV_DIR/bin/python3 collector.py --config local/config.json --mode metrics"
+echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $COLLECTOR_PYTHON collector.py --config local/config.json --mode metrics"
 echo ""
 echo "3. Verify jobs run:"
 echo "   tail -f $LOGS_DIR/collector.log"
