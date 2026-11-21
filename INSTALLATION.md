@@ -375,7 +375,8 @@ config (then restart the Manager). `--dry-run` prints every action without chang
 `/opt/lab-monitor` and builds `/opt/lab-monitor/venv`; writes `/etc/lab-monitor/collector.json`
 (`0640 root:labmon`); installs and enables `lab-monitor-metrics.timer` (every 5 minutes) and
 `lab-monitor-disk.timer` (daily 02:00); runs one metrics collection and shows whether the Manager
-acknowledged it. Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
+acknowledged it. On a server with an NVIDIA driver it also installs nvidia-ml-py and checks that NVML works for
+`labmon` ([GPU servers](collector/README.md#gpu-servers)). Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
 they name). Details: [collector/README.md](collector/README.md#linux--ubuntu).
 
 **Shared storage:** folders on NFS/SMB or cluster filesystems (Lustre, GPFS, ...) are not scanned by
@@ -383,12 +384,25 @@ default, so a server whose `/home` is an NFS mount reports `/home` in the disk s
 walking the shared tree every night. Measure shared storage on its file server, or set
 `"include_network_mounts": true` on one node.
 
-**Verify:**
+**Verify (first-install checklist):**
 ```bash
 systemctl list-timers 'lab-monitor-*'
 journalctl -u lab-monitor-metrics.service -n 30
 sudo systemctl start lab-monitor-metrics.service   # run once more now
 ```
+
+On a GPU server, also:
+```bash
+# NVML works for the service user: prints the number of GPUs
+sudo -u labmon /opt/lab-monitor/venv/bin/python -s -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlDeviceGetCount())"
+# The service found them ("GPUs: N (...)"), and logged no NVML errors
+journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'GPUs:|NVML'
+# Compare with the Dashboard card / the collector's values
+nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv
+```
+Temperature should match within a degree or two and power within a few watts. Utilization is a sample, and
+VRAM used can differ by the driver-reserved amount. Causes and fixes:
+[collector/README.md](collector/README.md#gpu-servers).
 
 **Uninstall:** `sudo /opt/lab-monitor/install-collector-linux.sh --uninstall` (keeps config, data and logs;
 add `--purge` to delete them and the `labmon` user).

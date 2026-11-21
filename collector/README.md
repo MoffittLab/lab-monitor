@@ -56,6 +56,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `max_batch_messages` | Max messages per POST (default 100) |
 | `max_queue_messages` | Max messages kept in `queue.json` while the Manager is unreachable (default 50000; `0` = unlimited). When exceeded, the **oldest** are dropped from the queue with a warning — they stay in the monthly archive. |
 | `exclude_users` | (Optional) Username patterns to exclude from user activity metrics. Supports wildcards. Built-in defaults already exclude `UMFD-*`, `NT AUTHORITY\*`, etc. |
+| `exclude_system_accounts` | (Optional, Linux/Synology) `true` = leave daemon accounts out of the per-user metrics: UID 1 to `UID_MIN`−1 (from `/etc/login.defs`, 1000 on Ubuntu) and `nobody` (65534), such as `systemd-resolve`, `messagebus` or `nvidia-persistenced`. `root` and UIDs without an account on the host (e.g. a container's own user, shown as the number) are kept. Default `true` on Linux, `false` on Synology (its previous behaviour). The collector's own service account (`labmon`, a system account) is never counted either way, including the nightly disk scan. |
 | `platform` | (Optional) `synology`, `linux` or `windows`. Default: detected — Windows; Synology if `/etc/synoinfo.conf` or `/usr/syno` exists; any other host is `linux`. |
 | `include_network_mounts` | (Optional, Linux) `true` = also auto-discover network and cluster filesystems (nfs/nfs4/cifs/smb3, ceph, Lustre, GPFS, BeeGFS, GlusterFS, AFS) as volumes and let scans enter them. Default `false`: a `scan_paths` entry on one is not scanned and is listed in `_errors`. |
 | `cross_filesystems` | (Optional) `false` = measuring a folder never descends into another filesystem or mount point below it (like `du -x`). Default `false` on Linux, `true` (the historical behaviour) on Synology/Windows. |
@@ -197,7 +198,13 @@ Measures CPU%, RAM%, uptime, and network traffic. Network bandwidth is computed 
 
 `network_bytes_in/out` are cumulative OS counters (since last boot), summed over every interface **except
 loopback** (`lo`, `lo0`, `Loopback Pseudo-Interface 1`) — the same rule with psutil and with the `/proc/net/dev`
-fallback, since loopback traffic never leaves the machine. `network_bandwidth_*_mbps` is the average rate since
+fallback, since loopback traffic never leaves the machine. On Linux and Synology, **virtual interfaces** are left
+out too: those with no device behind them (no `/sys/class/net/<if>/device`), such as `docker0`, each
+container's `veth*`, `br-*`, `virbr*`, bonds, VLANs, `tun`/`tap`, WireGuard and `tailscale0`. Their traffic is
+also counted on a physical NIC, or never leaves the host. A veth also disappears when its container stops, so
+counting it would make the totals drop, which the Manager would read as a reboot (and would add all traffic
+since boot again). A bond is counted through its physical ports. If every interface is virtual (a collector
+inside a container), they are all counted. `network_bandwidth_*_mbps` is the average rate since
 the previous metrics run; it is `null` on the first run and right after a counter reset (reboot). If the
 counters can't be read at all, all four fields are `null` and the stored snapshot is left untouched.
 
@@ -205,7 +212,9 @@ counters can't be read at all, all four fields are `null` and the stored snapsho
 counters fall, which the Manager reads as a reboot, adding all traffic since boot to the lifetime totals a second
 time. So a psutil host upgraded from an older collector keeps counting loopback until its counters next reset
 (reboot), then switches; `network_snapshot.json` records which mode is in use (`"loopback"`). New installs exclude
-loopback from the first run.
+loopback from the first run. Virtual interfaces follow the same rule (`"virtual"` in the snapshot): a host
+upgraded from a collector that counted them keeps counting them until its counters next go backwards (a reboot,
+or a container stopping, which the Manager already reads as a reset), then stops.
 
 Without psutil (common on Synology armv7l) the collector reads `/proc`: CPU from two `/proc/stat` samples one
 second apart, RAM from `/proc/meminfo` (`MemAvailable`, or `MemFree + Buffers + Cached` on older kernels),
@@ -327,7 +336,7 @@ Installed by `install-collector-linux.sh` (Ubuntu 22.04 / 24.04, Debian 12; see
 | Path | Contents |
 |------|----------|
 | `/opt/lab-monitor/collector` | Code, owned by root (the service can't modify it) |
-| `/opt/lab-monitor/venv` | Python venv: `requirements.txt` (+ `requirements-gpu.txt` when `nvidia-smi` exists) |
+| `/opt/lab-monitor/venv` | Python venv: `requirements.txt` (+ `requirements-gpu.txt` on [GPU servers](#gpu-servers)) |
 | `/etc/lab-monitor/collector.json` | Config, mode `0640 root:labmon` (it holds the token) |
 | `/var/lib/lab-monitor/<name>/` | `data_dir`: archive, queue, network snapshot |
 | `/var/log/lab-monitor/collector.log` | Log file (every line is in the journal too) |
@@ -340,14 +349,14 @@ at boot.
 
 **Sandbox.** Both services run as the system user `labmon` (no login shell) with `ProtectSystem=strict`
 (writable: only `/var/lib/lab-monitor` and `/var/log/lab-monitor`), `PrivateTmp`, `NoNewPrivileges`, a
-system-call filter, no W+X memory and only `AF_INET`/`AF_INET6`/`AF_UNIX` sockets. The metrics service has
-no capabilities and no access to `/home`; it reads `/proc` for every user's processes (per-user metrics),
+system-call filter (`@system-service`) and only `AF_INET`/`AF_INET6`/`AF_UNIX` sockets; the disk service
+also gets no W+X memory and no devices. The metrics service has no capabilities and no access to `/home`, but
+can reach the NVIDIA devices (see [GPU servers](#gpu-servers)); it reads `/proc` for every user's processes (per-user metrics),
 which world-readable `/proc` files allow (unless `/proc` is mounted with `hidepid=`). The disk service must
 read every file under `scan_paths` whoever owns it, so it gets exactly one capability,
 `CAP_DAC_READ_SEARCH` (skip read/search permission checks — no write access, nothing else of root), sees
 `/home` read-only, and runs at `Nice=19` with idle I/O priority. Change a setting with a drop-in
-(`sudo systemctl edit lab-monitor-disk.service`): e.g. `ReadWritePaths=` for a `data_dir` elsewhere, or
-`MemoryDenyWriteExecute=no` if NVIDIA GPU stats stop appearing.
+(`sudo systemctl edit lab-monitor-disk.service`): e.g. `ReadWritePaths=` for a `data_dir` elsewhere.
 
 **Time budget.** The disk service's `TimeoutStartSec` is the collector's overall scan budget
 (`total_timeout_seconds`, 3 h in the installer's config) + 1 h for volume capacity and the upload. The
@@ -410,13 +419,95 @@ Run a scan through `systemctl start`, not `sudo -u labmon .../collector.py`: onl
 manual run as root leaves root-owned files in `data_dir`; the installer gives them back to `labmon` on its
 next run.
 
+### GPU servers
+
+A Linux server with an NVIDIA GPU reports exactly what a Windows GPU server reports, from the same code
+(nvidia-ml-py, i.e. NVML): in `system_metrics`, `gpu_count`, the `gpus` list (per GPU: `index`, `name`,
+`gpu_percent`, `vram_used_bytes`, `vram_total_bytes`, `vram_used_formatted`, `vram_total_formatted`,
+`temperature_c`, `power_watts`) and the flat history fields `gpu_N_percent` (`%`), `gpu_N_vram_used`
+(`bytes`), `gpu_N_temp_c` (`°C`) and `gpu_N_power_w` (`W`), each with its `*_unit` sibling. A value the GPU
+can't report is `null`; `gpu_N_temp_c` / `gpu_N_power_w` are left out for a GPU without that sensor.
+[`tests/collector/test_collector_gpu_parity.py`](../tests/collector/test_collector_gpu_parity.py) builds the
+metrics, per-user and disk messages as Windows and as Linux and fails on any difference in keys, units or
+value types. The expected differences are in its `KNOWN_DIFFERENCES`: Linux paths and user names, and a per-user
+row for `root`. Windows hides its service accounts by default, and Linux hides daemon accounts
+(`exclude_system_accounts`, on by default). Neither platform counts the collector itself: on Linux that means
+every process of `labmon`, the nightly disk scan included. `root` stays visible because docker containers and
+`sudo` jobs run as root. So that row also carries the system services and dockerd; add `"root"` to
+`exclude_users` to hide it. Network totals leave out docker's virtual interfaces (see
+[Metrics mode](#metrics-mode-system_metrics)), so containers starting and stopping don't reset them.
+
+**Install.** The installer adds `requirements-gpu.txt` (pinned `nvidia-ml-py`) when it finds an NVIDIA
+driver by any of: `/proc/driver/nvidia/version` (kernel module loaded), `libnvidia-ml.so.1` in `ldconfig -p`,
+or `nvidia-smi` on `PATH`. It prints which it found. A re-run or upgrade keeps nvidia-ml-py when the venv
+already has it, even if the driver isn't visible at that moment. The installer then runs NVML as `labmon` and
+explains a failure, for example a driver/library version mismatch (reboot after a driver upgrade), missing
+`/dev/nvidia*` nodes or restrictive device permissions. After the test run it checks the service's
+`GPUs: N (...)` log line.
+
+**Sandbox (metrics unit).** NVML opens `/dev/nvidiactl`, `/dev/nvidia0`..`N` (plus `/dev/nvidia-caps/*`, and
+`/dev/nvidia-nvswitch*` on NVSwitch systems). It reads `/proc/driver/nvidia` and `/sys`, talks to
+nvidia-persistenced over `AF_UNIX`, and loads `libnvidia-ml.so.1` from wherever `ldconfig` finds it
+(`/usr/lib/x86_64-linux-gnu` on Ubuntu; `ProtectSystem=strict` leaves it readable and loadable). So
+[`lab-monitor-metrics.service`](systemd/lab-monitor-metrics.service), unlike the disk unit:
+- has no `PrivateDevices=yes` (it hides every `/dev/nvidia*`), and no `DevicePolicy=closed|strict` or
+  `DeviceAllow=` (any allow-list blocks every device it doesn't name);
+- has no `ProtectClock=yes`. On systemd < 252, which includes Ubuntu 22.04's systemd 249, that setting implies
+  `DeviceAllow=char-rtc r` and blocks the GPUs the same way
+  ([systemd#18142](https://github.com/systemd/systemd/issues/18142)). Without capabilities the service can't
+  set the clock anyway;
+- has no `ProcSubset=pid` (it hides `/proc/driver/nvidia`) or `ProtectProc=invisible`;
+- sets `MemoryDenyWriteExecute=no`. NVIDIA doesn't document libnvidia-ml as W^X-safe. Its 470 and 580 builds
+  have no executable stack, text relocations or W+X segments, but some memory protections are computed at run
+  time and it can load `libcuda.so.1`. For a Python service the setting adds little;
+- keeps `SystemCallFilter=@system-service`. libnvidia-ml's system calls (`ioctl`, `mmap`, the NUMA calls in
+  `@resources`, fork+exec of nvidia-modprobe) are all in that set. The one exception, `iopl`, needs
+  `CAP_SYS_RAWIO` anyway.
+
+`tests/collector/test_collector_linux.py` fails if the unit gains any of those blockers. To restrict devices
+in a drop-in anyway, allow the NVIDIA majors too: `DevicePolicy=closed` plus `DeviceAllow=char-nvidia* rw`
+(the pattern matches the `nvidia*` names in `/proc/devices`). With `NoNewPrivileges=yes`, NVML can't use the
+setuid `nvidia-modprobe` to create missing device nodes, so they must exist before the service runs:
+`sudo systemctl enable --now nvidia-persistenced` creates them at boot.
+
+**Troubleshooting.** NVML problems are logged as warnings in `journalctl -u lab-monitor-metrics.service` and
+`collector.log`. `NVIDIA GPU stats unavailable: NVML could not start (...)` names the cause:
+
+| NVML error | Likely cause |
+|------------|--------------|
+| `Driver Not Loaded`, `Unknown Error` | kernel module not loaded, `/dev/nvidiactl` missing, or a sandbox blocks the devices |
+| `Insufficient Permissions` | `/dev/nvidia*` not readable by `labmon` (`NVreg_DeviceFileMode` / `NVreg_DeviceFileGID`): add `labmon` to that group |
+| `RM has detected an NVML/RM version mismatch` | driver upgraded without a reboot: reboot |
+| `NVML Shared Library Not Found` | `libnvidia-ml.so.1` not in `ldconfig -p` (driver's NVML package missing) |
+
+`NVML errors (values sent as null): GPU 1 utilization: ...` means a single query failed. "Not supported"
+(e.g. no power sensor) is normal and isn't logged.
+
+**First-install checklist (GPU servers):**
+```bash
+# 1. NVML works for the service user (prints the number of GPUs)
+sudo -u labmon /opt/lab-monitor/venv/bin/python -s -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlDeviceGetCount())"
+# 2. The service found them, and NVML logged no errors
+journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'GPUs:|NVML'
+# 3. The collector's values match the driver's
+nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv
+```
+Compare step 3 with the GPU section of the device's Dashboard card, or with the `GPUs:` log line and
+`gpu_N_*` fields in `/var/lib/lab-monitor/<name>/<YYYY-MM>.jsonl`. Temperature should agree within a degree
+or two and power within a few watts. Utilization is a sample, so compare under a steady load. VRAM used can
+differ by the driver-reserved amount (a few hundred MiB), since NVML's memory queries and nvidia-smi
+account for reserved memory differently.
+
+Not reported yet on either platform, and possible later additions: per-user GPU memory (from NVML's
+per-process lists), fan speed, clocks, ECC errors and throttle reasons.
+
 ---
 
 ## Dependencies
 
 - `requests` — HTTP POST to Manager (required)
 - `psutil` — CPU, RAM, network measurements (optional; `/proc` fallbacks on Linux/Synology)
-- `nvidia-ml-py` — NVIDIA GPU stats (optional; `requirements-gpu.txt`)
+- `nvidia-ml-py` — NVIDIA GPU stats (optional; `requirements-gpu.txt`; see [GPU servers](#gpu-servers))
 
 ```bash
 pip install -r requirements.txt

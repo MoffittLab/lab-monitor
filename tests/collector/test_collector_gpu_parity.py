@@ -1,0 +1,651 @@
+"""
+Windows / Linux parity of what a GPU server reports.
+
+An Ubuntu GPU server must send the Manager the same data as the Windows GPU
+servers. The collector code is shared, so these tests run the real collection
+paths -- collect_metrics() and collect_disk_usage(), through the archive and
+the queue to the POST the (fake) Manager receives -- once with the process
+behaving as Windows and once as Linux, with the same fake NVML (two GPUs; the
+second can't report utilisation, temperature or power) and equivalent fake
+psutil data. The messages on the wire are compared: key sets (*_unit keys
+included), value types, units, and the GPU values.
+
+"Behaving as Windows" means the Windows *platform branches*: sys.platform
+'win32' and no "platform" key in the config (so detection, the data dir, the
+PowerShell folder scan, the Windows skip rules and the per-user code without
+psutil's 'uids' all take their Windows paths), Windows account and NIC names.
+As Linux: sys.platform 'linux', the config the Linux installer writes, the
+collector running as the system account labmon, /etc/login.defs, and a
+/sys/class/net with docker interfaces. os.path stays this host's, so
+test_folder_usage_has_the_same_shape_and_sizes feeds POSIX paths to the
+Windows run; Windows *path handling* (backslash and forward-slash scan_paths,
+ntpath normalisation, case-insensitive duplicate and volume-root checks,
+drive-letter volume keys such as 'E:\\_total_bytes') is covered by
+test_folder_usage_with_windows_paths, which runs the scan-path logic with
+ntpath. With psutil present the metrics code has no Windows-only branch (only
+the wmic fallbacks, never reached here). Not covered: the msvcrt queue lock
+(chosen when lib.local_queue is imported), and real PowerShell / wmic output.
+
+The expected differences are listed in KNOWN_DIFFERENCES, with the reason
+(none of them is a key or type difference); any other difference fails.
+"""
+import contextlib
+import logging
+import ntpath
+import os
+import re
+import subprocess
+import sys
+import time
+import types
+from collections import Counter
+from datetime import datetime, timedelta
+
+import pytest
+
+posix_only = pytest.mark.skipif(sys.platform == 'win32', reason='the Linux folder scanner needs POSIX paths')
+
+GiB = 1024 ** 3
+MiB = 1024 ** 2
+
+# Expected differences between the Windows and the Linux messages. None of
+# them is a key or type difference in system_metrics, user_metrics or
+# folder_usage: those must be identical.
+KNOWN_DIFFERENCES = {
+    'user_metrics: Linux-only accounts': (
+        {'root'},
+        "Windows' default excludes hide its OS service accounts (NT AUTHORITY\\*, NT SERVICE\\*, "
+        "DWM-*, UMFD-*); Linux hides their counterparts, daemon accounts (UID below UID_MIN, such "
+        "as systemd-resolve, nvidia-persistenced and the collector's own labmon), by default "
+        "(exclude_system_accounts). root stays visible on purpose: docker containers and sudo jobs -- "
+        "real GPU workloads -- run as root, while on Windows an elevated job keeps its user's name. "
+        "So the root row also carries system services; exclude_users [\"root\"] hides it."),
+    'user_metrics: username format': (
+        None, "Windows names are DOMAIN\\user (psutil), Linux names are plain user names."),
+    'folder_usage: path keys': (
+        None, "Folder and volume keys are native paths (E:\\Data\\alice on Windows, /data/alice on Linux)."),
+}
+
+
+# ---------------------------------------------------------------------------
+# Fake NVML (nvidia-ml-py's pynvml module)
+# ---------------------------------------------------------------------------
+
+_NVML_STRINGS = {3: 'Not Supported', 4: 'Insufficient Permissions', 9: 'Driver Not Loaded',
+                 12: 'NVML Shared Library Not Found', 18: 'RM has detected an NVML/RM version mismatch.',
+                 999: 'Unknown Error'}
+
+
+class FakeNVMLError(Exception):
+    """Like pynvml.NVMLError: .value is the NVML return code, str() its description."""
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.value = value
+
+    def __str__(self):
+        return _NVML_STRINGS.get(self.value, f'NVML error code {self.value}')
+
+
+ns = types.SimpleNamespace
+
+# GPU 0 reports everything. GPU 1 (an older nvidia-ml-py returns the name as
+# bytes) has a utilisation query that fails and no temperature/power sensors.
+GPUS = [
+    {'Name': 'NVIDIA RTX A6000',
+     'UtilizationRates': ns(gpu=37, memory=21),
+     'MemoryInfo': ns(total=48 * GiB, used=12 * GiB, free=36 * GiB),
+     'Temperature': 61,
+     'PowerUsage': 215_340},                       # milliwatts
+    {'Name': b'Tesla T4',
+     'UtilizationRates': FakeNVMLError(999),
+     'MemoryInfo': ns(total=16 * GiB, used=1 * GiB, free=15 * GiB),
+     'Temperature': FakeNVMLError(3),
+     'PowerUsage': FakeNVMLError(3)},
+]
+
+
+def make_fake_pynvml(gpus=GPUS, init_error=None):
+    nvml = types.ModuleType('pynvml')
+    nvml.NVMLError = FakeNVMLError
+    nvml.NVML_TEMPERATURE_GPU = 0
+    nvml.NVML_ERROR_NOT_SUPPORTED = 3
+    nvml.calls = Counter()
+
+    def nvmlInit():
+        nvml.calls['init'] += 1
+        if init_error is not None:
+            raise init_error
+
+    def nvmlShutdown():
+        nvml.calls['shutdown'] += 1
+
+    def query(field):
+        def fn(handle, *args):
+            if field == 'Temperature':
+                assert args == (nvml.NVML_TEMPERATURE_GPU,)
+            value = handle[field]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        fn.__name__ = f'nvmlDeviceGet{field}'
+        return fn
+
+    nvml.nvmlInit = nvmlInit
+    nvml.nvmlShutdown = nvmlShutdown
+    nvml.nvmlDeviceGetCount = lambda: len(gpus)
+    nvml.nvmlDeviceGetHandleByIndex = lambda i: gpus[i]
+    for field in ('Name', 'UtilizationRates', 'MemoryInfo', 'Temperature', 'PowerUsage'):
+        setattr(nvml, f'nvmlDeviceGet{field}', query(field))
+    return nvml
+
+
+# ---------------------------------------------------------------------------
+# Fake psutil: the same workload as seen on each OS
+# ---------------------------------------------------------------------------
+
+OWN = object()      # stands for the collector's own pid
+ABSENT = object()   # no such process on this OS
+LABMON_UID = 998    # useradd --system: below UID_MIN
+
+# (pid, username on Windows, (username, uid) on Linux, rss, per-core cpu%, exits before the 2nd sample).
+# A username of None is one psutil couldn't read (AccessDenied on Windows).
+PROCESSES = [
+    (4,    'NT AUTHORITY\\SYSTEM',          ('root', 0),                 2 * GiB,   1.0, False),  # kernel, services
+    (OWN,  'NT AUTHORITY\\SYSTEM',          ('labmon', LABMON_UID),      40 * MiB,  3.0, False),  # this collector
+    (5000, 'NT AUTHORITY\\SYSTEM',          ('labmon', LABMON_UID),     300 * MiB, 95.0, False),  # the disk scan
+    (812,  'NT AUTHORITY\\NETWORK SERVICE', ('systemd-resolve', 101),    30 * MiB,  0.5, False),  # daemon accounts
+    (813,  'NT AUTHORITY\\LOCAL SERVICE',   ('messagebus', 102),          5 * MiB,  0.1, False),
+    (814,  'NT AUTHORITY\\SYSTEM',          ('nvidia-persistenced', 120), 3 * MiB,  0.0, False),
+    (815,  ABSENT,                          ('nobody', 65534),            2 * MiB,  0.0, False),
+    (1500, 'Window Manager\\DWM-1',         ABSENT,                      90 * MiB,  0.3, False),
+    (1600, 'Font Driver Host\\UMFD-0',      ABSENT,                       5 * MiB,  0.0, False),
+    (2001, 'LAB\\alice',                    ('alice', 1000),              8 * GiB, 400.0, False),  # training job
+    (2002, 'LAB\\alice',                    ('alice', 1000),              1 * GiB,  32.0, False),  # notebook
+    (2003, 'LAB\\bob',                      ('bob', 1001),                2 * GiB,  64.0, False),
+    (2004, 'LAB\\bob',                      ('bob', 1001),                3 * GiB,  50.0, True),   # exits mid-run
+    (2005, None,                            ABSENT,                       1 * GiB,  10.0, False),  # owner unreadable
+    (3001, ABSENT,                          ('root', 0),                  6 * GiB, 640.0, False),  # docker container
+]
+
+# Physical NIC traffic is the same on both. The Linux host also runs docker:
+# docker0 and one veth per container (counted on eno1 as well), and the
+# container behind veth3f2a stops before the second run.
+NICS = {'windows': ('Loopback Pseudo-Interface 1', 'Ethernet'), 'linux': ('lo', 'eno1')}
+LINUX_VIRTUAL_NICS = ('docker0', 'veth3f2a', 'veth9c1d')
+
+
+def make_fake_psutil(platform):
+    ps = types.ModuleType('psutil')
+
+    class NoSuchProcess(Exception):
+        pass
+
+    class AccessDenied(Exception):
+        pass
+
+    class Process:
+        def __init__(self, pid, user, rss, cpu, exits, attrs):
+            username, uid = user if isinstance(user, tuple) else (user, None)
+            self.pid = pid
+            self.info = {'pid': pid, 'username': username, 'memory_info': ns(rss=rss)}
+            if 'uids' in attrs:
+                assert platform == 'linux'         # an invalid attribute name for psutil on Windows
+                self.info['uids'] = ns(real=uid, effective=uid, saved=uid)
+            self._cpu, self._exits, self._samples = cpu, exits, 0
+
+        def cpu_percent(self, interval=None):
+            assert interval is None
+            self._samples += 1
+            if self._samples == 1:
+                return 0.0                     # psutil's first sample is always 0
+            if self._exits:
+                raise NoSuchProcess(self.pid)
+            return self._cpu
+
+    column = 1 if platform == 'windows' else 2
+    procs = [(os.getpid() if p[0] is OWN else p[0], p[column], *p[3:])
+             for p in PROCESSES if p[column] is not ABSENT]
+    loopback, physical = NICS[platform]
+    reads = Counter()
+
+    def net_io_counters(pernic=False):
+        assert pernic
+        reads['n'] += 1
+        n = reads['n']
+        nics = {loopback: ns(bytes_recv=10 ** 9 * n, bytes_sent=10 ** 9 * n),
+                physical: ns(bytes_recv=5_000_000 + 7_500_000 * n, bytes_sent=2_000_000 + 1_500_000 * n)}
+        if platform == 'linux':
+            nics['docker0'] = ns(bytes_recv=10 ** 8 * n, bytes_sent=10 ** 8 * n)
+            nics['veth9c1d'] = ns(bytes_recv=4 * 10 ** 7 * n, bytes_sent=4 * 10 ** 7 * n)
+            if n == 1:
+                nics['veth3f2a'] = ns(bytes_recv=6 * 10 ** 10, bytes_sent=6 * 10 ** 10)
+        return nics
+
+    ps.NoSuchProcess, ps.AccessDenied = NoSuchProcess, AccessDenied
+    ps.cpu_percent = lambda interval=None: 42.5
+    ps.cpu_count = lambda logical=True: 64
+    ps.virtual_memory = lambda: ns(percent=63.2, total=256 * GiB, available=94 * GiB)
+    ps.boot_time = lambda: time.time() - 90061
+    ps.net_io_counters = net_io_counters
+    ps.process_iter = lambda attrs=None: [Process(*p, attrs=attrs) for p in procs]
+    return ps
+
+
+# ---------------------------------------------------------------------------
+# Running the collector as Windows / as Linux
+# ---------------------------------------------------------------------------
+
+class Subprocesses:
+    """
+    Stand-ins for subprocess.run / check_output. PowerShell folder scans are
+    answered like Get-ChildItem -Recurse -Force -File | Measure-Object (sum
+    and count of every file, hidden ones included); anything else (wmic, ...)
+    is recorded as unexpected.
+    """
+
+    def __init__(self):
+        self.powershell = []
+        self.unexpected = []
+
+    def run(self, args, *a, env=None, **kw):
+        if args and args[0] == 'powershell' and sys.platform == 'win32':
+            path = env['LM_SCAN_PATH']
+            self.powershell.append(path)
+            total = count = 0
+            for dirpath, _dirs, files in os.walk(path):
+                for name in files:
+                    total += os.lstat(os.path.join(dirpath, name)).st_size
+                    count += 1
+            return subprocess.CompletedProcess(args, 0, stdout=f'{total} {count}\r\n', stderr='')
+        self.unexpected.append((sys.platform, args))
+        raise RuntimeError(f'unexpected subprocess.run({args!r})')
+
+    def check_output(self, args, *a, **kw):
+        self.unexpected.append((sys.platform, args))
+        raise RuntimeError(f'unexpected subprocess.check_output({args!r})')
+
+
+@pytest.fixture
+def hosts(collector, config, disk_usage, fake_manager, monkeypatch, tmp_path):
+    """
+    run(platform, fn) runs fn(config, logger) with the process behaving as that
+    OS and returns the messages POSTed to the fake Manager. nvml: a fake pynvml
+    module (default: make_fake_pynvml()), or 'absent' for no nvidia-ml-py.
+    """
+    procs = Subprocesses()
+    clock = {'t': datetime(2026, 11, 21, 10, 0, 0)}
+
+    def utcnow():
+        clock['t'] += timedelta(seconds=1)
+        return clock['t']
+    monkeypatch.setattr(collector, '_utcnow', utcnow)
+
+    configs = {
+        # As install-collector-windows.ps1 writes it: no "platform" (detected)
+        'windows': {**config, 'name': 'gpu-win', 'id': 'windows-gpu-win',
+                    'data_dir': str(tmp_path / 'state-windows'),
+                    'exclude_users': ['UMFD-*', 'NT AUTHORITY\\*', 'NT SERVICE\\*']},
+        # As install-collector-linux.sh writes it
+        'linux': {**config, 'name': 'gpu-linux', 'id': 'linux-gpu-linux', 'platform': 'linux',
+                  'data_dir': str(tmp_path / 'state-linux'), 'exclude_users': [],
+                  'exclude_system_accounts': True,
+                  'cross_filesystems': False, 'include_network_mounts': False},
+    }
+    psutils = {p: make_fake_psutil(p) for p in configs}
+
+    # The Linux host: Ubuntu's /etc/login.defs, and /sys/class/net with eno1
+    # (a PCI device) next to docker0 and the veths
+    login_defs = tmp_path / 'login.defs'
+    login_defs.write_text('UID_MIN\t\t\t 1000\nUID_MAX\t\t\t60000\n')
+    sys_class_net = tmp_path / 'sys-class-net'
+    for nic in ('lo', 'eno1') + LINUX_VIRTUAL_NICS:
+        (sys_class_net / nic).mkdir(parents=True)
+    (sys_class_net / 'eno1' / 'device').mkdir()
+
+    @contextlib.contextmanager
+    def behave_as(platform, nvml):
+        with monkeypatch.context() as m:
+            m.setattr(sys, 'platform', 'win32' if platform == 'windows' else 'linux')
+            # Platform detection: not Synology, whatever this test host is
+            m.setattr(disk_usage, 'SYNOLOGY_MARKERS', (str(tmp_path / 'no-synoinfo.conf'),))
+            # Win32-only helpers (PowerShell, wmic) never really run
+            m.setattr(subprocess, 'run', procs.run)
+            m.setattr(subprocess, 'check_output', procs.check_output)
+            m.setitem(sys.modules, 'pynvml', None if nvml == 'absent' else nvml)   # None: ImportError
+            m.setitem(sys.modules, 'psutil', psutils[platform])
+            if platform == 'linux':
+                # The scanned tree is on a local filesystem even if this host's /tmp is tmpfs
+                m.setattr(disk_usage, 'read_mounts',
+                          lambda path='/proc/self/mounts': [disk_usage.Mount('/dev/sda2', '/', 'ext4')])
+                m.setattr(collector, 'LOGIN_DEFS', str(login_defs))
+                m.setattr(collector, 'SYS_CLASS_NET', str(sys_class_net))
+                m.setattr(os, 'getuid', lambda: LABMON_UID, raising=False)   # the systemd unit's User=labmon
+            yield
+
+    def run(platform, fn, nvml=None, **config_changes):
+        nvml = nvml or make_fake_pynvml()
+        cfg = {**configs[platform], **config_changes}
+        sent_before = len(fake_manager.calls)
+        with behave_as(platform, nvml):
+            assert collector.get_platform(cfg) == platform
+            assert fn(cfg, logging.getLogger(f'test-{platform}')) is True
+        return [m for call in fake_manager.calls[sent_before:] for m in call['payload']['messages']]
+
+    return types.SimpleNamespace(run=run, procs=procs, configs=configs)
+
+
+def shape(value):
+    """The JSON structure of a value with every leaf replaced by its type name."""
+    if isinstance(value, dict):
+        return {k: shape(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [shape(v) for v in value]
+    return type(value).__name__
+
+
+def _by_type(messages, data_type):
+    return [m for m in messages if m['data']['data_type'] == data_type]
+
+
+def _plain_user(name):
+    return name.rsplit('\\', 1)[-1]
+
+
+# ---------------------------------------------------------------------------
+# system_metrics / user_metrics
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def metrics(hosts, collector):
+    """Two metrics runs per OS (the second has a bandwidth): {platform: [run1 messages, run2 messages]}."""
+    runs = {p: [hosts.run(p, collector.collect_metrics) for _ in range(2)] for p in ('windows', 'linux')}
+    assert hosts.procs.unexpected == []             # psutil present: no wmic, no PowerShell
+    return runs
+
+
+@pytest.mark.parametrize('run', [0, 1], ids=['first-run', 'second-run'])
+def test_system_metrics_have_the_same_keys_types_and_units(metrics, run):
+    win = _by_type(metrics['windows'][run], 'system_metrics')
+    lin = _by_type(metrics['linux'][run], 'system_metrics')
+    assert len(win) == len(lin) == 1
+    win, lin = win[0], lin[0]
+
+    assert set(win['data']) == set(lin['data'])                     # *_unit keys included
+    assert shape(win['data']) == shape(lin['data'])                 # value types, gpus list included
+    assert shape(win['header']) == shape(lin['header'])
+    assert win['header']['device_type'] == lin['header']['device_type'] == 'Server'
+    units = {k: v for k, v in win['data'].items() if k.endswith('_unit')}
+    assert units == {k: v for k, v in lin['data'].items() if k.endswith('_unit')}
+    # Every measured numeric field carries its unit
+    for key, value in win['data'].items():
+        if key.endswith('_unit') or key in ('data_type', 'gpus', 'gpu_count', 'uptime_formatted'):
+            continue
+        assert f'{key}_unit' in win['data'], key
+
+
+def test_gpu_fields_are_identical_on_windows_and_linux(metrics):
+    def gpu_fields(platform):
+        data = _by_type(metrics[platform][1], 'system_metrics')[0]['data']
+        return {k: v for k, v in data.items() if k.startswith('gpu')}
+
+    win, lin = gpu_fields('windows'), gpu_fields('linux')
+    assert win == lin
+    assert lin['gpu_count'] == 2
+    assert lin['gpus'] == [
+        {'index': 0, 'name': 'NVIDIA RTX A6000', 'gpu_percent': 37,
+         'vram_used_bytes': 12 * GiB, 'vram_total_bytes': 48 * GiB,
+         'vram_used_formatted': '12.0 GB', 'vram_total_formatted': '48.0 GB',
+         'temperature_c': 61, 'power_watts': 215.3},
+        # Unmeasurable values are null, never 0 (contract 4)
+        {'index': 1, 'name': 'Tesla T4', 'gpu_percent': None,
+         'vram_used_bytes': 1 * GiB, 'vram_total_bytes': 16 * GiB,
+         'vram_used_formatted': '1.0 GB', 'vram_total_formatted': '16.0 GB',
+         'temperature_c': None, 'power_watts': None},
+    ]
+    flat = {k: v for k, v in lin.items() if k not in ('gpus', 'gpu_count')}
+    assert flat == {
+        'gpu_0_percent': 37, 'gpu_0_percent_unit': '%',
+        'gpu_0_vram_used': 12 * GiB, 'gpu_0_vram_used_unit': 'bytes',
+        'gpu_0_temp_c': 61, 'gpu_0_temp_c_unit': '\u00b0C',
+        'gpu_0_power_w': 215.3, 'gpu_0_power_w_unit': 'W',
+        # GPU 1: utilisation unmeasured (null); no temperature/power sensor (omitted)
+        'gpu_1_percent': None, 'gpu_1_percent_unit': '%',
+        'gpu_1_vram_used': 1 * GiB, 'gpu_1_vram_used_unit': 'bytes',
+    }
+
+
+def test_system_values_match_for_the_same_machine_state(metrics):
+    def data(platform):
+        return _by_type(metrics[platform][1], 'system_metrics')[0]['data']
+
+    win, lin = data('windows'), data('linux')
+    for key in ('cpu_percent', 'ram_percent', 'total_ram_bytes', 'network_bytes_in', 'network_bytes_out'):
+        assert win[key] == lin[key], key
+    # Loopback not counted on either OS, nor docker0 / the veths on Linux. A
+    # container stopping between the runs (its veth gone) doesn't make the
+    # Linux counters drop, which the Manager would take as a reboot.
+    assert win['network_bytes_in'] == 5_000_000 + 7_500_000 * 2
+    assert abs(win['uptime_seconds'] - lin['uptime_seconds']) <= 5
+    for platform in ('windows', 'linux'):
+        first = _by_type(metrics[platform][0], 'system_metrics')[0]['data']
+        assert first['network_bandwidth_in_mbps'] is None            # no previous sample yet
+        assert isinstance(data(platform)['network_bandwidth_in_mbps'], float)
+
+
+def test_user_metrics_have_the_same_shape_and_values(metrics):
+    for run in (0, 1):
+        win = _by_type(metrics['windows'][run], 'user_metrics')
+        lin = _by_type(metrics['linux'][run], 'user_metrics')
+        assert win and lin
+        shapes = {repr(shape(m['data'])) for m in win + lin}
+        assert len(shapes) == 1, shapes                               # one shape for every message
+        assert shape(win[0]['header']) == shape(lin[0]['header'])
+        assert set(win[0]['data']) == {'data_type', 'username', 'cpu_percent', 'ram_bytes', 'ram_formatted'}
+
+    win = {_plain_user(m['data']['username']): m['data'] for m in _by_type(metrics['windows'][1], 'user_metrics')}
+    lin = {m['data']['username']: m['data'] for m in _by_type(metrics['linux'][1], 'user_metrics')}
+    assert {m['data']['username'] for m in _by_type(metrics['windows'][1], 'user_metrics')} == {'LAB\\alice', 'LAB\\bob'}
+
+    linux_only, _reason = KNOWN_DIFFERENCES['user_metrics: Linux-only accounts']
+    assert set(lin) - set(win) == linux_only
+    assert set(win) - set(lin) == set()
+    # The collector is never a user's workload, nor is the disk scan running
+    # at the same time: on Windows both run as SYSTEM (excluded), on Linux as
+    # labmon. Daemon accounts are hidden on both.
+    assert not {'labmon', 'systemd-resolve', 'messagebus', 'nvidia-persistenced', 'nobody'} & set(lin)
+    for user in ('alice', 'bob'):
+        assert {k: v for k, v in win[user].items() if k != 'username'} == \
+               {k: v for k, v in lin[user].items() if k != 'username'}, user
+    # Per-user CPU on the system's 0-100 % scale: (400 + 32) / 64 cores
+    assert lin['alice']['cpu_percent'] == 6.75 and lin['alice']['ram_bytes'] == 9 * GiB
+    assert lin['bob'] == {**lin['bob'], 'cpu_percent': 1.0, 'ram_bytes': 2 * GiB}   # the exited process isn't counted
+    assert lin['root']['cpu_percent'] == 10.02            # (1 + 640) / 64: system + the container
+
+
+def test_nvml_is_shut_down_after_every_run(hosts, collector):
+    for platform in ('windows', 'linux'):
+        nvml = make_fake_pynvml()
+        hosts.run(platform, collector.collect_metrics, nvml=nvml)
+        assert nvml.calls == Counter(init=1, shutdown=1)
+
+
+@pytest.mark.parametrize('code,hint', [
+    (9, 'kernel driver is not loaded, or /dev/nvidiactl cannot be opened'),
+    (12, 'NVML library'),
+    (18, 'reboot'),
+])
+def test_nvml_that_cannot_start_is_logged_the_same_on_both(hosts, collector, caplog, code, hint):
+    for platform in ('windows', 'linux'):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            messages = hosts.run(platform, collector.collect_metrics,
+                                 nvml=make_fake_pynvml(init_error=FakeNVMLError(code)))
+        data = _by_type(messages, 'system_metrics')[0]['data']
+        assert data['gpus'] == [] and data['gpu_count'] == 0
+        assert not [k for k in data if re.match(r'gpu_\d+_', k)]
+        warning = next(r.getMessage() for r in caplog.records if 'NVML could not start' in r.getMessage())
+        assert f'(NVML error {code})' in warning and hint in warning, warning
+
+
+def test_failing_nvml_queries_are_logged_but_not_supported_ones_are_not(hosts, collector, caplog):
+    with caplog.at_level(logging.WARNING):
+        hosts.run('linux', collector.collect_metrics)
+    warnings = [r.getMessage() for r in caplog.records if 'NVML errors' in r.getMessage()]
+    assert warnings == ['NVML errors (values sent as null): GPU 1 utilization: Unknown Error (NVML error 999).']
+
+
+def test_without_nvidia_ml_py_there_are_no_gpu_fields_and_no_warning(hosts, collector, caplog):
+    for platform in ('windows', 'linux'):
+        with caplog.at_level(logging.WARNING):
+            messages = hosts.run(platform, collector.collect_metrics, nvml='absent')
+        data = _by_type(messages, 'system_metrics')[0]['data']
+        assert data['gpus'] == [] and data['gpu_count'] == 0
+        assert not [k for k in data if re.match(r'gpu_\d+_', k)]
+    assert not [r for r in caplog.records if 'NVML' in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# folder_usage
+# ---------------------------------------------------------------------------
+
+def _write(path, size):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(b'x' * size)
+
+
+def _folder_shape(data, base, pathmod=os.path):
+    """folder_usage split into metadata (types), volumes (types, path-free keys) and folders (relative path -> bytes)."""
+    volumes = data['_volumes']
+    meta, vols, folders = {}, {}, {}
+    for key, value in data.items():
+        if key.startswith('_') or key in ('data_type', 'total_usage'):
+            meta[key] = shape(value)
+            continue
+        vol = next((v for v in volumes if key in (v, f'{v}_total_bytes', f'{v}_free_bytes')), None)
+        if vol is not None:
+            vols['<volume>' + key[len(vol):]] = shape(value)
+        else:
+            folders[pathmod.relpath(key, base).replace(pathmod.sep, '/')] = value
+    return meta, vols, folders
+
+
+@posix_only
+def test_folder_usage_has_the_same_shape_and_sizes(hosts, collector, tmp_path):
+    srv = tmp_path / 'srv'
+    _write(str(srv / 'data' / 'alice' / 'results' / 'run1.bin'), 3000)
+    _write(str(srv / 'data' / 'alice' / 'results' / '.ipynb_checkpoints' / 'x'), 200)   # hidden: counted
+    _write(str(srv / 'data' / 'alice' / 'notes.txt'), 50)
+    _write(str(srv / 'data' / 'bob' / 'model.pt'), 5000)
+    _write(str(srv / 'data' / 'bob' / 'deep' / 'a' / 'b' / 'c.txt'), 7)
+    os.makedirs(srv / 'data' / 'empty-project')
+    _write(str(srv / 'data' / '.cache' / 'blob'), 999)                                   # hidden folder: skipped
+    _write(str(srv / 'shared' / 'readme'), 123)
+    changes = {'volumes': [str(srv)], 'scan_paths': [f'{srv}/data/*', str(srv / 'shared')]}
+
+    win = hosts.run('windows', collector.collect_disk_usage, **changes)
+    assert len(hosts.procs.powershell) == 4                 # Windows measured through PowerShell
+    lin = hosts.run('linux', collector.collect_disk_usage, **changes)
+    assert len(hosts.procs.powershell) == 4                 # ... Linux with the Python scanner
+    assert hosts.procs.unexpected == []
+
+    assert len(win) == len(lin) == 1
+    assert shape(win[0]['header']) == shape(lin[0]['header'])
+    win_meta, win_vols, win_folders = _folder_shape(win[0]['data'], str(srv))
+    lin_meta, lin_vols, lin_folders = _folder_shape(lin[0]['data'], str(srv))
+    assert win_meta == lin_meta
+    assert win_vols == lin_vols == {'<volume>': 'int', '<volume>_total_bytes': 'int', '<volume>_free_bytes': 'int'}
+    assert win_folders == lin_folders == {
+        'data/alice': 3250, 'data/bob': 5007, 'data/empty-project': 0, 'shared': 123}
+    for data in (win[0]['data'], lin[0]['data']):
+        assert data['_unit'] == 'bytes' and data['_timed_out'] == [] and data['_errors'] == []
+        assert data['_volumes'] == [str(srv)]
+
+
+# A Windows GPU server's E: drive, as the collector sees it through ntpath
+WIN_DIRS = {'E:\\': ['Data', 'Shared'], 'E:\\Data': ['alice', 'bob', 'empty-project'],
+            'E:\\Data\\alice': [], 'E:\\Data\\bob': [], 'E:\\Data\\empty-project': [], 'E:\\Shared': []}
+WIN_SIZES = {'E:\\Data\\alice': 3250, 'E:\\Data\\bob': 5007, 'E:\\Data\\empty-project': 0, 'E:\\Shared': 123}
+
+
+def _ntkey(path):
+    return ntpath.normcase(ntpath.normpath(path)).rstrip('\\') or path
+
+
+@posix_only
+def test_folder_usage_with_windows_paths(hosts, collector, monkeypatch, tmp_path):
+    """
+    The scan_paths / volume logic with Windows path semantics (ntpath, '\\'),
+    against the same tree measured by the Linux scanner. Listing and measuring
+    are stubbed (E: doesn't exist here); everything between scan_paths and the
+    message -- glob parsing, normalisation, the volume-root and duplicate
+    checks, key naming -- is the real code.
+    """
+    dirs = {_ntkey(d): d for d in WIN_DIRS}
+    win_path = types.ModuleType('ntpath')
+    win_path.__dict__.update(ntpath.__dict__)
+    win_path.isdir = lambda p: _ntkey(p) in dirs
+    win_os = types.ModuleType('os')
+    win_os.__dict__.update(os.__dict__)
+    win_os.path, win_os.sep, win_os.altsep = win_path, '\\', '/'
+
+    listed, measured = [], []
+
+    def discover_folders(root, nas_type, validate_volume=True, raise_errors=False):
+        assert nas_type == 'windows'
+        listed.append(root)
+        return [ntpath.join(root, name) for name in WIN_DIRS[dirs[_ntkey(root)]]]
+
+    def scan_folders(folders, timeout=None, deadline=None):
+        measured.extend(folders)
+        return {'sizes': {f: WIN_SIZES[dirs[_ntkey(f)]] for f in folders}, 'timed_out': [], 'errors': []}
+
+    def measure_volume_capacity(vol):
+        return {'total_bytes': 4 * 10 ** 12, 'free_bytes': 3 * 10 ** 12} if _ntkey(vol) == 'e:' else {}
+
+    real_measure = collector._measure_scan_paths
+
+    def measure_with_ntpath(*args, **kwargs):
+        with monkeypatch.context() as m:
+            m.setattr(collector, 'os', win_os)
+            return real_measure(*args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(collector, '_measure_scan_paths', measure_with_ntpath)
+        m.setattr(collector, 'discover_folders', discover_folders)
+        m.setattr(collector, 'scan_folders', scan_folders)
+        m.setattr(collector, 'measure_volume_capacity', measure_volume_capacity)
+        win = hosts.run('windows', collector.collect_disk_usage, volumes=['E:\\'], scan_paths=[
+            'E:\\Data\\*',          # backslash glob
+            'e:/Shared',            # forward slashes, other case
+            'E:',                   # the volume root ('E:\\'): reported from capacity, not scanned
+            'E:\\data\\ALICE\\',    # already measured through the glob (case-insensitive)
+        ])
+    assert listed == ['E:\\Data']
+    assert measured == ['E:\\Data\\alice', 'E:\\Data\\bob', 'E:\\Data\\empty-project', 'e:\\Shared']
+    assert hosts.procs.powershell == [] and hosts.procs.unexpected == []
+
+    data = win[0]['data']
+    assert {k: v for k, v in data.items() if not k.startswith('_') and k != 'data_type'} == {
+        'E:\\Data\\alice': 3250, 'E:\\Data\\bob': 5007, 'E:\\Data\\empty-project': 0, 'e:\\Shared': 123,
+        'E:\\': 10 ** 12, 'E:\\_total_bytes': 4 * 10 ** 12, 'E:\\_free_bytes': 3 * 10 ** 12,
+        'total_usage': 10 ** 12}
+    assert data['_volumes'] == ['E:\\'] and data['_errors'] == [] and data['_timed_out'] == []
+
+    # The same tree on the Linux server
+    srv = tmp_path / 'srv'
+    for folder, size in WIN_SIZES.items():
+        linux_folder = srv.joinpath(*folder[len('E:\\'):].split('\\'))
+        if size:
+            _write(str(linux_folder / 'f.bin'), size)
+        else:
+            os.makedirs(linux_folder)
+    lin = hosts.run('linux', collector.collect_disk_usage, volumes=[str(srv)],
+                    scan_paths=[f'{srv}/Data/*', f'{srv}/Shared', str(srv), f'{srv}/Data/alice/'])
+
+    win_meta, win_vols, win_folders = _folder_shape(data, 'E:\\', ntpath)
+    lin_meta, lin_vols, lin_folders = _folder_shape(lin[0]['data'], str(srv))
+    assert win_meta == lin_meta
+    assert win_vols == lin_vols == {'<volume>': 'int', '<volume>_total_bytes': 'int', '<volume>_free_bytes': 'int'}
+    assert win_folders == lin_folders == {'Data/alice': 3250, 'Data/bob': 5007, 'Data/empty-project': 0, 'Shared': 123}

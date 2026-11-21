@@ -22,5 +22,6 @@
   "request_timeout_seconds": 30,
   "max_batch_messages": 100,
   "max_queue_messages": 50000,
+  "exclude_system_accounts": true,
   "exclude_users": []
 }

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -426,6 +427,157 @@ def test_per_user_stats_without_psutil_is_empty_not_an_error(collector, config, 
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
+class _UserProcs:
+    """
+    Fake psutil for per-user metrics: process_iter() over (pid, username, uid,
+    rss, per-core cpu%) rows; pid None stands for the collector's own process.
+    uid None: psutil couldn't read it (no 'uids' value).
+    """
+
+    def __init__(self, monkeypatch, rows, cpus=8):
+        self.attrs = []
+        ps = types.ModuleType('psutil')
+        ps.NoSuchProcess = type('NoSuchProcess', (Exception,), {})
+        ps.AccessDenied = type('AccessDenied', (Exception,), {})
+        ps.cpu_count = lambda logical=True: cpus
+
+        def process_iter(attrs=None):
+            self.attrs.append(list(attrs))
+            return [_UserProc(os.getpid() if pid is None else pid, user, uid, rss, cpu, 'uids' in attrs)
+                    for pid, user, uid, rss, cpu in rows]
+        ps.process_iter = process_iter
+        monkeypatch.setitem(sys.modules, 'psutil', ps)
+
+
+class _UserProc:
+    def __init__(self, pid, username, uid, rss, cpu, with_uids):
+        self.pid = pid
+        self.info = {'pid': pid, 'username': username, 'memory_info': types.SimpleNamespace(rss=rss)}
+        if with_uids:
+            self.info['uids'] = None if uid is None else types.SimpleNamespace(real=uid, effective=uid, saved=uid)
+        self._cpu, self._samples = cpu, 0
+
+    def cpu_percent(self, interval=None):
+        self._samples += 1
+        return 0.0 if self._samples == 1 else self._cpu
+
+
+MiB = 1024 ** 2
+LABMON_UID = 998
+# A Ubuntu GPU server during the nightly disk scan
+GPU_SERVER_PROCS = [
+    (None, 'labmon',              LABMON_UID, 40 * MiB,    3.0),   # this metrics run
+    (5000, 'labmon',              LABMON_UID, 300 * MiB,  95.0),   # lab-monitor-disk.service
+    (1,    'root',                0,          12 * MiB,    0.1),   # systemd, kernel threads, dockerd ...
+    (3001, 'root',                0,          6 * 1024 * MiB, 640.0),   # a docker container's job
+    (610,  'systemd-resolve',     101,        20 * MiB,    0.2),
+    (620,  'messagebus',          102,        5 * MiB,     0.1),
+    (630,  'nvidia-persistenced', 120,        3 * MiB,     0.0),
+    (640,  'nobody',              65534,      2 * MiB,     0.0),
+    (650,  '999',                 999,        512 * MiB,  80.0),   # container user without a host account
+    (2001, 'alice',               1000,       8 * 1024 * MiB, 400.0),
+    (2002, 'bob',                 1001,       2 * 1024 * MiB, 64.0),
+]
+
+
+@pytest.fixture
+def ubuntu_accounts(collector, monkeypatch, tmp_path):
+    """/etc/login.defs as on Ubuntu, the collector running as labmon (a system account)."""
+    login_defs = tmp_path / 'login.defs'
+    login_defs.write_text('# comment\nUID_MIN\t\t\t 1000\nUID_MAX\t\t\t60000\nSYS_UID_MIN\t\t  100\n')
+    monkeypatch.setattr(collector, 'LOGIN_DEFS', str(login_defs))
+    monkeypatch.setattr(os, 'getuid', lambda: LABMON_UID)
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    return login_defs
+
+
+def _users(collector, config, monkeypatch, rows=GPU_SERVER_PROCS):
+    fake = _UserProcs(monkeypatch, rows)
+    seeded = collector._seed_user_processes(config)
+    stats = collector.get_per_user_stats(config, logging.getLogger('test'), seeded_procs=seeded)
+    return {u['username']: u for u in stats}, fake
+
+
+def test_linux_per_user_metrics_leave_out_the_collector_and_daemon_accounts(
+        collector, config, monkeypatch, ubuntu_accounts):
+    config['platform'] = 'linux'
+    users, fake = _users(collector, config, monkeypatch)
+    # Neither the metrics run nor the concurrent disk scan (both labmon), nor
+    # systemd-resolve / messagebus / nvidia-persistenced / nobody
+    assert set(users) == {'alice', 'bob', 'root', '999'}
+    assert users['root']['cpu_percent'] == round(640.1 / 8, 2)
+    assert users['999']['ram_bytes'] == 512 * MiB          # no account here: a container's user, shown
+    assert fake.attrs == [['pid', 'username', 'memory_info', 'uids']]
+
+
+def test_linux_system_accounts_can_be_shown_but_never_the_collector(
+        collector, config, monkeypatch, ubuntu_accounts):
+    config.update(platform='linux', exclude_system_accounts=False)
+    users, _ = _users(collector, config, monkeypatch)
+    assert set(users) == {'alice', 'bob', 'root', '999', 'systemd-resolve', 'messagebus',
+                          'nvidia-persistenced', 'nobody'}      # labmon still hidden
+
+
+def test_exclude_users_still_applies(collector, config, monkeypatch, ubuntu_accounts):
+    config.update(platform='linux', exclude_users=['root', 'b*'])
+    users, _ = _users(collector, config, monkeypatch)
+    assert set(users) == {'alice', '999'}
+
+
+def test_collector_run_by_hand_as_a_regular_user_counts_that_users_other_processes(
+        collector, config, monkeypatch, ubuntu_accounts):
+    monkeypatch.setattr(os, 'getuid', lambda: 1000)        # alice runs it
+    config['platform'] = 'linux'
+    rows = [(None, 'alice', 1000, 40 * MiB, 3.0), (2001, 'alice', 1000, 1024 * MiB, 400.0),
+            (5000, 'labmon', LABMON_UID, 300 * MiB, 95.0)]
+    users, _ = _users(collector, config, monkeypatch, rows)
+    assert set(users) == {'alice'} and users['alice']['ram_bytes'] == 1024 * MiB   # own process only
+
+
+@pytest.mark.parametrize('content,uid_min', [
+    ('UID_MIN 500\n', 500),
+    ('#UID_MIN 500\nUID_MIN\t2000 # site policy\n', 2000),
+    ('UID_MIN\n', 1000), ('UID_MIN abc\n', 1000), ('', 1000), (None, 1000),
+])
+def test_uid_min_comes_from_login_defs(collector, monkeypatch, tmp_path, content, uid_min):
+    path = tmp_path / 'login.defs'
+    if content is not None:
+        path.write_text(content)
+    monkeypatch.setattr(collector, 'LOGIN_DEFS', str(path))
+    assert collector._uid_min() == uid_min
+
+
+def test_system_account_range_follows_uid_min(collector, config, monkeypatch, ubuntu_accounts):
+    ubuntu_accounts.write_text('UID_MIN 500\n')            # an old RHEL-style layout
+    config['platform'] = 'linux'
+    rows = [(2001, 'olduser', 600, MiB, 8.0), (610, 'daemon', 2, MiB, 8.0)]
+    users, _ = _users(collector, config, monkeypatch, rows)
+    assert set(users) == {'olduser'}
+
+
+def test_synology_keeps_showing_system_accounts_by_default(collector, config, monkeypatch, ubuntu_accounts):
+    monkeypatch.setattr(os, 'getuid', lambda: 0)            # DSM Task Scheduler runs it as root
+    config['platform'] = 'synology'
+    rows = [(1, 'root', 0, MiB, 1.0), (700, 'postgres', 55, MiB, 1.0), (2001, 'alice', 1026, MiB, 8.0)]
+    users, _ = _users(collector, config, monkeypatch, rows)
+    assert set(users) == {'root', 'postgres', 'alice'}
+
+
+def test_unreadable_uid_falls_back_to_the_name(collector, config, monkeypatch, ubuntu_accounts):
+    config['platform'] = 'linux'
+    rows = [(610, 'systemd-resolve', None, MiB, 1.0), (2001, 'alice', 1000, MiB, 8.0)]
+    users, _ = _users(collector, config, monkeypatch, rows)
+    assert set(users) == {'systemd-resolve', 'alice'}       # can't tell: counted, as before
+
+
+def test_windows_does_not_ask_psutil_for_uids(collector, config, monkeypatch):
+    monkeypatch.setattr(sys, 'platform', 'win32')           # 'uids' would raise ValueError there
+    rows = [(None, 'NT AUTHORITY\\SYSTEM', None, MiB, 1.0), (2001, 'LAB\\alice', None, MiB, 8.0)]
+    users, fake = _users(collector, config, monkeypatch, rows)
+    assert set(users) == {'LAB\\alice'}
+    assert fake.attrs == [['pid', 'username', 'memory_info']]
+
+
 @linux_only
 def test_metrics_from_proc_without_psutil(collector, config, monkeypatch):
     monkeypatch.setitem(sys.modules, 'psutil', None)
@@ -515,6 +667,7 @@ def test_print_config_defaults(monkeypatch):
     assert config['scan_paths'][0] == '/home/*'
     assert re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', config['name'])
     assert config['device_type'] == 'Server'
+    assert config['exclude_system_accounts'] is True and config['exclude_users'] == []
     proc, config = _print_config('--token', TOKEN, '--scan-paths', 'none', '--volumes', 'auto')
     assert config['scan_paths'] == [] and 'volumes' not in config
 
@@ -675,9 +828,12 @@ def _seconds(value):
 HARDENING = {
     'NoNewPrivileges': 'yes', 'ProtectSystem': 'strict', 'PrivateTmp': 'yes',
     'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes', 'LockPersonality': 'yes',
-    'MemoryDenyWriteExecute': 'yes', 'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX',
+    'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX', 'SystemCallFilter': '@system-service',
     'ReadWritePaths': '/var/lib/lab-monitor /var/log/lab-monitor', 'User': 'labmon', 'Type': 'oneshot',
 }
+# The metrics unit loads the NVIDIA driver's libnvidia-ml, which isn't known to
+# be W^X-safe (see the comment in the unit); the disk unit loads nothing native.
+MEMORY_DENY_WRITE_EXECUTE = {'metrics': 'no', 'disk': 'yes'}
 
 
 @pytest.mark.parametrize('mode', ['metrics', 'disk'])
@@ -685,6 +841,7 @@ def test_service_units_are_hardened(mode):
     svc = _unit(f'lab-monitor-{mode}.service')['Service']
     for key, value in HARDENING.items():
         assert svc.get(key) == [value], key
+    assert svc.get('MemoryDenyWriteExecute') == [MEMORY_DENY_WRITE_EXECUTE[mode]]
     # -s: no user site-packages from labmon's writable HOME (see test_user_site_is_off_in_units)
     assert svc['ExecStart'] == [
         '/opt/lab-monitor/venv/bin/python -s /opt/lab-monitor/collector/collector.py '
@@ -700,6 +857,64 @@ def test_metrics_unit_has_no_capabilities_and_a_short_timeout():
     assert svc['CapabilityBoundingSet'] == [''] and svc.get('AmbientCapabilities', ['']) == ['']
     assert svc['ProtectHome'] == ['yes']
     assert _seconds(svc['TimeoutStartSec'][0]) < 5 * 60
+
+
+_TRUE = ('yes', 'true', 'on', '1')
+
+
+def nvml_blockers(svc):
+    """
+    Settings of a [Service] section ({key: [values]}) that keep NVML from the
+    GPUs: hidden or blocked /dev/nvidia* nodes, or a hidden /proc/driver/nvidia.
+    """
+    def last(key):
+        values = svc.get(key)
+        return values[-1].strip().lower() if values else None
+
+    problems = []
+    if last('PrivateDevices') in _TRUE:
+        problems.append('PrivateDevices=yes hides /dev/nvidia*')
+    if last('ProcSubset') == 'pid':
+        problems.append('ProcSubset=pid hides /proc/driver/nvidia')
+    allows = [v for v in svc.get('DeviceAllow', []) if v.strip()]
+    # Any DeviceAllow= entry, DevicePolicy=closed/strict, and on systemd < 252
+    # ProtectClock=yes (an implicit DeviceAllow=char-rtc r) block every device not listed
+    if last('DevicePolicy') in ('closed', 'strict') or allows or last('ProtectClock') in _TRUE:
+        if not any(re.match(r'(char-nvidia|/dev/nvidia)', a.split()[0]) for a in allows):
+            problems.append('devices are restricted without a DeviceAllow= for the NVIDIA devices '
+                            '(e.g. DeviceAllow=char-nvidia* rw)')
+    for key in ('InaccessiblePaths', 'TemporaryFileSystem', 'NoExecPaths'):
+        for value in ' '.join(svc.get(key, [])).split():
+            path = value.lstrip('-+').split(':')[0].rstrip('/')
+            if any(p == path or p.startswith(path + '/') for p in
+                   ('/dev/nvidiactl', '/proc/driver/nvidia', '/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1')):
+                problems.append(f'{key}={value} covers what NVML needs')
+    return problems
+
+
+def test_metrics_unit_lets_nvml_reach_the_gpus():
+    svc = _unit('lab-monitor-metrics.service')['Service']
+    assert nvml_blockers(svc) == []
+    # NVML talks to nvidia-persistenced over AF_UNIX
+    assert 'AF_UNIX' in svc['RestrictAddressFamilies'][0].split()
+
+
+@pytest.mark.parametrize('extra,blocked', [
+    ({'PrivateDevices': ['yes']}, True),
+    ({'DevicePolicy': ['closed']}, True),
+    ({'DevicePolicy': ['strict'], 'DeviceAllow': ['/dev/null rw']}, True),
+    ({'DeviceAllow': ['char-rtc r']}, True),                     # policy "auto" + any allow-list
+    ({'ProtectClock': ['yes']}, True),                           # implicit char-rtc on systemd < 252
+    ({'ProcSubset': ['pid']}, True),
+    ({'InaccessiblePaths': ['/proc/driver']}, True),
+    ({'DevicePolicy': ['closed'], 'DeviceAllow': ['char-nvidia* rw']}, False),
+    ({'ProtectClock': ['yes'], 'DeviceAllow': ['char-nvidia* rw', 'char-rtc r']}, False),
+    ({'DevicePolicy': ['auto']}, False),
+    ({'PrivateDevices': ['no']}, False),
+])
+def test_nvml_blockers_are_recognised(extra, blocked):
+    svc = {**_unit('lab-monitor-metrics.service')['Service'], **extra}
+    assert bool(nvml_blockers(svc)) is blocked, nvml_blockers(svc)
 
 
 def test_disk_unit_reads_everything_without_root():
@@ -1088,3 +1303,206 @@ def test_install_lock_is_in_a_root_only_directory():
     assert '/run/lock' not in re.sub(r'#.*', '', text)
     # install and uninstall both take it
     assert text.count('take_install_lock\n') >= 2
+
+
+# --- installer: NVIDIA GPU servers --------------------------------------------
+
+PROC_NVIDIA_VERSION = ('NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  535.183.01  Release Build  '
+                       '(dvs-builder@U16-I3-B03-4-3)  Tue May 14 13:28:42 UTC 2024\nGCC version:  gcc 12.3.0\n')
+LDCONFIG_CACHE = ('1234 libs found in cache `/etc/ld.so.cache\'\n'
+                  '\tlibnvidia-ml.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libnvidia-ml.so.1\n'
+                  '\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6\n')
+
+
+def _gpu_host(tmp_path, proc_version=False, ldconfig_nvml=False, nvidia_smi=False):
+    """
+    Shell lines that make the installer see a host with the given signs of an
+    NVIDIA driver: a PATH with only the tools it needs (a fake ldconfig, and a
+    fake nvidia-smi if asked), and NVIDIA_PROC_VERSION in tmp_path.
+    """
+    bindir = tmp_path / 'bin'
+    bindir.mkdir(exist_ok=True)
+    for tool in ('head', 'awk', 'grep', 'tail', 'sed', 'stat', 'cat', 'mktemp', 'rm', 'dirname'):
+        target = shutil.which(tool)
+        if target and not (bindir / tool).exists():
+            os.symlink(target, bindir / tool)
+    cache = tmp_path / 'ld.so.cache.txt'
+    cache.write_text(LDCONFIG_CACHE if ldconfig_nvml else LDCONFIG_CACHE.replace('libnvidia-ml', 'libother'))
+    (bindir / 'ldconfig').write_text(f'#!/bin/sh\n[ "$1" = -p ] && cat "{cache}"\n')
+    (bindir / 'ldconfig').chmod(0o755)
+    if nvidia_smi:
+        (bindir / 'nvidia-smi').write_text('#!/bin/sh\nexit 0\n')
+        (bindir / 'nvidia-smi').chmod(0o755)
+    version = tmp_path / 'nvidia-version'
+    if proc_version:
+        version.write_text(PROC_NVIDIA_VERSION)
+    return f'PATH="{bindir}"\nNVIDIA_PROC_VERSION="{version}"\n'
+
+
+@needs_bash
+@pytest.mark.parametrize('signs,expected', [
+    ({}, []),
+    ({'proc_version': True}, ['kernel driver 535.183.01 loaded (']),
+    ({'ldconfig_nvml': True}, ['NVML library /lib/x86_64-linux-gnu/libnvidia-ml.so.1 (ldconfig -p)']),
+    ({'nvidia_smi': True}, ['nvidia-smi (']),
+    ({'proc_version': True, 'ldconfig_nvml': True, 'nvidia_smi': True},
+     ['kernel driver 535.183.01 loaded (', 'NVML library ', 'nvidia-smi (']),
+])
+def test_installer_detects_an_nvidia_driver_by_any_sign(tmp_path, signs, expected):
+    proc = run_sourced(_gpu_host(tmp_path, **signs) + 'decide_gpu_support 0\necho "wanted=$GPU_WANTED"')
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert f'wanted={int(bool(expected))}' in out
+    found = [l.strip()[2:] for l in out.splitlines() if l.startswith('  - ')]
+    assert len(found) == len(expected) and all(f.startswith(e) for f, e in zip(found, expected)), out
+    if not expected:
+        assert 'No NVIDIA driver detected' in out
+
+
+@needs_bash
+def test_installer_keeps_gpu_support_on_upgrade_without_a_visible_driver(tmp_path):
+    proc = run_sourced(_gpu_host(tmp_path) + 'decide_gpu_support 1\necho "wanted=$GPU_WANTED"')
+    assert 'wanted=1' in proc.stdout and 'installed by an earlier run' in proc.stdout, proc.stdout
+
+
+FAKE_VENV_PYTHON = '''#!/bin/bash
+echo "$*" >>"$LOG"
+case "$*" in
+    *"import pynvml"*) exit "$HAD_PYNVML" ;;
+esac
+exit 0
+'''
+
+
+@needs_bash
+@pytest.mark.parametrize('had_pynvml,signs,gpu_installed', [
+    (False, {}, False),                          # no GPU: nothing extra
+    (True, {}, True),                            # upgrade: kept although no driver is visible now
+    (False, {'proc_version': True}, True),       # kernel module loaded, no nvidia-smi on PATH
+    (False, {'ldconfig_nvml': True}, True),
+])
+def test_setup_venv_installs_requirements_gpu(tmp_path, had_pynvml, signs, gpu_installed):
+    venv, code, log = tmp_path / 'venv', tmp_path / 'code', tmp_path / 'log'
+    (venv / 'bin').mkdir(parents=True)
+    code.mkdir()
+    (venv / 'bin' / 'python').write_text(FAKE_VENV_PYTHON)
+    (venv / 'bin' / 'python').chmod(0o755)
+    script = (_gpu_host(tmp_path, **signs) +
+              f'VENV_DIR="{venv}"\nCODE_DIR="{code}"\n'
+              'venv_healthy() { return 0; }\n'
+              'check_nvml_access() { echo "nvml-check wanted=$GPU_WANTED"; }\n'
+              'setup_venv')
+    proc = run_sourced(script, env={'LOG': str(log), 'HAD_PYNVML': '0' if had_pynvml else '1'})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = log.read_text()
+    assert f'-r {code}/requirements.txt' in calls
+    assert (f'-r {code}/requirements-gpu.txt' in calls) is gpu_installed, calls
+    assert f'nvml-check wanted={int(gpu_installed)}' in proc.stdout
+
+
+FAKE_PYNVML = '''
+import os
+class NVMLError(Exception):
+    pass
+def nvmlInit():
+    if os.environ.get("NVML_FAIL"):
+        raise NVMLError(os.environ["NVML_FAIL"])
+def nvmlShutdown():
+    pass
+def nvmlDeviceGetCount():
+    return 2
+def nvmlDeviceGetHandleByIndex(i):
+    return i
+def nvmlDeviceGetName(h):
+    return ["NVIDIA RTX A6000", b"Tesla T4"][h]
+'''
+
+
+@needs_bash
+@pytest.mark.parametrize('fail,expected', [
+    (None, (0, '2 GPU(s): NVIDIA RTX A6000, Tesla T4')),
+    ('Driver Not Loaded', (4, 'nvmlInit failed: Driver Not Loaded')),
+])
+def test_nvml_probe_is_what_the_collector_does(tmp_path, fail, expected):
+    probe = run_sourced('printf "%s" "$NVML_PROBE"').stdout
+    mod = tmp_path / 'mods'
+    mod.mkdir()
+    (mod / 'pynvml.py').write_text(FAKE_PYNVML)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')}
+    if fail:
+        env['NVML_FAIL'] = fail
+    proc = subprocess.run([sys.executable, '-I', '-c', f'import sys; sys.path.insert(0, {str(mod)!r})\n' + probe],
+                          capture_output=True, text=True, env=env)
+    assert (proc.returncode, proc.stdout.strip()) == expected, proc.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize('message,device,expected', [
+    ('nvmlInit failed: RM has detected an NVML/RM version mismatch.', None, 'without a reboot'),
+    ('nvmlInit failed: Driver/library version mismatch', None, 'without a reboot'),
+    ('nvmlInit failed: NVML Shared Library Not Found', None, 'libnvidia-compute-<driver version>'),
+    ('nvmlInit failed: Insufficient Permissions', 0o660, 'NVreg_DeviceFileMode'),
+    ('nvmlInit failed: Driver Not Loaded', None, 'nvidia-persistenced'),
+    ('import pynvml failed: No module named pynvml', None, 'PyPI'),
+])
+def test_nvml_failure_hints(tmp_path, message, device, expected):
+    dev = tmp_path / 'dev'
+    dev.mkdir()
+    if device is not None:
+        (dev / 'nvidiactl').touch()
+        (dev / 'nvidiactl').chmod(device)
+        (dev / 'nvidia0').touch()
+    proc = run_sourced(f'NVIDIA_DEV_DIR="{dev}"\nnvml_failure_hint "{message}"')
+    assert proc.returncode == 0 and expected in proc.stdout, proc.stdout + proc.stderr
+    if device is not None:
+        assert f'-rw-rw---- ' in proc.stdout and f'{dev}/nvidia0' in proc.stdout
+
+
+@needs_bash
+@pytest.mark.parametrize('probe_out,rc,expected', [
+    ('2 GPU(s): NVIDIA RTX A6000, Tesla T4', 0, '[OK] NVML works as labmon: 2 GPU(s)'),
+    ('nvmlInit failed: Insufficient Permissions', 4, 'GPU stats will be missing: as labmon, nvmlInit failed'),
+])
+def test_check_nvml_access_reports_the_result(tmp_path, probe_out, rc, expected):
+    script = ('GPU_WANTED=1\n'
+              f'run_as_service_user() {{ echo "{probe_out}"; return {rc}; }}\n'
+              f'NVIDIA_DEV_DIR="{tmp_path}"\ncheck_nvml_access')
+    proc = run_sourced(script)
+    assert proc.returncode == 0
+    assert expected in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize('log,expected', [
+    ('2026-11-21 10:00:01 - INFO - CPU: 4.0% | RAM: 20% | Uptime: 1d 1h | Network: {} | '
+     'GPUs: 2 (NVIDIA RTX A6000 37%, Tesla T4 n/a)\nmore', 'GPUs: 2 (NVIDIA RTX A6000 37%, Tesla T4 n/a)'),
+    ('... | GPUs: none/unavailable', 'GPUs: none/unavailable'),
+    ('no summary line', ''),
+])
+def test_test_run_reads_the_gpu_summary_from_the_journal(log, expected):
+    proc = run_sourced(f"gpu_summary_of {shlex.quote(log)}")
+    assert proc.returncode == 0 and proc.stdout.strip() == expected, proc.stdout + proc.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize('journal,expected', [
+    ('CPU: 4.0% | RAM: 20% | GPUs: 2 (NVIDIA RTX A6000 37%, Tesla T4 n/a)',
+     '[OK] GPU stats collected by the service (GPUs: 2 (NVIDIA RTX A6000 37%, Tesla T4 n/a))'),
+    ('WARNING - NVIDIA GPU stats unavailable: NVML could not start (Driver Not Loaded (NVML error 9)).\n'
+     'CPU: 4.0% | RAM: 20% | GPUs: none/unavailable',
+     'reported no GPUs (GPUs: none/unavailable)'),
+])
+def test_test_run_checks_that_the_service_saw_the_gpus(tmp_path, journal, expected):
+    venv = tmp_path / 'venv'
+    (venv / 'bin').mkdir(parents=True)
+    (venv / 'bin' / 'python').write_text('#!/bin/sh\nexit 0\n')
+    (venv / 'bin' / 'python').chmod(0o755)
+    script = (f'VENV_DIR="{venv}"\nGPU_WANTED=1\n'
+              'config_get() { echo http://manager.invalid:5000; }\n'
+              'queue_length() { echo 0; }\n'
+              'systemctl() { [[ $1 == show ]] && echo success; return 0; }\n'
+              f'journalctl() {{ printf "%s\\n" {shlex.quote(journal)}; }}\n'
+              'test_run')
+    proc = run_sourced(script)
+    assert proc.returncode == 0, proc.stderr
+    assert expected in proc.stdout + proc.stderr, proc.stdout + proc.stderr

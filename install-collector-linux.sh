@@ -22,8 +22,11 @@
 #   3. Installs the collector code to /opt/lab-monitor (from this checkout,
 #      --source DIR, or a git clone of --repo/--ref), owned by root
 #   4. Creates the venv /opt/lab-monitor/venv and installs
-#      collector/requirements.txt (+ requirements-gpu.txt when nvidia-smi exists);
-#      offline, it falls back to the Debian packages python3-requests/python3-psutil
+#      collector/requirements.txt; offline, it falls back to the Debian packages
+#      python3-requests/python3-psutil. With an NVIDIA driver (any of:
+#      /proc/driver/nvidia/version, libnvidia-ml.so.1 in ldconfig -p, nvidia-smi
+#      on PATH) or nvidia-ml-py already in the venv, also requirements-gpu.txt,
+#      and checks that NVML works as the service user
 #   5. Writes /etc/lab-monitor/collector.json (0640 root:labmon) with Python's
 #      json module; an existing config is kept, flags change only the keys they name
 #   6. Installs and enables the systemd units (collector/systemd/):
@@ -70,6 +73,10 @@ INSTALL_LOCK=/run/lab-monitor-install.lock
 # unattended-upgrades holds it for minutes after a fresh VM boots
 APT_LOCK_WAIT=300
 APT_RETRY_INTERVAL=10
+# Signs of an NVIDIA driver (any one is enough), and its device nodes
+NVIDIA_PROC_VERSION=/proc/driver/nvidia/version
+NVML_SONAME=libnvidia-ml.so.1
+NVIDIA_DEV_DIR=/dev
 
 # ------------------------------------------------------------------------------
 # Options
@@ -96,6 +103,9 @@ OPT_SOURCE=""
 GENERATED_TOKEN=""
 TMP_DIRS=()
 TIMERS_STOPPED=0
+NVIDIA_DETECTED=0     # detect_nvidia: an NVIDIA driver is present
+NVIDIA_FOUND=()       # detect_nvidia: what was found
+GPU_WANTED=0          # decide_gpu_support: install nvidia-ml-py
 
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
@@ -338,6 +348,9 @@ else:
         'request_timeout_seconds': 30,
         'max_batch_messages': 100,
         'max_queue_messages': 50000,
+        # Per-user metrics leave out daemon accounts (UID below UID_MIN, such
+        # as labmon itself) and keep root (docker containers, sudo jobs)
+        'exclude_system_accounts': True,
         'exclude_users': [],
     }
 
@@ -867,10 +880,177 @@ venv_healthy() {
     return 0
 }
 
+# ------------------------------------------------------------------------------
+# NVIDIA GPUs
+# ------------------------------------------------------------------------------
+
+# Path of the NVML library in the dynamic loader's cache (empty if it isn't there)
+nvml_library_path() {
+    local ldconfig="" candidate
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig=ldconfig
+    else
+        for candidate in /sbin/ldconfig /usr/sbin/ldconfig; do
+            if [[ -x $candidate ]]; then
+                ldconfig=$candidate
+                break
+            fi
+        done
+    fi
+    [[ -n $ldconfig ]] || return 0
+    # e.g. "	libnvidia-ml.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+    { "$ldconfig" -p 2>/dev/null || true; } | awk -v so="$NVML_SONAME" '$1 == so { print $NF; exit }' || true
+}
+
+# Sets NVIDIA_DETECTED=1 if any sign of an NVIDIA driver is found: the loaded
+# kernel module, the NVML library, or nvidia-smi. NVIDIA_FOUND lists them.
+detect_nvidia() {
+    local version="" lib smi
+    NVIDIA_DETECTED=0
+    NVIDIA_FOUND=()
+    if [[ -e $NVIDIA_PROC_VERSION ]]; then
+        version=$(head -n 1 -- "$NVIDIA_PROC_VERSION" 2>/dev/null |
+                  awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+(\.[0-9]+)*$/) { print $i; exit } }' || true)
+        NVIDIA_FOUND+=("kernel driver ${version:+$version }loaded ($NVIDIA_PROC_VERSION)")
+    fi
+    lib=$(nvml_library_path)
+    if [[ -n $lib ]]; then
+        NVIDIA_FOUND+=("NVML library $lib (ldconfig -p)")
+    fi
+    smi=$(command -v nvidia-smi 2>/dev/null || true)
+    if [[ -n $smi ]]; then
+        NVIDIA_FOUND+=("nvidia-smi ($smi)")
+    fi
+    if (( ${#NVIDIA_FOUND[@]} )); then
+        NVIDIA_DETECTED=1
+    fi
+    return 0
+}
+
+venv_has_pynvml() {
+    [[ -x $VENV_DIR/bin/python ]] && "$VENV_DIR/bin/python" -I -c 'import pynvml' >/dev/null 2>&1
+}
+
+# decide_gpu_support HAD_PYNVML: sets GPU_WANTED and says why. HAD_PYNVML=1
+# when the venv had nvidia-ml-py before this run: an upgrade keeps GPU support
+# even if the driver can't be seen right now (e.g. during a driver update).
+decide_gpu_support() {
+    local had=${1:-0} line
+    detect_nvidia
+    GPU_WANTED=0
+    if (( NVIDIA_DETECTED )); then
+        info "NVIDIA driver detected:"
+        for line in "${NVIDIA_FOUND[@]}"; do
+            info "  - $line"
+        done
+        GPU_WANTED=1
+    else
+        info "No NVIDIA driver detected (no $NVIDIA_PROC_VERSION, no $NVML_SONAME in ldconfig -p, no nvidia-smi on PATH)."
+        if (( had )); then
+            info "nvidia-ml-py was installed by an earlier run: keeping GPU support."
+            GPU_WANTED=1
+        fi
+    fi
+    return 0
+}
+
+# Run a command as the service user (with its supplementary groups, as systemd does)
+run_as_service_user() {
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$SERVICE_USER" -- "$@"
+    elif command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- "$@"
+    else
+        echo "neither runuser nor setpriv is available to run a command as $SERVICE_USER"
+        return 2
+    fi
+}
+
+# What the collector does at the start of every metrics run
+NVML_PROBE='
+import sys
+try:
+    import pynvml
+except Exception as e:
+    print("import pynvml failed: %s" % e)
+    sys.exit(3)
+try:
+    pynvml.nvmlInit()
+except Exception as e:
+    print("nvmlInit failed: %s" % e)
+    sys.exit(4)
+try:
+    names = []
+    for i in range(pynvml.nvmlDeviceGetCount()):
+        name = pynvml.nvmlDeviceGetName(pynvml.nvmlDeviceGetHandleByIndex(i))
+        names.append(name.decode() if isinstance(name, bytes) else str(name))
+finally:
+    pynvml.nvmlShutdown()
+print("%d GPU(s): %s" % (len(names), ", ".join(names)))
+'
+
+# nvml_failure_hint MESSAGE: the likely cause of a failed NVML probe
+nvml_failure_hint() {
+    local msg=$1 node
+    case $msg in
+        *"import pynvml failed"*)
+            info "  nvidia-ml-py can't be imported in $VENV_DIR: did pip fail above? Re-run this installer with access to PyPI." ;;
+        *"ersion mismatch"*|*"ersion Mismatch"*)
+            info "  The loaded NVIDIA kernel module and the driver's user-space library are different versions,"
+            info "  usually because the driver was upgraded without a reboot. Reboot (or reload the nvidia modules)."
+            info "  nvidia-smi then works again, and so do the GPU stats." ;;
+        *"Library Not Found"*|*"library not found"*)
+            info "  $NVML_SONAME is not in the dynamic loader's cache (ldconfig -p): install the driver's NVML"
+            info "  library (Ubuntu: libnvidia-compute-<driver version>) and run ldconfig." ;;
+        *"Insufficient Permissions"*|*"No Permission"*|*"Driver Not Loaded"*|*"Unknown Error"*)
+            if [[ ! -e $NVIDIA_DEV_DIR/nvidiactl ]]; then
+                info "  $NVIDIA_DEV_DIR/nvidiactl does not exist: the nvidia kernel module isn't loaded, or nothing has"
+                info "  created the device nodes since boot (the service can't: NoNewPrivileges disables the setuid"
+                info "  nvidia-modprobe). Check 'nvidia-smi' as root, and have the nodes created at boot:"
+                info "  sudo systemctl enable --now nvidia-persistenced"
+            else
+                info "  $SERVICE_USER can't open the NVIDIA device nodes:"
+                for node in "$NVIDIA_DEV_DIR"/nvidiactl "$NVIDIA_DEV_DIR"/nvidia[0-9]*; do
+                    if [[ -e $node ]]; then
+                        info "    $(stat -c '%A %U:%G' -- "$node" 2>/dev/null) $node"
+                    fi
+                done
+                info "  The driver's NVreg_DeviceFileMode / NVreg_DeviceFileGID options (/etc/modprobe.d) restrict"
+                info "  them: add $SERVICE_USER to that group (sudo usermod -aG <group> $SERVICE_USER) or use mode 0666."
+            fi ;;
+        *)
+            info "  Check the driver with nvidia-smi, and see 'GPU servers' in $CODE_DIR/README.md." ;;
+    esac
+}
+
+# NVML as the service user: catches driver/library mismatches and device
+# permissions now; the test run (step 8) then checks it inside the unit's sandbox
+check_nvml_access() {
+    (( GPU_WANTED )) || return 0
+    if (( OPT_DRY_RUN )); then
+        info "[dry-run] would check that NVML works as $SERVICE_USER (nvmlInit, list the GPUs)"
+        return 0
+    fi
+    local out rc=0
+    out=$(cd / && run_as_service_user "$VENV_DIR/bin/python" -I -c "$NVML_PROBE" 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        ok "NVML works as $SERVICE_USER: $out"
+        return 0
+    fi
+    warn "GPU stats will be missing: as $SERVICE_USER, ${out:-the NVML check failed (exit $rc)}"
+    nvml_failure_hint "$out"
+    return 0
+}
+
 setup_venv() {
     step "Step 4: Python environment $VENV_DIR"
-    local vpy="$VENV_DIR/bin/python" pip_ok=0 reused=0
+    local vpy="$VENV_DIR/bin/python" pip_ok=0 reused=0 had_pynvml=0 apt_ok=0
     local pip_args=(-m pip install --disable-pip-version-check --no-input --timeout 20 --retries 2)
+
+    # Before the venv may be rebuilt: an upgrade keeps GPU support it had
+    if venv_has_pynvml; then
+        had_pynvml=1
+    fi
 
     if venv_healthy; then
         reused=1
@@ -894,10 +1074,11 @@ setup_venv() {
         fi
     fi
 
-    if (( pip_ok )) && command -v nvidia-smi >/dev/null 2>&1; then
-        info "NVIDIA GPU tools found; installing $CODE_DIR/requirements-gpu.txt"
+    decide_gpu_support "$had_pynvml"
+    if (( pip_ok && GPU_WANTED )); then
+        info "Installing $CODE_DIR/requirements-gpu.txt (nvidia-ml-py, for GPU stats)"
         if run "$vpy" -I "${pip_args[@]}" -q -r "$CODE_DIR/requirements-gpu.txt"; then
-            ok "nvidia-ml-py installed (GPU stats enabled)"
+            ok "nvidia-ml-py installed (pinned version)"
         else
             warn "Could not install nvidia-ml-py; GPU stats will be unavailable"
         fi
@@ -911,8 +1092,15 @@ setup_venv() {
     if (( ! pip_ok )); then
         warn "pip could not install the collector requirements (offline, or no pip in the venv)."
         warn "Falling back to the Debian packages python3-requests and python3-psutil (distribution versions, not the pinned ones)."
-        apt_install python3-requests python3-psutil || \
+        if apt_install python3-requests python3-psutil; then
+            apt_ok=1
+        else
             warn "apt could not install them either (offline, or apt still locked?); the collector needs at least python3-requests"
+        fi
+        if (( apt_ok && GPU_WANTED )); then
+            apt_install python3-pynvml || \
+                warn "Could not install python3-pynvml either; GPU stats will be unavailable until pip works (re-run this installer)"
+        fi
         run rm -rf -- "$VENV_DIR"
         run "${PY[@]}" -m venv --system-site-packages --without-pip "$VENV_DIR" || \
             die "Could not create the venv $VENV_DIR"
@@ -927,6 +1115,7 @@ setup_venv() {
         warn "psutil is not available: CPU/RAM/network come from /proc, and there are no per-user metrics."
     fi
     "$vpy" -I -m compileall -q "$CODE_DIR" >/dev/null 2>&1 || true
+    check_nvml_access
 }
 
 setup_dirs() {
@@ -1059,7 +1248,7 @@ test_run() {
         run systemctl start lab-monitor-metrics.service
         return 0
     fi
-    local since status=0 result queued url
+    local since status=0 result queued url log gpus
     url=$(config_get "$CONFIG_FILE" manager_url)
     if "$VENV_DIR/bin/python" -I -c '
 import sys, requests
@@ -1075,7 +1264,19 @@ sys.exit(0 if requests.get(sys.argv[1].rstrip("/") + "/health", timeout=10).ok e
     result=$(systemctl show -p Result --value lab-monitor-metrics.service 2>/dev/null || echo unknown)
     info ""
     info "Log of this run (journalctl -u lab-monitor-metrics.service):"
-    journalctl -u lab-monitor-metrics.service --since "$since" --no-pager -o cat 2>/dev/null | tail -n 25 | sed 's/^/    /' || true
+    log=$(journalctl -u lab-monitor-metrics.service --since "$since" --no-pager -o cat 2>/dev/null || true)
+    if [[ -n $log ]]; then
+        printf '%s\n' "$log" | tail -n 25 | sed 's/^/    /'
+    fi
+    if (( GPU_WANTED )); then
+        gpus=$(gpu_summary_of "$log")
+        if [[ $gpus == "GPUs: "[0-9]* ]]; then
+            ok "GPU stats collected by the service ($gpus)"
+        else
+            warn "GPU support is installed but the metrics service reported no GPUs${gpus:+ ($gpus)}. Look for"
+            warn "NVML warnings above / in journalctl -u lab-monitor-metrics.service ('GPU servers' in $CODE_DIR/README.md)."
+        fi
+    fi
     queued=$(queue_length)
     info ""
     if (( status == 0 )) && [[ $result == success && ${queued:-1} == 0 ]]; then
@@ -1088,6 +1289,11 @@ sys.exit(0 if requests.get(sys.argv[1].rstrip("/") + "/health", timeout=10).ok e
         info "  - Network error: check manager_url and the firewall"
         info "  Retry with: sudo systemctl start lab-monitor-metrics.service"
     fi
+}
+
+# The collector's "GPUs: ..." summary from a metrics run's log (last one), or empty
+gpu_summary_of() {
+    printf '%s\n' "$1" | grep -o 'GPUs: [^|]*' | tail -n 1 | sed 's/[[:space:]]*$//' || true
 }
 
 summary() {

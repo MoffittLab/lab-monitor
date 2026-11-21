@@ -32,9 +32,13 @@ collector_module = _load_collector()
 
 
 @pytest.fixture
-def collector(monkeypatch):
+def collector(monkeypatch, tmp_path):
     # build_header() would otherwise probe the network for the local IP
     monkeypatch.setattr(collector_module, 'get_local_ip', lambda: '10.0.0.1')
+    # Not this host's interfaces (fake NIC names could match a real virtual
+    # one, e.g. a veth eth0 inside a container) or account layout
+    monkeypatch.setattr(collector_module, 'SYS_CLASS_NET', str(tmp_path / 'no-sys-class-net'))
+    monkeypatch.setattr(collector_module, 'LOGIN_DEFS', str(tmp_path / 'no-login.defs'))
     return collector_module
 
 
