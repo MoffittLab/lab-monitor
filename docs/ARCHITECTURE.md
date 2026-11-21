@@ -83,7 +83,7 @@ under an exclusive lock and is written atomically (temporary file, fsync, rename
 ```
 
 `data_type` tells the Manager which table to use; without it the message goes to `not_specified`.
-In `folder_usage`, keys starting with `_` (`_unit`, `_timed_out`, `_errors`, `_scan_seconds`) are
+In `folder_usage`, keys starting with `_` (`_unit`, `_timed_out`, `_errors`, `_scan_seconds`, `_volumes`) are
 metadata, never folders.
 
 ### Queue and acknowledgement

@@ -79,7 +79,8 @@ metadata, never folders.
   "total_usage":          24876669222912,
   "_timed_out":           ["/volume2/Archive"],
   "_errors":              [],
-  "_scan_seconds":        5321.4
+  "_scan_seconds":        5321.4,
+  "_volumes":             ["/volume1", "/volume2"]
 }
 ```
 
@@ -92,6 +93,7 @@ metadata, never folders.
 | `_timed_out` | Folders that hit a time budget; they are left out, not reported as 0 |
 | `_errors` | Folders (or glob roots / volumes) that could not be scanned, and configured paths that don't exist |
 | `_scan_seconds` | Duration of the folder scan |
+| `_volumes` | Which of the keys are volumes (those whose capacity was measured). Sent by the current collector on every platform. On Linux a volume can be `/mnt/data` and a folder `/data`, so path depth can't tell them apart; the Dashboard uses this list, and for older collectors without it falls back to the `_total_bytes` keys, then path depth. |
 
 Volume capacity is measured first and always sent. A scan path equal to a volume root is not
 scanned (the volume's own figure is authoritative).
