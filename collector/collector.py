@@ -267,9 +267,14 @@ def _identity(config: dict, logger: logging.Logger):
         logger.error("Config missing 'name' field (or old 'nas_name'). Update config.json.")
         return None
     if not DEVICE_NAME_RE.fullmatch(str(name)):
+        token_key = re.sub(r'[^A-Za-z0-9_.-]', '_', str(name))[:64]
         logger.warning(
-            f"Device name {name!r} must be 1-64 characters from A-Z a-z 0-9 _ . - ; "
-            f"the Manager will reject its messages. Change 'name' in config.json."
+            f"Device name {name!r} is outside the allowed pattern (1-64 characters from "
+            f"A-Z a-z 0-9 _ . -). An upgraded Manager accepts it only if a previous Manager "
+            f"already registered exactly this spelling, so an existing device keeps working; "
+            f"for a new device it refuses the messages (HTTP 400). Renaming ('name' in "
+            f"config.json) starts a new device with its own, empty history. A collector_tokens "
+            f"entry for this device must be keyed {token_key!r}."
         )
     return name, system_id, device_type
 
@@ -803,6 +808,7 @@ def _post_batch(manager_url: str, token: str, timeout: float, name: str, system_
     in_batch = set(batch_ids)
     acked = set()
     counts = Counter()
+    errors = []
     for r in results:
         if not isinstance(r, dict) or r.get('msg_id') not in in_batch:
             continue
@@ -817,10 +823,14 @@ def _post_batch(manager_url: str, token: str, timeout: float, name: str, system_
                     f"removed from the queue"
                 )
         elif outcome == 'error':
-            logger.warning(
-                f"Manager could not store message {msg_id} ({r.get('error') or 'transient error'}); "
-                f"keeping it queued for retry"
-            )
+            errors.append((msg_id, r.get('error') or 'transient error'))
+    if errors:
+        # One line, not one per message: a locked Manager database fails the whole batch
+        first_id, reason = errors[0]
+        logger.warning(
+            f"Manager could not store {len(errors)} message(s) ({reason}; first: {first_id}); "
+            f"keeping them queued for retry"
+        )
 
     kept = len(batch) - len(acked)
     logger.info(

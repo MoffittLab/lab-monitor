@@ -237,3 +237,16 @@ def test_data_dir_failure_is_logged_not_raised(collector, config, tmp_path, fake
                                           helpers.make_entries(1), logging.getLogger('test')) is False
     assert 'Cannot create the data directory' in caplog.text
     assert fake_manager.calls == []
+
+
+def test_storage_errors_are_logged_once_per_batch(collector, local_queue, config, queue_path,
+                                                  fake_manager, helpers, caplog):
+    # A locked Manager database answers 'error' for the whole batch: one log line, not one per message
+    ids = _seed(local_queue, queue_path, helpers.make_entries(6))
+    fake_manager.handler = lambda p: helpers.FakeManager.ack(
+        p, {m['header']['msg_id']: 'error' for m in p['messages']})
+    with caplog.at_level(logging.WARNING):
+        assert _sync(collector, config, queue_path) is False
+    lines = [r.getMessage() for r in caplog.records if 'could not store' in r.getMessage()]
+    assert len(lines) == 1 and 'could not store 6 message(s)' in lines[0] and ids[0] in lines[0]
+    assert _queued_ids(helpers, queue_path) == ids

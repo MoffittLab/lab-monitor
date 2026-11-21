@@ -40,7 +40,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 
 | Field | Description |
 |-------|-------------|
-| `name` | Display name — appears on the Dashboard and in database folder names. 1–64 characters from `A-Z a-z 0-9 _ . -`; the Manager rejects anything else. |
+| `name` | Display name — appears on the Dashboard and in database folder names. 1–64 characters from `A-Z a-z 0-9 _ . -`; the Manager rejects anything else for a new device. A device the previous Manager already registered under another name (such as `Lab PC`) keeps working under exactly that spelling; don't rename it, since a new name starts a new device with its own, empty history. |
 | `id` | Stable unique identifier — use something that won't change (e.g., `synology-triton`) |
 | `device_type` | System type: `synology`, `windows`, or any label you choose |
 | `manager_url` | URL of the Manager service (`http://` or `https://`). With `http://` the token travels unencrypted. |
@@ -309,6 +309,30 @@ mid-write). Nothing in it was lost from the archive; once you've looked at it yo
 **Disk measurement slow / `_timed_out` folders:**
 Large folders (50 TB+) take time. Check logs for per-folder timing and raise `timeout_seconds` and/or
 `total_timeout_seconds` (and, on Windows, the Disk Collection task's time limit).
+
+---
+
+## Upgrading
+
+**Rollout order: Dashboard, then Manager, then collectors.** Upgrade a collector only once the Manager and the
+Dashboard run the new version. The new Manager accepts old collectors unchanged: they keep their token, and
+anything they re-send that it already stored comes back as a duplicate. The other way round goes wrong:
+
+- **Old Manager:** it reads a `null` (unmeasured) network counter as 0, resets its running total and then adds the
+  whole counter again on the next reading, inflating the lifetime network totals.
+- **Old Manager:** a collector token from `collector_tokens` gets HTTP 401; an old Manager knows only `auth_tokens`.
+- **Old Dashboard:** it shows the new `_scan_seconds` folder_usage key as a volume on every card.
+
+When upgrading:
+
+- Python 3.8 or later is required.
+- Don't update a collector while its daily disk run is in progress. The old code finishing that run afterwards
+  deletes the whole `queue.json` without the lock, which can drop messages queued in between (they stay in the
+  archive).
+- `queue.json` entries queued by the old collector are kept and sent. They get the deterministic `legacy-` id
+  (see [Queue and Handshake](#queue-and-handshake)), so any the Manager already stored come back as duplicates.
+- `tools/update_collectors.py --upgrade-pip` installs `collector/requirements.txt` the way the Synology installer
+  does: `requests` must install, `psutil` is best-effort on Synology/Linux (no armv7l wheel).
 
 ---
 

@@ -140,6 +140,10 @@ POLL_ENDPOINTS = (CORE_ENDPOINT, '/api/metrics/all', '/api/usage/all',
 
 ManagerResult = namedtuple('ManagerResult', 'data error status')
 
+# Device names from the latest successful /api/devices poll (see
+# _valid_system_name); replaced as a whole, never mutated.
+_registered_names = frozenset()
+
 # requests.Session for connection reuse.  Shared by the poll threads: only
 # get() is used and no cookies are set, which is safe in practice; the
 # underlying urllib3 pool is thread-safe.
@@ -188,7 +192,7 @@ _AUTH_CACHE_MAX = 32
 
 
 def init_app(config: dict, logger: logging.Logger):
-    global _config, _logger, _session
+    global _config, _logger, _session, _registered_names
     for warning in validate_config(config):
         logger.warning(warning)
     _config = config
@@ -198,6 +202,7 @@ def init_app(config: dict, logger: logging.Logger):
     _data_cache.clear()
     with _auth_lock:
         _auth_verified.clear()
+    _registered_names = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +281,16 @@ def _valid_name(name: str) -> bool:
     return bool(NAME_RE.match(name)) and name.strip('.') != ''
 
 
+def _valid_system_name(name: str) -> bool:
+    """
+    NAME_RE, or exactly a name the Manager's device registry listed in a
+    recent poll: an older Manager registered devices under any name (e.g.
+    "Lab PC") and still serves them, so their charts must keep working.
+    Every segment is URL-quoted before it is forwarded.
+    """
+    return _valid_name(name) or (name.strip('.') != '' and name in _registered_names)
+
+
 def _manager_headers() -> dict:
     token = _config.get("manager_token", "")
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -332,8 +347,11 @@ def parse_folder_usage(raw: dict) -> dict:
     structured form the frontend can consume.
 
     Input keys fall into five categories:
-      - Metadata: name, system_id, device_type, data_type, timestamp, and
-        every key starting with "_" (_unit, _timed_out, _errors, ...)
+      - Metadata: the snapshot / history row columns (name, system_id,
+        device_type, data_type, timestamp, total_disk_bytes, id, msg_id,
+        first_seen, last_seen), "payload_<key>" (a payload key the Manager
+        renamed because it collided with one of its columns), and every key
+        starting with "_" (_unit, _timed_out, _errors, ...)
       - Leaf folders:  /volume1/JeffMoffitt  (depth > 1 after splitting on /)
       - Volume roots:  /volume1              (depth == 1)
       - Capacity:      /volume1_total_bytes, /volume1_free_bytes
@@ -353,7 +371,8 @@ def parse_folder_usage(raw: dict) -> dict:
             scan_seconds:         float or None
         }
     """
-    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp', 'total_disk_bytes'}
+    METADATA = {'name', 'system_id', 'device_type', 'data_type', 'timestamp', 'total_disk_bytes',
+                'id', 'msg_id', 'first_seen', 'last_seen'}
     if not isinstance(raw, dict):
         raw = {}
     unit_default = raw.get('_unit')  # message-level unit default for all numeric fields
@@ -365,7 +384,7 @@ def parse_folder_usage(raw: dict) -> dict:
 
     for key, val in raw.items():
         # "_"-prefixed keys are metadata, never folders (contract 5)
-        if not isinstance(key, str) or key in METADATA or key.startswith('_'):
+        if not isinstance(key, str) or key in METADATA or key.startswith(('_', 'payload_')):
             continue
         if key == 'total_usage':
             total = _to_int(val)
@@ -469,6 +488,7 @@ def get_all_systems_data(results: dict = None) -> tuple:
         and errors is [{"endpoint": path, "error": reason}, ...] for every
         Manager call that failed or returned an unexpected shape.
     """
+    global _registered_names
     if results is None:
         results = fetch_manager_state()
 
@@ -503,6 +523,8 @@ def get_all_systems_data(results: dict = None) -> tuple:
             'first_seen': dev.get('first_seen'),
             'last_seen':  dev.get('last_seen'),
         })
+    if devices:
+        _registered_names = frozenset(systems)
 
     # --- metrics snapshots ---
     # Unmeasured values stay None (contract 4); the frontend renders them as "—".
@@ -728,7 +750,7 @@ def get_data():
 @app.route('/api/history/<system_name>/<data_type>/<path:field>')
 def get_metric_history(system_name, data_type, field):
     """Proxy metric time-series data from Manager for frontend charting."""
-    if not _valid_name(system_name):
+    if not _valid_system_name(system_name):
         return _error('Invalid system name', 400)
     if not _valid_name(data_type):
         return _error('Invalid data type', 400)

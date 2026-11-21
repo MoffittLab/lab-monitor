@@ -8,7 +8,7 @@ The Dashboard owns no data. Its Flask server polls the Manager's read API on beh
 
 **See [INSTALLATION.md](../INSTALLATION.md) for complete setup instructions.**
 
-Run: `install-manager-dashboard.ps1` on Windows Server atlantis.
+Run `install-manager-dashboard-taskscheduler.ps1` on the Windows server (atlantis). It installs the Manager and the Dashboard from the same checkout, registers the "Lab Monitor Dashboard" task, and gives the Dashboard its own Manager **read** token, never the admin token. At the end it says whether the Dashboard login is enabled, and how to enable it (see [Security](#security)).
 
 Requirements: `pip install -r requirements.txt` (Flask, requests, waitress). The dashboard runs under **waitress** when it is installed. Without waitress, or with `"debug": true`, it falls back to the Flask development server and logs a loud warning.
 
@@ -71,7 +71,7 @@ The dashboard refuses to start if `auth` is present but incomplete or its `passw
   ```
 
   Paste the printed `auth` block into `config.json` and restart. Every page, API route and static file then requires the username/password, except `GET /health`, which returns only `{"status": "ok"}`. Basic auth sends the password with every request, so on an untrusted network either put the dashboard behind an HTTPS reverse proxy or bind it to `127.0.0.1` and reach it through the proxy.
-- The browser never sees the Manager token or the Manager URL. All Manager calls go through the dashboard server, which validates system names (`^[A-Za-z0-9_.-]{1,64}$`) and URL-encodes every path segment it forwards. Error responses carry short generic messages; details go to the log.
+- The browser never sees the Manager token or the Manager URL. All Manager calls go through the dashboard server, which validates system names and URL-encodes every path segment it forwards. A name must match `^[A-Za-z0-9_.-]{1,64}$`, or be exactly a name the Manager's device registry listed in a recent poll (devices an older Manager registered under other names, such as `Lab PC`). Error responses carry short generic messages; details go to the log.
 - Plotly is loaded from the CDN at a pinned version (1.58.5) with a Subresource Integrity hash.
 
 ---
@@ -153,9 +153,12 @@ See [INSTALLATION.md](../INSTALLATION.md) troubleshooting section for more.
 
 ## Upgrade notes
 
-- **Rollout order: upgrade the dashboard first**, then the Manager, then the collectors. The new dashboard works with the old Manager (it downsamples history itself when the Manager ignores `max_points`). The old dashboard does not handle the new components well:
-  - With the new Manager, the old dashboard's "All Available" chart sends no `max_points`. The new Manager caps such window queries at its default row limit and returns the *oldest* rows, so the chart silently ends months ago.
-  - With new collectors, the old dashboard treats the new `_scan_seconds` folder_usage key as a volume and shows a bogus `_scan_seconds` row on every card that has disk data.
+- **Rollout order: Dashboard, then Manager, then collectors.** The installer upgrades the Dashboard and the Manager together, which is fine. Upgrade the collectors last:
+  - The new dashboard works with the old Manager. It downsamples history itself when the Manager ignores `max_points`.
+  - The old dashboard works with the new Manager. Its "All Available" chart sends no `max_points`, and the new Manager bucket-averages such window queries instead of cutting them off.
+  - New collectors need the new dashboard. The old one treats their new `_scan_seconds` folder_usage key as a volume and shows a bogus `_scan_seconds` row on every card that has disk data.
+  - New collectors also need the new Manager (see `manager/README.md`, "Upgrading").
+- History and devices stored by the old Manager show up unchanged. A device the old Manager registered under a name outside `^[A-Za-z0-9_.-]{1,64}$` keeps its card and its charts. Two spellings of one device left by the old Manager (for example `Triton` and `triton`) show as two cards, each with its own totals.
 - Existing configs keep working unchanged. New keys are optional, and without `auth` the dashboard stays open as before, now with a startup warning.
 - Replace the dashboard's `manager_token` with a Manager **read** token once the Manager has `read_tokens` configured.
 - Install `waitress` (`pip install -r requirements.txt`) to get the production server.

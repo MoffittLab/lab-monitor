@@ -189,3 +189,20 @@ def test_synology_installer_asks_before_tightening_an_existing_config():
     rerun = text[text.index('Config file already exists'):text.index('Step 7')]
     assert 'Restrict config.json to 600 now? [y/N]' in rerun
     assert rerun.index('read -r -p') < rerun.index('chmod 600 "$CONFIG_FILE"')
+
+
+@pytest.mark.parametrize('name, key', [('Lab PC', 'Lab_PC'), ('Atlas 2 (old)', 'Atlas_2__old_')])
+def test_name_outside_pattern_warns_without_telling_to_rename(collector, caplog, name, key):
+    # A name the previous Manager registered keeps working on the new Manager;
+    # renaming would start a new device and split its history.
+    with caplog.at_level(logging.WARNING):
+        assert collector._identity({'name': name, 'id': 'x'}, logging.getLogger('test'))[0] == name
+    text = caplog.text
+    assert 'exactly this spelling' in text and 'new device' in text and repr(key) in text
+    assert "Change 'name'" not in text and 'will reject' not in text
+
+
+def test_valid_name_does_not_warn(collector, caplog):
+    with caplog.at_level(logging.WARNING):
+        collector._identity({'name': 'lab.ws01', 'id': 'x'}, logging.getLogger('test'))
+    assert caplog.text == ''

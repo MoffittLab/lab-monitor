@@ -439,6 +439,17 @@ def test_parse_folder_usage_null_total_and_garbage():
     assert dash.parse_folder_usage(None)['folders'] == []
 
 
+def test_parse_folder_usage_internal_columns_are_metadata():
+    # history rows (/api/data/<sys>/folder_usage) carry the Manager's own
+    # columns; payload keys that collided with them arrive as payload_<key>
+    raw = {'id': 7, 'msg_id': 'abc', 'timestamp': '2026-11-21T00:00:00Z', 'device_type': 'nas',
+           'first_seen': 1, 'last_seen': 2, 'payload_id': 99, 'payload_timestamp': 5,
+           '/volume1': 600, '/volume1/Data': 500}
+    out = dash.parse_folder_usage(raw)
+    assert [v['path'] for v in out['volumes']] == ['/volume1']
+    assert [f['path'] for f in out['folders']] == ['/volume1/Data']
+
+
 def test_format_bytes_binary_units():
     assert dash.format_bytes(1536) == '1.50 KiB'
     assert dash.format_bytes(3 * 1024 ** 4) == '3.00 TiB'
@@ -484,6 +495,20 @@ def test_history_quotes_path_segments(make_client):
     urls = [c['url'] for c in fake.calls]
     assert urls[0] == 'http://manager.test:5000/api/history/Lab-A.1/folder_usage/E%3A'
     assert urls[1] == 'http://manager.test:5000/api/history/Triton/folder_usage/volume1%2Fmy%20folder%3F'
+
+
+def test_history_allows_grandfathered_registered_names(make_client):
+    # An older Manager registered devices under any name; the new Manager still
+    # serves those exact names, so their charts must work once the registry lists them
+    routes = {**healthy_manager(), **_history_routes()}
+    routes['/api/devices'] = FakeResponse(200, {'devices': [{'name': 'Lab PC', 'device_type': 'server'}]})
+    client, fake = make_client(routes=routes)
+    url = '/api/history/Lab%20PC/system_metrics/cpu_percent'
+    assert client.get(url).status_code == 400                    # not listed by the Manager yet
+    assert client.get('/api/data').status_code == 200
+    assert client.get(url).status_code == 200
+    assert fake.calls[-1]['url'] == 'http://manager.test:5000/api/history/Lab%20PC/system_metrics/cpu_percent'
+    assert client.get('/api/history/Other%20PC/system_metrics/cpu_percent').status_code == 400
 
 
 def test_history_passes_max_points_and_limits(make_client):
