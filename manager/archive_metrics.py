@@ -1,63 +1,69 @@
 #!/usr/bin/env python3
 r"""
-Archive Metrics - Monthly Archival Job
+Archive Metrics — history retention job.
 
-Runs once per month (1st at 2 AM via Windows Task Scheduler).
+History is kept forever by default.  Retention only runs when the Manager
+config sets "history_retention_days" (or --days is passed): rows older than
+that many days are appended to monthly JSONL files and then deleted.
 
-Moves metrics older than 90 days from SQLite to monthly JSONL files for archival.
-Keeps recent metrics (last 90 days) in SQLite for fast queries.
+What is archived:
+  - every per-system history table in data/<system>/data.db
+    (system_metrics, folder_usage, user_metrics, not_specified, ...)
+      → data/<system>/archive/<YYYY-MM>-<data_type>.jsonl
+  - user_metrics_history in the central metrics.db
+      → data/<system>/archive/<YYYY-MM>-user_metrics_history.jsonl
+
+Rows are deleted only after their archive lines have been written and
+fsync'd.  The legacy "retention_days" key is NOT used here (it only ever
+applied to the old usage.jsonl files).  folder_usage_legacy (the pre-upgrade
+wide table) is left untouched.
+
+The Manager runs this daily itself when history_retention_days is set; it
+can also be run by hand or from Task Scheduler (safe while the Manager is
+running — SQLite busy_timeout handles the locking):
 
 Usage:
     python archive_metrics.py --config E:\Users\lab-monitor\scripts\lab-monitor\manager\config.json
-
-Or from Task Scheduler:
-    python.exe E:\Users\lab-monitor\scripts\lab-monitor\manager\archive_metrics.py
+    python archive_metrics.py --config config.json --days 365 --dry-run
 """
 import os
-import re
 import sys
 import json
 import logging
 import argparse
-import sqlite3
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Add this directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from metrics import MetricsDB
+from data_store import TypedDataStore
+from storage_util import format_timestamp, normalize_device_name
 
-
-def _sanitize_name(name: str) -> str:
-    """
-    Convert a system name into a safe single path segment.
-    Mirrors data_store._sanitize_table so archive paths line up with the
-    per-system DB directories and cannot escape data_dir via traversal.
-    """
-    return re.sub(r'[^a-z0-9_]', '_', str(name).lower())[:64]
+BATCH = 5000
 
 
 def setup_logging(log_file: str = None):
-    """Setup logging"""
-    logger = logging.getLogger(__name__)
+    """Setup logging on the root logger so data_store/metrics logs are captured too."""
+    logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
+
     formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
+
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     logger.addHandler(console)
-    
+
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-    
-    return logger
+
+    return logging.getLogger('archive_metrics')
 
 
 def load_config(config_path: str) -> dict:
@@ -73,136 +79,115 @@ def load_config(config_path: str) -> dict:
         sys.exit(1)
 
 
-def archive_old_metrics(db: MetricsDB, data_dir: str, logger: logging.Logger, days: int = 90):
+def _append_archive(data_dir: str, system_key: str, label: str, rows: List[dict]) -> int:
     """
-    Archive metrics older than N days from SQLite to monthly JSONL files.
-    
-    Args:
-        db: MetricsDB instance
-        data_dir: Base data directory
-        logger: Logger instance
-        days: Retention days (default 90)
+    Append rows to data_dir/<system_key>/archive/<YYYY-MM>-<label>.jsonl,
+    grouped by the month of each row's timestamp.  fsyncs before returning
+    so the caller can delete the rows safely.
     """
-    cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    
-    logger.info(f"Starting archival of metrics older than {cutoff_date}")
-    
-    try:
-        # Get all systems with old data
-        cursor = db.db.execute('''
-            SELECT DISTINCT name FROM metrics
-            WHERE timestamp < ?
-            ORDER BY name
-        ''', (cutoff_date,))
-        
-        systems = [row[0] for row in cursor.fetchall()]
-        
-        if not systems:
-            logger.info("No metrics older than retention period to archive")
-            return True
-        
-        logger.info(f"Found {len(systems)} systems with old data")
-        
-        # Archive each system separately, grouped by month
-        total_archived = 0
-        
-        for name in systems:
-            # Get old metrics for this system, grouped by month
-            cursor = db.db.execute('''
-                SELECT timestamp, cpu_percent, ram_percent, network_bytes_in, network_bytes_out
-                FROM metrics
-                WHERE name = ? AND timestamp < ?
-                ORDER BY timestamp
-            ''', (name, cutoff_date))
-            
-            metrics = cursor.fetchall()
-            
-            if not metrics:
-                continue
-            
-            # Group by month
-            months = {}
-            for row in metrics:
-                timestamp = row[0]  # ISO format: YYYY-MM-DDTHH:MM:SSZ
-                year_month = timestamp[:7]  # Extract YYYY-MM
-                
-                if year_month not in months:
-                    months[year_month] = []
-                
-                months[year_month].append({
-                    'timestamp': timestamp,
-                    'cpu_percent': row[1],
-                    'ram_percent': row[2],
-                    'network_bytes_in': row[3],
-                    'network_bytes_out': row[4]
-                })
-            
-            # Write to JSONL monthly files (sanitize name to prevent traversal)
-            system_dir = os.path.join(data_dir, _sanitize_name(name))
-            os.makedirs(system_dir, exist_ok=True)
-            
-            for year_month, entries in sorted(months.items()):
-                archive_file = os.path.join(system_dir, f"{year_month}-metrics.jsonl")
-                
-                try:
-                    with open(archive_file, 'a') as f:
-                        for entry in entries:
-                            f.write(json.dumps(entry) + '\n')
-                    
-                    logger.info(f"Archived {len(entries)} metrics to {archive_file}")
-                    total_archived += len(entries)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to write {archive_file}: {e}")
-                    return False
-        
-        # Delete archived metrics from SQLite
-        try:
-            cursor = db.db.execute(
-                'SELECT COUNT(*) FROM metrics WHERE timestamp < ?',
-                (cutoff_date,)
-            )
-            old_count = cursor.fetchone()[0]
-            
-            db.db.execute(
-                'DELETE FROM metrics WHERE timestamp < ?',
-                (cutoff_date,)
-            )
-            db.db.commit()
-            logger.info(f"Deleted {old_count} old metrics from SQLite")
-        except Exception as e:
-            logger.error(f"Failed to delete old metrics: {e}")
-            return False
-        
-        logger.info(f"Archival complete: {total_archived} metrics archived, retention window reset")
-        return True
-    
-    except Exception as e:
-        logger.error(f"Archival failed: {e}", exc_info=True)
-        return False
+    archive_dir = os.path.join(data_dir, normalize_device_name(system_key), 'archive')
+    os.makedirs(archive_dir, exist_ok=True)
+
+    months: Dict[str, List[dict]] = {}
+    for row in rows:
+        ts = str(row.get('timestamp') or '')
+        months.setdefault(ts[:7] if len(ts) >= 7 else 'unknown', []).append(row)
+
+    for year_month, entries in sorted(months.items()):
+        path = os.path.join(archive_dir, f"{year_month}-{label}.jsonl")
+        with open(path, 'a', encoding='utf-8') as f:
+            for entry in entries:
+                f.write(json.dumps(entry, default=str) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+    return len(rows)
+
+
+def run_history_retention(data_store: TypedDataStore, metrics_db, data_dir: str,
+                          days: int, logger: logging.Logger, dry_run: bool = False) -> dict:
+    """
+    Archive and delete history rows older than `days` days.
+    metrics_db may be None (central user_metrics_history is then skipped).
+    Returns {"cutoff", "archived": {label: n}, "dry_run"}.
+    """
+    cutoff = format_timestamp(datetime.now(timezone.utc) - timedelta(days=days))
+    logger.info(f"History retention: archiving rows older than {cutoff} ({days} days)"
+                + (" [dry run]" if dry_run else ""))
+    archived: Dict[str, int] = {}
+
+    # ---- per-system history tables -------------------------------------- #
+    for system_key in data_store.list_systems():
+        for data_type in data_store.list_data_types(system_key):
+            total = 0
+            while True:
+                rows = data_store.rows_older_than(system_key, data_type, cutoff, limit=BATCH)
+                if not rows:
+                    break
+                if dry_run:
+                    total += len(rows)
+                    if len(rows) == BATCH:
+                        logger.info(f"  {system_key}/{data_type}: at least {total} rows (dry run stops counting)")
+                    break
+                _append_archive(data_dir, system_key, data_type, rows)
+                deleted = data_store.delete_rows(system_key, data_type, [r['id'] for r in rows])
+                total += deleted
+                if deleted == 0:
+                    break
+            if total:
+                archived[f"{system_key}/{data_type}"] = total
+                logger.info(f"  {system_key}/{data_type}: {'would archive' if dry_run else 'archived'} {total} rows")
+
+    # ---- central per-user history ---------------------------------------- #
+    if metrics_db is not None:
+        total = 0
+        while True:
+            rows = metrics_db.users.history_older_than(cutoff, limit=BATCH)
+            if not rows:
+                break
+            if dry_run:
+                total += len(rows)
+                break
+            by_device: Dict[str, List[dict]] = {}
+            for row in rows:
+                by_device.setdefault(row['device_name'], []).append(row)
+            for device, device_rows in by_device.items():
+                _append_archive(data_dir, device, 'user_metrics_history', device_rows)
+            deleted = metrics_db.users.delete_history_ids([r['id'] for r in rows])
+            total += deleted
+            if deleted == 0:
+                break
+        if total:
+            archived['user_metrics_history'] = total
+            logger.info(f"  user_metrics_history: {'would archive' if dry_run else 'archived'} {total} rows")
+
+    if not archived:
+        logger.info("History retention: nothing older than the cutoff")
+    return {"cutoff": cutoff, "archived": archived, "dry_run": dry_run}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Archive old metrics from SQLite to JSONL'
+        description='Archive history older than history_retention_days to JSONL, then delete it'
     )
     parser.add_argument('--config', help='Config file path')
-    
+    parser.add_argument('--days', type=int, help='Override history_retention_days')
+    parser.add_argument('--dry-run', action='store_true', help='Only report what would be archived')
+
     args = parser.parse_args()
-    
+
     # If no config provided, look for standard location
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__),
+            os.path.dirname(os.path.abspath(__file__)),
             'config.json'
         )
-    
+
     if not os.path.exists(args.config):
         print(f"ERROR: Config not found: {args.config}")
         sys.exit(1)
-    
+
     config = load_config(args.config)
-    
+
     # Setup logging
     log_file = os.path.join(
         config.get('data_dir', 'data'),
@@ -211,32 +196,37 @@ def main():
         'archive-metrics.log'
     )
     logger = setup_logging(log_file)
-    
+
     logger.info("=" * 60)
     logger.info("Archive Metrics Job Starting")
     logger.info("=" * 60)
-    
-    # Initialize metrics database
+
+    days = args.days if args.days is not None else config.get('history_retention_days')
+    if not days:
+        logger.info("History retention is disabled (history_retention_days is not set) — nothing to do")
+        sys.exit(0)
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+        logger.error(f"history_retention_days must be a positive integer, got {days!r}")
+        sys.exit(1)
+
     data_dir = config.get('data_dir', 'data')
-    os.makedirs(data_dir, exist_ok=True)
-    db_path = os.path.join(data_dir, 'metrics.db')
-    
+    if not os.path.isdir(data_dir):
+        logger.error(f"data_dir does not exist: {data_dir}")
+        sys.exit(1)
+
     try:
-        db = MetricsDB(db_path)
-        
-        # Archive metrics older than retention period
-        retention_days = config.get('retention_days', 90)
-        success = archive_old_metrics(db, data_dir, logger, days=retention_days)
-        
-        db.close()
-        
-        if success:
-            logger.info("Archive job completed successfully")
-            sys.exit(0)
-        else:
-            logger.error("Archive job failed")
-            sys.exit(1)
-    
+        data_store = TypedDataStore(data_dir)
+        db_path = os.path.join(data_dir, 'metrics.db')
+        metrics_db = MetricsDB(db_path, data_dir=data_dir) if os.path.exists(db_path) else None
+
+        run_history_retention(data_store, metrics_db, data_dir, days, logger, dry_run=args.dry_run)
+
+        data_store.close()
+        if metrics_db is not None:
+            metrics_db.close()
+        logger.info("Archive job completed successfully")
+        sys.exit(0)
+
     except Exception as e:
         logger.error(f"Archive job crashed: {e}", exc_info=True)
         sys.exit(1)

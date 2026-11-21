@@ -1,31 +1,30 @@
 # ============================================================
-# Lab Monitor — Unified Requirements
-# Covers: collector, manager, dashboard, tools
+# Lab Monitor — Manager + Dashboard + tools requirements
 # ============================================================
-# Install with:
+# Install on the Manager/Dashboard server (and wherever the fleet tools in
+# tools/ run):
 #   pip install -r requirements.txt
 #
-# Component-level requirements.txt files in collector/, manager/,
-# and dashboard/ are kept for reference but this file is the
-# authoritative source used by all installers and the remote
-# update tool.
+# Collectors do NOT use this file: their installers and
+# tools/update_collectors.py install collector/requirements.txt
+# (requests + psutil only).
+#
+# Every package is pinned; bump versions deliberately and re-run the tests.
 # ============================================================
-
-# --- HTTP client (collector → manager, dashboard → manager) ---
-requests==2.31.0
-
-# --- System metrics (collector) ---
-psutil==5.9.6
-
-# --- NVIDIA GPU stats (collector) ---
-# Soft dependency: gracefully skipped at runtime if not installed
-# or if no NVIDIA GPU/driver is present.
-# nvidia-ml-py is the maintained fork of pynvml
-nvidia-ml-py
 
 # --- Web framework (manager + dashboard) ---
 Flask==2.3.3
+Werkzeug==3.1.9
+# Only used when the Manager config sets "cors_origins" (off by default)
 Flask-CORS==4.0.0
 
-# --- Remote management (tools/update_collectors.py) ---
-paramiko
+# --- Production WSGI server (manager + dashboard) ---
+# Both services fall back to the Flask development server, with a loud
+# warning, if waitress is missing.
+waitress==3.0.2
+
+# --- HTTP client (dashboard → manager, tools → manager) ---
+requests==2.32.3
+
+# --- Remote management over SSH (tools/*.py) ---
+paramiko==3.5.0
