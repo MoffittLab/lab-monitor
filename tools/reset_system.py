@@ -35,7 +35,13 @@ What it does:
     4. Move queue.json and any queue.corrupt-*.json (queues the collector set
        aside as unreadable) into the backup folder; queue.json.lock is left in
        place (it holds no data)
-    5. Send DELETE /api/system/<name> to the Manager
+    5. Move sessions_state.json and storage_health_state.json, when present,
+       into the backup folder: they record what the Manager was last sent, so
+       after the wipe the collector would otherwise send "unchanged" session
+       lists and skip storage health messages for up to an hour
+       (perf_snapshot.json and storage_breakdown_state.json stay: they
+       describe the host, not the Manager)
+    6. Send DELETE /api/system/<name> to the Manager
        - Deletes per-system history DB on the Manager
        - Clears this system from the central summary DB
 
@@ -93,6 +99,17 @@ def find_queue(data_dir: str, name: str) -> Optional[str]:
     """Return queue.json path if it exists."""
     queue_path = os.path.join(data_dir, name, 'queue.json')
     return queue_path if os.path.exists(queue_path) else None
+
+
+# Collector state files that describe what the Manager was last sent
+MANAGER_STATE_FILES = ('sessions_state.json', 'storage_health_state.json')
+
+
+def find_manager_state_files(data_dir: str, name: str) -> list:
+    """sessions_state.json / storage_health_state.json of this system, when present."""
+    system_dir = os.path.join(data_dir, name)
+    return [os.path.join(system_dir, f) for f in MANAGER_STATE_FILES
+            if os.path.isfile(os.path.join(system_dir, f))]
 
 
 def find_corrupt_queues(data_dir: str, name: str) -> list:
@@ -191,9 +208,11 @@ def queue_lock(system_dir: str, timeout: Optional[float] = None):
 
 def backup_and_clear(data_dir: str, name: str) -> str:
     """
-    Move archives, queue.json and queue.corrupt-*.json into a timestamped
-    backup folder while holding the collector's queue lock (queue_lock).
-    queue.json.lock is left in place.  Returns the backup folder path.
+    Move archives, queue.json, queue.corrupt-*.json and the Manager state
+    files (sessions_state.json, storage_health_state.json) into a
+    timestamped backup folder while holding the collector's queue lock
+    (queue_lock).  queue.json.lock is left in place.  Returns the backup
+    folder path.
     Raises QueueLockTimeout (before anything is moved) if a collector keeps
     the lock.
     """
@@ -214,13 +233,14 @@ def backup_and_clear(data_dir: str, name: str) -> str:
             print(f"  Archived: {os.path.basename(src)} → backup_{timestamp}/")
 
         queue = find_queue(data_dir, name)
-        for src in ([queue] if queue else []) + find_corrupt_queues(data_dir, name):
+        for src in ([queue] if queue else []) + find_corrupt_queues(data_dir, name) + \
+                find_manager_state_files(data_dir, name):
             shutil.move(src, os.path.join(backup_dir, os.path.basename(src)))
             moved.append(os.path.basename(src))
             print(f"  Archived: {os.path.basename(src)} → backup_{timestamp}/")
 
     if not moved:
-        print("  (no archive files or queue found)")
+        print("  (no archive files, queue or state files found)")
 
     return backup_dir
 
@@ -321,6 +341,7 @@ def main():
     archives = find_archives(data_dir, name)
     queue    = find_queue(data_dir, name)
     corrupt  = find_corrupt_queues(data_dir, name)
+    state_files = find_manager_state_files(data_dir, name)
     system_dir = os.path.join(data_dir, name)
 
     print()
@@ -329,7 +350,7 @@ def main():
     print("=" * 60)
     print()
     print("This will:")
-    print(f"  1. Move archives + queue into a timestamped backup folder")
+    print(f"  1. Move archives + queue (+ session / storage health state) into a timestamped backup folder")
     print(f"     Location: {system_dir}/backup_YYYYMMDD_HHMMSS/")
     print(f"     Archives found: {len(archives)}")
     if archives:
@@ -337,7 +358,7 @@ def main():
             print(f"       - {os.path.basename(a)}")
     if queue:
         print(f"       - queue.json")
-    for c in corrupt:
+    for c in corrupt + state_files:
         print(f"       - {os.path.basename(c)}")
     print()
     print(f"  2. DELETE /api/system/{name} on Manager ({manager_url})")

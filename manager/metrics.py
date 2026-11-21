@@ -23,6 +23,24 @@ Three tables, each with a clear purpose:
 Plus dead_letter (messages the Manager rejected, with the raw message and
 the reason) and the per-user tables managed by UserMetricsStore.
 
+Latest state of the newer data types, one row per device each (only a
+message at least as new as the stored one replaces it):
+
+  device_session_snapshot   sessions: the counts of the latest message
+                            (summary_json) and the latest connection list
+                            (sessions_json), with when that list was sent
+                            (list_timestamp) and last confirmed unchanged
+                            (list_confirmed_at)
+  device_storage_health     storage_health without the flattened history keys
+  device_storage_breakdown  storage_breakdown summary: device owners (top 25
+                            plus other) and per-folder totals with their top
+                            owner, at most 50 KB
+
+The per-user rows carry the usage fields of spec §12 (cpu_seconds,
+cpu_cores, ..., gpu_processes); rows stored before them read NULL, and the
+read API leaves a NULL usage field out of a row, so data an older Manager
+stored reads back exactly as before.
+
 All writes for one ingested message happen in one transaction
 (apply_side_effects).  Device names are matched through
 storage_util.normalize_device_name, so "Lab-A" and "lab-a" resolve to the
@@ -53,6 +71,7 @@ Full historical data lives in TypedDataStore (data_store.py).
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -75,6 +94,26 @@ _INT64_MAX = 2 ** 63 - 1
 # traffic since boot to the lifetime totals again.
 REBOOT_UPTIME_SLACK_SECONDS = 300
 
+# Per-user usage fields (spec §12): columns of device_user_snapshot and
+# user_metrics_history, NULL in rows stored before them
+USER_EXTRA_COLUMNS = (
+    ('cpu_seconds', 'REAL'), ('cpu_cores', 'REAL'), ('interval_s', 'REAL'), ('process_count', 'INTEGER'),
+    ('gpu_vram_bytes', 'INTEGER'), ('gpu_util_percent', 'REAL'), ('gpu_busy_seconds', 'REAL'),
+    ('gpus_held', 'INTEGER'), ('gpu_held_seconds', 'REAL'), ('gpu_processes', 'INTEGER'),
+)
+USER_EXTRA_FIELDS = tuple(c for c, _ in USER_EXTRA_COLUMNS)
+
+# system_metrics keys (spec §11) that /api/metrics/all passes through from
+# the latest message, when that message has them
+SYSTEM_METRICS_EXTRA = (
+    'interval_s', 'cpu_count', 'cpu_iowait_percent', 'cpu_steal_percent', 'proc_cpu_coverage_percent',
+    'disk_read_bytes_per_s', 'disk_write_bytes_per_s', 'disk_read_iops', 'disk_write_iops',
+    'disk_await_ms', 'disk_busy_max_percent', 'gpu_sample_seconds',
+)
+
+# Snapshot tables of the newer data types
+_NEW_TABLES = ('device_session_snapshot', 'device_storage_health', 'device_storage_breakdown')
+
 # Tables and columns of the current central schema (an existing database
 # missing any of them is upgraded, after a pre-upgrade backup)
 _CURRENT_SCHEMA = {
@@ -82,9 +121,23 @@ _CURRENT_SCHEMA = {
     'device_snapshot':      ('metrics_json',),
     'device_totals':        ('network_last_updated',),
     'dead_letter':          (),
-    'device_user_snapshot': (),
-    'user_metrics_history': ('msg_id',),
+    'device_user_snapshot': USER_EXTRA_FIELDS,
+    'user_metrics_history': ('msg_id',) + USER_EXTRA_FIELDS,
+    'device_session_snapshot':  (),
+    'device_storage_health':    (),
+    'device_storage_breakdown': (),
 }
+
+# storage_health keys that only exist for history and rollups (spec §14):
+# not part of the latest-state snapshot
+_FLAT_HEALTH_KEY = re.compile(r'(?:disk|array|volume)_[a-z0-9_]+')
+_HEALTH_FIELDS = ('overall_status', 'status_reasons', 'sources', 'arrays', 'disks', 'volumes', 'events')
+
+# storage_breakdown snapshot: device owners kept (the rest folded into
+# "other") and the size cap of one device's summary
+BREAKDOWN_DEVICE_OWNERS = 25
+BREAKDOWN_SNAPSHOT_BYTES = 50 * 1024
+_BREAKDOWN_NUMBERS = ('bytes', 'files', 'cold_1y_bytes', 'cold_3y_bytes')
 
 # A message whose timestamp is further ahead of this server's clock than
 # this (a collector with a wrong clock: dead RTC battery, before NTP sync)
@@ -98,15 +151,19 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 def _has_original_central_layout(conn) -> bool:
     """
-    True while a metrics.db still has the layout an older Manager wrote:
-    none of the tables / columns only this Manager adds (dead_letter,
-    device_totals.network_last_updated, user_metrics_history.msg_id).
+    True while a metrics.db still has the layout an older Manager wrote
+    (the original f086e7e one, or that of the release before usage metrics,
+    with dead_letter and msg_id): none of the tables / columns only this
+    Manager adds (the snapshot tables of the newer data types, the per-user
+    usage columns).  _init_schema creates those tables in its first
+    transaction, so a database this Manager started to migrate never looks
+    original again and gets no second "pre-upgrade" copy.
     """
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if 'dead_letter' in tables:
+    if tables & set(_NEW_TABLES):
         return False
-    for table, column in (('device_totals', 'network_last_updated'), ('user_metrics_history', 'msg_id')):
-        if table in tables and column in {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}:
+    for table in ('device_user_snapshot', 'user_metrics_history'):
+        if table in tables and set(USER_EXTRA_FIELDS) & {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}:
             return False
     return True
 
@@ -118,6 +175,35 @@ def _number_or_none(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _scrub(value):
+    """NaN / ±inf (not valid JSON) → None, recursively."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
+
+
+def _json_text(value) -> str:
+    return json.dumps(_scrub(value), default=str, allow_nan=False)
+
+
+def _json_value(text, default):
+    """A stored JSON column (default when missing or unreadable)."""
+    try:
+        value = json.loads(text) if text else default
+    except (TypeError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def _user_extra(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The per-user usage fields of a user_metrics payload (unmeasured / not a number → None)."""
+    return {k: _number_or_none(payload.get(k)) for k in USER_EXTRA_FIELDS}
 
 
 def _seconds_ahead(timestamp) -> Optional[float]:
@@ -165,6 +251,85 @@ def _seconds_between(earlier: Optional[str], later: str) -> Optional[float]:
         return (parse_timestamp(later) - parse_timestamp(earlier)).total_seconds()
     except (ValueError, TypeError):
         return None
+
+
+def _by_bytes(entry: dict):
+    """Sort key: bytes descending, unmeasured last."""
+    b = _number_or_none(entry.get('bytes'))
+    return (b is None, -(b or 0))
+
+
+def _totals(entry: dict, keys=_BREAKDOWN_NUMBERS) -> dict:
+    return {k: _number_or_none(entry.get(k)) for k in keys}
+
+
+def _breakdown_device(device) -> Optional[dict]:
+    """
+    The device rollup with its BREAKDOWN_DEVICE_OWNERS largest owners; the
+    others are folded into "other" (owner_count and sizes added up; a size
+    any of them did not measure is null).  owners null (not collected)
+    stays null.
+    """
+    if not isinstance(device, dict):
+        return None
+    out = _totals(device)
+    other = device.get('other')
+    other = _totals(other, ('owner_count',) + _BREAKDOWN_NUMBERS) if isinstance(other, dict) else None
+    owners = device.get('owners')
+    if isinstance(owners, list):
+        rows = sorted((o for o in owners if isinstance(o, dict)), key=_by_bytes)
+        keep, rest = rows[:BREAKDOWN_DEVICE_OWNERS], rows[BREAKDOWN_DEVICE_OWNERS:]
+        if rest:
+            other = other or {'owner_count': 0, 'bytes': 0, 'files': 0, 'cold_1y_bytes': 0, 'cold_3y_bytes': 0}
+            other['owner_count'] = (other.get('owner_count') or 0) + len(rest)
+            for k in _BREAKDOWN_NUMBERS:
+                values = [other.get(k)] + [_number_or_none(o.get(k)) for o in rest]
+                other[k] = None if any(v is None for v in values) else sum(values)
+        out['owners'] = [dict(owner=o.get('owner'), **_totals(o)) for o in keep]
+    else:
+        out['owners'] = None
+    out['other'] = other
+    return out
+
+
+def _breakdown_summary(data: Dict[str, Any]) -> dict:
+    """
+    What /api/storage/breakdown/all shows of one storage_breakdown message:
+    the device rollup (_breakdown_device) and every folder's totals with its
+    top owner, folders sorted by bytes descending and cut so the summary
+    stays within BREAKDOWN_SNAPSHOT_BYTES ("folders_truncated").
+    """
+    thresholds = data.get('cold_thresholds_days')
+    owner_source = data.get('owner_source')
+    summary = {
+        'owner_source': owner_source if isinstance(owner_source, str) else None,
+        'reference_time': data.get('reference_time') if isinstance(data.get('reference_time'), str) else None,
+        'cold_thresholds_days': [_number_or_none(t) for t in thresholds] if isinstance(thresholds, list) else None,
+        'device': _breakdown_device(data.get('device')),
+        'volume_owners': _scrub(data.get('volume_owners')),
+        'folders': [],
+        'folders_truncated': False,
+    }
+    folders = []
+    for f in data.get('folders') if isinstance(data.get('folders'), list) else ():
+        if not isinstance(f, dict):
+            continue
+        owners = sorted((o for o in f.get('owners') or () if isinstance(o, dict)
+                         and _number_or_none(o.get('bytes')) is not None), key=_by_bytes) \
+            if isinstance(f.get('owners'), list) else []
+        folder_owner = f.get('folder_owner')
+        folders.append(dict(path=f.get('path'), folder_owner=folder_owner if isinstance(folder_owner, str) else None,
+                            **_totals(f), top_owner=owners[0].get('owner') if owners else None,
+                            top_owner_bytes=_number_or_none(owners[0].get('bytes')) if owners else None))
+    folders.sort(key=_by_bytes)
+    size = len(_json_text(summary))
+    for f in folders:
+        size += len(_json_text(f)) + 2
+        if size > BREAKDOWN_SNAPSHOT_BYTES:
+            summary['folders_truncated'] = True
+            break
+        summary['folders'].append(f)
+    return summary
 
 
 class MetricsDB:
@@ -279,6 +444,11 @@ class MetricsDB:
     def _columns(self, table: str) -> set:
         return {row[1] for row in self._conn.query(f'PRAGMA table_info("{table}")')}
 
+    def _has_table(self, table: str) -> bool:
+        """False while a held-back migration has not created it yet (reads then return nothing)."""
+        return self._conn.query_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                                    (table,)) is not None
+
     def _init_schema(self):
         with self._conn.transaction() as db:
             # ---- device registry ----------------------------------------- #
@@ -337,6 +507,36 @@ class MetricsDB:
                 )
             ''')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_dead_letter_msg_id ON dead_letter (msg_id)')
+
+            # ---- latest state of the newer data types ---------------------- #
+            # (created in this first transaction: see _has_original_central_layout)
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_session_snapshot (
+                    name              TEXT PRIMARY KEY,
+                    timestamp         TEXT NOT NULL,
+                    summary_json      TEXT NOT NULL DEFAULT '{}',
+                    sessions_json     TEXT NOT NULL DEFAULT '[]',
+                    list_hash         TEXT,
+                    list_timestamp    TEXT,
+                    list_confirmed_at TEXT
+                )
+            ''')
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_storage_health (
+                    name           TEXT PRIMARY KEY,
+                    timestamp      TEXT NOT NULL,
+                    overall_status TEXT,
+                    summary_json   TEXT NOT NULL DEFAULT '{}'
+                )
+            ''')
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_storage_breakdown (
+                    name         TEXT PRIMARY KEY,
+                    timestamp    TEXT NOT NULL,
+                    owner_source TEXT,
+                    summary_json TEXT NOT NULL DEFAULT '{}'
+                )
+            ''')
 
         # Migration: add metrics_json to existing databases that pre-date it
         if 'metrics_json' not in self._columns('device_snapshot'):
@@ -494,6 +694,7 @@ class MetricsDB:
                         msg_id,
                         raw_timestamp=raw_timestamp,
                         update_snapshot=False,
+                        extra=_user_extra(payload),
                     )
             return
 
@@ -521,7 +722,14 @@ class MetricsDB:
                     payload.get('ram_formatted'),
                     msg_id,
                     raw_timestamp=raw_timestamp,
+                    extra=_user_extra(payload),
                 )
+            elif data_type == 'sessions':
+                self._update_session_snapshot(db, name, timestamp, payload)
+            elif data_type == 'storage_health':
+                self._update_health_snapshot(db, name, timestamp, payload)
+            elif data_type == 'storage_breakdown':
+                self._update_breakdown_snapshot(db, name, timestamp, payload)
             # Unknown / not_specified: nothing else to do in central DB
 
     def _warn_future(self, name: str, timestamp: str):
@@ -575,6 +783,13 @@ class MetricsDB:
                 INSERT INTO devices (name, system_id, device_type, first_seen, last_seen)
                 VALUES (?, ?, ?, ?, ?)
             ''', (name, system_id, device_type, timestamp, timestamp))
+            # Snapshots left by an older Manager's DELETE /api/system/<name>
+            # (it does not know these tables, so a downgrade could leave them):
+            # they belong to the deleted device, not to this new registration
+            ph = ', '.join('?' * len(_NEW_TABLES))
+            for (table,) in db.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({ph})",
+                                       _NEW_TABLES).fetchall():
+                db.execute(f'DELETE FROM {table} WHERE name = ?', (name,))
             return
         if _not_older(timestamp, row['last_seen']):
             db.execute('''
@@ -710,6 +925,92 @@ class MetricsDB:
         except Exception as e:
             logger.error(f"update_snapshot_disk failed for {name}: {e}")
             return False
+
+    # ------------------------------------------------------------------ #
+    # Write — snapshots of the newer data types                            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _update_session_snapshot(db, name, timestamp, data) -> bool:
+        """
+        Latest sessions state, unless a newer sessions message is stored.
+          summary   every non-list key of the message (counts, _sources, ...)
+          the list  "_list_state" full: replaced, list_timestamp and
+                    list_confirmed_at = this message; "unchanged" with the
+                    stored list's hash: kept, list_confirmed_at = this
+                    message; "unchanged" with another hash: kept as it is
+                    (its real age stays visible); "none": cleared.
+        Returns True if it was updated.
+        """
+        row = db.execute('SELECT * FROM device_session_snapshot WHERE name = ?', (name,)).fetchone()
+        if row is not None and not _not_older(timestamp, row['timestamp']):
+            return False
+        summary = {k: v for k, v in data.items()
+                   if k not in ('data_type', 'sessions') and not isinstance(v, list)}
+        if row is not None:
+            sessions_json, list_hash = row['sessions_json'], row['list_hash']
+            list_ts, confirmed = row['list_timestamp'], row['list_confirmed_at']
+        else:
+            sessions_json, list_hash, list_ts, confirmed = '[]', None, None, None
+        state, rows = data.get('_list_state'), data.get('sessions')
+        sent_hash = data.get('_list_hash') if isinstance(data.get('_list_hash'), str) else None
+        if state == 'full' or (state is None and isinstance(rows, list)):
+            sessions_json = _json_text(rows if isinstance(rows, list) else [])
+            list_hash, list_ts, confirmed = sent_hash, timestamp, timestamp
+        elif state == 'unchanged':
+            if list_ts is not None and sent_hash is not None and sent_hash == list_hash:
+                confirmed = timestamp
+        elif state == 'none':
+            sessions_json, list_hash, list_ts, confirmed = '[]', None, None, None
+        db.execute('''
+            INSERT INTO device_session_snapshot
+                (name, timestamp, summary_json, sessions_json, list_hash, list_timestamp, list_confirmed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                timestamp         = excluded.timestamp,
+                summary_json      = excluded.summary_json,
+                sessions_json     = excluded.sessions_json,
+                list_hash         = excluded.list_hash,
+                list_timestamp    = excluded.list_timestamp,
+                list_confirmed_at = excluded.list_confirmed_at
+        ''', (name, timestamp, _json_text(summary), sessions_json, list_hash, list_ts, confirmed))
+        return True
+
+    @staticmethod
+    def _update_health_snapshot(db, name, timestamp, data) -> bool:
+        """Latest storage_health message without its flattened history keys, unless a newer one is stored."""
+        row = db.execute('SELECT timestamp FROM device_storage_health WHERE name = ?', (name,)).fetchone()
+        if row is not None and not _not_older(timestamp, row['timestamp']):
+            return False
+        summary = {k: v for k, v in data.items()
+                   if k != 'data_type' and not (isinstance(k, str) and _FLAT_HEALTH_KEY.fullmatch(k))}
+        status = data.get('overall_status')
+        db.execute('''
+            INSERT INTO device_storage_health (name, timestamp, overall_status, summary_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                timestamp      = excluded.timestamp,
+                overall_status = excluded.overall_status,
+                summary_json   = excluded.summary_json
+        ''', (name, timestamp, status if isinstance(status, str) else None, _json_text(summary)))
+        return True
+
+    @staticmethod
+    def _update_breakdown_snapshot(db, name, timestamp, data) -> bool:
+        """Summary of the latest storage_breakdown message (_breakdown_summary), unless a newer one is stored."""
+        row = db.execute('SELECT timestamp FROM device_storage_breakdown WHERE name = ?', (name,)).fetchone()
+        if row is not None and not _not_older(timestamp, row['timestamp']):
+            return False
+        summary = _breakdown_summary(data)
+        db.execute('''
+            INSERT INTO device_storage_breakdown (name, timestamp, owner_source, summary_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                timestamp    = excluded.timestamp,
+                owner_source = excluded.owner_source,
+                summary_json = excluded.summary_json
+        ''', (name, timestamp, summary['owner_source'], _json_text(summary)))
+        return True
 
     # ------------------------------------------------------------------ #
     # Write — running totals                                               #
@@ -954,6 +1255,14 @@ class MetricsDB:
             d['units']           = self._extract_units(raw)
             d['gpus']            = raw.get('gpus', [])
             d['total_ram_bytes'] = _number_or_none(raw.get('total_ram_bytes'))
+            # Counter-based fields (spec §11), only when the latest message
+            # has them: a snapshot an older collector sent reads as before
+            for key in SYSTEM_METRICS_EXTRA:
+                if key in raw:
+                    d[key] = _number_or_none(raw[key])
+            if 'disk_busy_max_name' in raw:
+                d['disk_busy_max_name'] = raw['disk_busy_max_name'] \
+                    if isinstance(raw['disk_busy_max_name'], str) else None
             result[d['name']] = d
         return result
 
@@ -991,13 +1300,73 @@ class MetricsDB:
         return self.get_latest_disk_usage_for_all().get(self.resolve_read_name(name))
 
     # ------------------------------------------------------------------ #
+    # Read — snapshots of the newer data types                             #
+    # ------------------------------------------------------------------ #
+
+    def _snapshot_rows(self, table: str, name: Optional[str]) -> list:
+        """Rows of a snapshot table for registered devices (one device, or all); [] before the migration."""
+        if not self._has_table(table):
+            return []
+        where = 'WHERE s.name = ?' if name is not None else ''
+        return self._conn.query(
+            f'SELECT s.* FROM {table} s JOIN devices d ON d.name = s.name {where} ORDER BY s.name',
+            (self.resolve_read_name(name),) if name is not None else ())
+
+    @staticmethod
+    def _session_entry(row) -> dict:
+        return {
+            'timestamp': row['timestamp'],
+            'list_timestamp': row['list_timestamp'],
+            'list_confirmed_at': row['list_confirmed_at'],
+            'summary': _json_value(row['summary_json'], {}),
+            'sessions': _json_value(row['sessions_json'], []),
+        }
+
+    def get_all_sessions(self) -> Dict[str, Dict]:
+        """{name: {timestamp, list_timestamp, list_confirmed_at, summary, sessions}} (GET /api/sessions/all)."""
+        return {row['name']: self._session_entry(row) for row in self._snapshot_rows('device_session_snapshot', None)}
+
+    def get_sessions(self, name: str) -> Optional[Dict]:
+        rows = self._snapshot_rows('device_session_snapshot', name)
+        return self._session_entry(rows[0]) if rows else None
+
+    @staticmethod
+    def _health_entry(row) -> dict:
+        summary = _json_value(row['summary_json'], {})
+        out = {'timestamp': row['timestamp']}
+        out.update({k: summary.get(k) for k in _HEALTH_FIELDS})
+        return out
+
+    def get_all_storage_health(self) -> Dict[str, Dict]:
+        """{name: {timestamp, overall_status, status_reasons, sources, arrays, disks, volumes, events}}."""
+        return {row['name']: self._health_entry(row) for row in self._snapshot_rows('device_storage_health', None)}
+
+    def get_storage_health(self, name: str) -> Optional[Dict]:
+        rows = self._snapshot_rows('device_storage_health', name)
+        return self._health_entry(rows[0]) if rows else None
+
+    def get_all_breakdown(self) -> Dict[str, Dict]:
+        """
+        {name: {timestamp, owner_source, reference_time, cold_thresholds_days,
+        device, folders, folders_truncated, volume_owners}} (the summary of
+        each device's latest storage_breakdown, at most 50 KB each).
+        """
+        out = {}
+        for row in self._snapshot_rows('device_storage_breakdown', None):
+            entry = {'timestamp': row['timestamp']}
+            entry.update(_json_value(row['summary_json'], {}))
+            out[row['name']] = entry
+        return out
+
+    # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
 
     def delete_system(self, name: str) -> bool:
         """
         Remove ONE device's records from the central summary DB: devices,
-        device_snapshot, device_totals and the per-user tables of the row
+        device_snapshot, device_totals, the sessions / storage health /
+        storage breakdown snapshots and the per-user tables of the row
         reads for `name` return (that exact spelling if registered, else the
         spelling it resolves to), plus any per-user rows stored under exactly
         `name`.  Other registered spellings that normalize alike (two
@@ -1008,12 +1377,16 @@ class MetricsDB:
         try:
             with self._conn.transaction() as db:
                 names = {name, self.resolve_read_name(name)}
+                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 deleted = 0
                 for n in names:
                     for table, col in (('devices', 'name'), ('device_snapshot', 'name'),
                                        ('device_totals', 'name'), ('device_user_snapshot', 'name'),
-                                       ('user_metrics_history', 'device_name')):
-                        deleted += db.execute(f'DELETE FROM {table} WHERE {col} = ?', (n,)).rowcount
+                                       ('user_metrics_history', 'device_name'),
+                                       ('device_session_snapshot', 'name'), ('device_storage_health', 'name'),
+                                       ('device_storage_breakdown', 'name')):
+                        if table in tables:
+                            deleted += db.execute(f'DELETE FROM {table} WHERE {col} = ?', (n,)).rowcount
                 self._registered.difference_update(names)   # a deleted name is no longer grandfathered
             logger.info(f"Deleted system '{name}' ({', '.join(sorted(names))}) from central metrics DB "
                         f"({deleted} rows)")
@@ -1034,6 +1407,8 @@ class UserMetricsStore:
     Snapshot table  (device_user_snapshot): latest row per (device, username).
     History table   (user_metrics_history):  one row per (device, timestamp, username),
                                              msg_id UNIQUE for dedup.
+    Both carry the usage fields (USER_EXTRA_COLUMNS); the read methods leave
+    a NULL one out of a row (not measured, or stored before they existed).
     """
 
     def __init__(self, metrics_db: MetricsDB, init: bool = True):
@@ -1044,19 +1419,20 @@ class UserMetricsStore:
             self._init_tables()
 
     def _init_tables(self):
+        extra = ''.join(f',\n                    {c} {t}' for c, t in USER_EXTRA_COLUMNS)
         with self._conn.transaction() as db:
-            db.execute('''
+            db.execute(f'''
                 CREATE TABLE IF NOT EXISTS device_user_snapshot (
                     name          TEXT NOT NULL,
                     username      TEXT NOT NULL,
                     cpu_percent   REAL,
                     ram_bytes     INTEGER,
                     ram_formatted TEXT,
-                    timestamp     TEXT,
+                    timestamp     TEXT{extra},
                     PRIMARY KEY (name, username)
                 )
             ''')
-            db.execute('''
+            db.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_metrics_history (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     device_name TEXT NOT NULL,
@@ -1065,7 +1441,7 @@ class UserMetricsStore:
                     cpu_percent REAL,
                     ram_bytes   INTEGER,
                     ram_formatted TEXT,
-                    msg_id      TEXT
+                    msg_id      TEXT{extra}
                 )
             ''')
             cols = {row[1] for row in db.execute('PRAGMA table_info(user_metrics_history)').fetchall()}
@@ -1073,6 +1449,15 @@ class UserMetricsStore:
                 # Migration: existing rows get NULL (UNIQUE allows many NULLs)
                 db.execute('ALTER TABLE user_metrics_history ADD COLUMN msg_id TEXT')
                 logger.info("Migrated user_metrics_history: added msg_id column")
+            for table in ('device_user_snapshot', 'user_metrics_history'):
+                have = {row[1] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
+                added = [c for c, _ in USER_EXTRA_COLUMNS if c not in have]
+                for c, t in USER_EXTRA_COLUMNS:
+                    if c in added:
+                        # Migration: existing rows read NULL ("not measured")
+                        db.execute(f'ALTER TABLE {table} ADD COLUMN {c} {t}')
+                if added:
+                    logger.info(f"Migrated {table}: added {', '.join(added)} columns")
             db.execute('''
                 CREATE INDEX IF NOT EXISTS idx_umh_device_ts
                     ON user_metrics_history (device_name, timestamp)
@@ -1088,7 +1473,8 @@ class UserMetricsStore:
 
     @staticmethod
     def _ingest(db, device_name, timestamp, username, cpu_percent, ram_bytes,
-                ram_formatted, msg_id=None, raw_timestamp=None, update_snapshot=True):
+                ram_formatted, msg_id=None, raw_timestamp=None, update_snapshot=True,
+                extra: Optional[Dict[str, Any]] = None):
         """
         History row, unless it is there already: by msg_id (UNIQUE index),
         or because an older Manager stored this reading (a msg_id NULL row
@@ -1096,13 +1482,17 @@ class UserMetricsStore:
         the message's id: none, "legacy-...", or a collector's random id the
         older Manager dropped); the snapshot row only if this message is not
         older (and update_snapshot: False for a message from the future).
+        extra: the usage fields (USER_EXTRA_FIELDS -> number or None); the
+        snapshot takes them as sent, NULL included (not measured now).
         """
+        extra = extra or {}
+        values = [extra.get(c) for c in USER_EXTRA_FIELDS]
         row = db.execute(
             'SELECT timestamp FROM device_user_snapshot WHERE name = ? AND username = ?',
             (device_name, username)).fetchone()
         if update_snapshot and (row is None or _not_older(timestamp, row['timestamp'])):
             UserMetricsStore._upsert_snapshot(
-                db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted)
+                db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, extra)
         stamps = list(dict.fromkeys(t for t in (raw_timestamp, timestamp) if isinstance(t, str)))
         ph = ', '.join(['?'] * len(stamps))
         if stamps and db.execute(
@@ -1111,53 +1501,69 @@ class UserMetricsStore:
                 f'AND msg_id IS NULL LIMIT 1',
                 [device_name, username] + stamps).fetchone():
             return
-        db.execute('''
+        db.execute(f'''
             INSERT OR IGNORE INTO user_metrics_history
-                (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id))
+                (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id,
+                 {', '.join(USER_EXTRA_FIELDS)})
+            VALUES ({', '.join(['?'] * (7 + len(USER_EXTRA_FIELDS)))})
+        ''', [device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id] + values)
 
     @staticmethod
-    def _upsert_snapshot(db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted):
-        db.execute('''
+    def _upsert_snapshot(db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted,
+                         extra: Optional[Dict[str, Any]] = None):
+        extra = extra or {}
+        updates = ''.join(f',\n                {c} = excluded.{c}' for c in USER_EXTRA_FIELDS)
+        db.execute(f'''
             INSERT INTO device_user_snapshot
-                (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp, {', '.join(USER_EXTRA_FIELDS)})
+            VALUES ({', '.join(['?'] * (6 + len(USER_EXTRA_FIELDS)))})
             ON CONFLICT(name, username) DO UPDATE SET
                 cpu_percent   = excluded.cpu_percent,
                 ram_bytes     = excluded.ram_bytes,
                 ram_formatted = excluded.ram_formatted,
-                timestamp     = excluded.timestamp
-        ''', (device_name, username, cpu_percent, ram_bytes, ram_formatted, timestamp))
+                timestamp     = excluded.timestamp{updates}
+        ''', [device_name, username, cpu_percent, ram_bytes, ram_formatted, timestamp]
+                   + [extra.get(c) for c in USER_EXTRA_FIELDS])
 
     def ingest(self, device_name: str, timestamp: str, username: str,
                cpu_percent: Optional[float], ram_bytes: Optional[int],
-               ram_formatted: Optional[str], msg_id: Optional[str] = None):
+               ram_formatted: Optional[str], msg_id: Optional[str] = None,
+               extra: Optional[Dict[str, Any]] = None):
         """Store one user-metric observation: updates snapshot + appends history."""
         with self._metrics_db._write() as db:
             self._ingest(db, device_name, timestamp, username, cpu_percent,
-                         ram_bytes, ram_formatted, msg_id)
+                         ram_bytes, ram_formatted, msg_id, extra=extra)
+
+    def _extra_select(self, table: str) -> str:
+        """', <usage columns>' that `table` has (none while a held-back migration has not added them)."""
+        have = {row[1] for row in self._conn.query(f'PRAGMA table_info({table})')}
+        return ''.join(f', {c}' for c in USER_EXTRA_FIELDS if c in have)
+
+    @staticmethod
+    def _user_row(row) -> dict:
+        """A per-user row; a usage field that is NULL (unmeasured) is left out."""
+        return {k: v for k, v in dict(row).items() if v is not None or k not in USER_EXTRA_FIELDS}
 
     def get_snapshot(self, device_name: str) -> list:
         """Current users for one device, sorted by cpu_percent desc."""
-        rows = self._conn.query('''
-            SELECT username, cpu_percent, ram_bytes, ram_formatted, timestamp
+        rows = self._conn.query(f'''
+            SELECT username, cpu_percent, ram_bytes, ram_formatted, timestamp{self._extra_select('device_user_snapshot')}
             FROM device_user_snapshot
             WHERE name = ?
             ORDER BY cpu_percent DESC
         ''', (device_name,))
-        return [dict(r) for r in rows]
+        return [self._user_row(r) for r in rows]
 
     def get_all_snapshots(self) -> dict:
         """Current users for all devices. Returns {device_name: [user_rows]}."""
-        rows = self._conn.query('''
-            SELECT name, username, cpu_percent, ram_bytes, ram_formatted, timestamp
+        rows = self._conn.query(f'''
+            SELECT name, username, cpu_percent, ram_bytes, ram_formatted, timestamp{self._extra_select('device_user_snapshot')}
             FROM device_user_snapshot
             ORDER BY name, cpu_percent DESC
         ''')
         result = {}
         for row in rows:
-            d = dict(row)
+            d = self._user_row(row)
             result.setdefault(d.pop('name'), []).append(d)
         return result
 
@@ -1174,14 +1580,14 @@ class UserMetricsStore:
 
     def get_history(self, device_name: str, username: str, limit: int = 200) -> list:
         """Time-series rows for one user on one device."""
-        rows = self._conn.query('''
-            SELECT timestamp, cpu_percent, ram_bytes, ram_formatted
+        rows = self._conn.query(f'''
+            SELECT timestamp, cpu_percent, ram_bytes, ram_formatted{self._extra_select('user_metrics_history')}
             FROM user_metrics_history
             WHERE device_name = ? AND username = ?
             ORDER BY timestamp DESC
             LIMIT ?
         ''', (device_name, username, limit))
-        return [dict(r) for r in rows]
+        return [self._user_row(r) for r in rows]
 
     # ---- retention support (archive_metrics.py) ---- #
 

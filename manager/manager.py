@@ -17,6 +17,7 @@ import time
 import hashlib
 import logging
 import logging.handlers
+import math
 import argparse
 import sqlite3
 import threading
@@ -29,9 +30,10 @@ from werkzeug.exceptions import HTTPException
 from functools import wraps
 import re
 
+import rollups
 from metrics import MetricsDB
 from data_store import (
-    TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE,
+    TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE, table_for_data_type,
 )
 from storage_util import (
     InstanceLock, InstanceLockError, canonical_timestamp, format_timestamp, is_transient_db_error,
@@ -57,6 +59,14 @@ _PLACEHOLDER_MARKERS = (
     'GENERATE-RANDOM', 'GENERATE_RANDOM', 'PLACEHOLDER', 'REPLACE-ME', 'REPLACE_ME',
 )
 _MSG_ID_RE = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
+# /api/user_metrics/usage result cache (manager config "usage_cache_seconds")
+DEFAULT_USAGE_CACHE_SECONDS = 300
+USAGE_WINDOWS = {'24h': 86400, '7d': 7 * 86400, '30d': 30 * 86400}
+# /api/history ?resolution= and ?entity= (one user of user_metrics)
+HISTORY_RESOLUTIONS = ('auto', 'raw', 'hour', 'day')
+MAX_ENTITY_LEN = 256
+# /api/storage/breakdown/<name>?folder= (a folder path)
+MAX_FOLDER_LEN = 4096
 
 
 def write_pid_file():
@@ -193,6 +203,11 @@ _data_store = None
 _user_metrics = None   # initialised in init_app()
 _auth = None
 _cors_enabled = False
+_rollup_backfill = None   # rollups.BackfillThread, started by main()
+_usage_cache_seconds = DEFAULT_USAGE_CACHE_SECONDS
+# (window, device, top) -> (time.monotonic() computed, answer)
+_usage_cache = {}
+_usage_cache_lock = threading.Lock()
 # Grandfathered device names already logged once by this process
 _grandfather_warned = set()
 
@@ -361,7 +376,10 @@ def require_scope(scope: str):
 # ---------------------------------------------------------------------------
 
 def _close_stores():
-    global _metrics_db, _data_store, _user_metrics
+    global _metrics_db, _data_store, _user_metrics, _rollup_backfill
+    if _rollup_backfill is not None:
+        _rollup_backfill.stop()
+        _rollup_backfill = None
     for store in (_data_store, _metrics_db):
         if store is not None:
             try:
@@ -383,12 +401,35 @@ def validate_config(config: dict, logger: logging.Logger) -> _AuthConfig:
             raise ConfigError(f"{key} must be a positive integer")
     if not isinstance(config.get('backup_before_migration', True), bool):
         raise ConfigError("backup_before_migration must be true or false")
+    # Optional feature settings: a bad value is logged and replaced by its
+    # default, never a reason to refuse to start
+    rollups.settings_from_config(config, logger)
+    usage_cache_seconds(config, logger)
     return auth
+
+
+def usage_cache_seconds(config: dict, logger: logging.Logger = None) -> float:
+    """
+    Config "usage_cache_seconds" (default 300): how long a
+    /api/user_metrics/usage answer is reused; 0 = not cached.  A bad value
+    is logged (when logger is given) and replaced by the default.
+    """
+    value = config.get('usage_cache_seconds')
+    if value is None:
+        return DEFAULT_USAGE_CACHE_SECONDS
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+            not math.isfinite(value) or value < 0:
+        if logger:
+            logger.warning(f"Config 'usage_cache_seconds' = {value!r} is invalid (a number of seconds "
+                           f">= 0); using the default {DEFAULT_USAGE_CACHE_SECONDS}")
+        return DEFAULT_USAGE_CACHE_SECONDS
+    return value
 
 
 def init_app(config: dict, logger: logging.Logger = None):
     """Initialize app with config. Raises ConfigError for unsafe config."""
     global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled
+    global _usage_cache_seconds
     logger = logger or logging.getLogger('manager')
 
     auth = validate_config(config, logger)
@@ -398,6 +439,9 @@ def init_app(config: dict, logger: logging.Logger = None):
     _logger = logger
     _auth = auth
     _grandfather_warned.clear()
+    _usage_cache_seconds = usage_cache_seconds(config)
+    with _usage_cache_lock:
+        _usage_cache.clear()
 
     app.config['MAX_CONTENT_LENGTH'] = int(config.get('max_request_bytes', DEFAULT_MAX_REQUEST_BYTES))
 
@@ -417,8 +461,15 @@ def init_app(config: dict, logger: logging.Logger = None):
     logger.info(f"Central metrics DB: {db_path}")
 
     # Per-system typed data store (full history); existing databases are
-    # opened (and upgraded where needed) now rather than on first request
-    _data_store = TypedDataStore(data_dir=data_dir, backup_before_migration=backup)
+    # opened (and upgraded where needed) now rather than on first request.
+    # Rollups are written with every new row; the rows already stored are
+    # rolled up by the background backfill (start_rollup_backfill_thread).
+    rollup_settings = rollups.settings_from_config(config)
+    engine = rollups.RollupEngine(rollup_settings) if rollup_settings['enabled'] else None
+    if engine is None:
+        logger.warning("Rollups disabled (rollups.enabled is false): no hourly/daily rollups are "
+                       "written; rows stored meanwhile are rolled up when they are enabled again")
+    _data_store = TypedDataStore(data_dir=data_dir, backup_before_migration=backup, rollups=engine)
     blocked = _data_store.prepare_existing()
     logger.info(f"TypedDataStore root: {data_dir}")
     if _metrics_db.upgrade_blocked or blocked:
@@ -727,21 +778,58 @@ def _legacy_id(batch_name: str, header: dict, payload: dict) -> str:
     return "legacy-" + hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
-# Fields whose value must be a number or null when present
+# Fields whose value must be a number or null when present (otherwise the
+# message is rejected)
 _NUMERIC_FIELDS = {
     'system_metrics': ('cpu_percent', 'ram_percent', 'total_ram_bytes', 'uptime_seconds',
                        'network_bytes_in', 'network_bytes_out',
-                       'network_bandwidth_in_mbps', 'network_bandwidth_out_mbps', 'gpu_count'),
-    'user_metrics':   ('cpu_percent', 'ram_bytes'),
+                       'network_bandwidth_in_mbps', 'network_bandwidth_out_mbps', 'gpu_count',
+                       'interval_s', 'cpu_count', 'cpu_iowait_percent', 'cpu_steal_percent',
+                       'proc_cpu_coverage_percent', 'disk_read_bytes_per_s', 'disk_write_bytes_per_s',
+                       'disk_read_iops', 'disk_write_iops', 'disk_await_ms', 'disk_busy_max_percent',
+                       'gpu_sample_seconds'),
+    'user_metrics':   ('cpu_percent', 'ram_bytes', 'cpu_seconds', 'cpu_cores', 'interval_s',
+                       'process_count', 'gpu_vram_bytes', 'gpu_util_percent', 'gpu_busy_seconds',
+                       'gpus_held', 'gpu_held_seconds', 'gpu_processes'),
     'folder_usage':   ('total_usage',),
+    'sessions':       ('clients_total', 'users_total', 'rdp_disconnected'),
+    'storage_health': ('overall_status_code',),
 }
+# Keys that are numeric only because their name matches a pattern: a value
+# that is not a number (or null) is DROPPED and listed in "_dropped_fields",
+# the rest of the message is stored (R8: a later collector may add a string
+# key that happens to match, e.g. "disk_sata1_model").
+_NUMERIC_PATTERNS = {
+    'sessions':       re.compile(r'[a-z][a-z0-9]{0,15}_(?:clients|users)'),
+    'storage_health': re.compile(r'(?:disk|array|volume)_[a-z0-9_]+'),
+}
+
+_HEALTH_STATUS = ('ok', 'warning', 'critical', 'unknown')
+_LIST_STATES = ('full', 'unchanged', 'none')
+_SERVICE_RE = re.compile(r'[a-z][a-z0-9]{0,15}')
+# Hard caps on nested lists (larger = rejected) and R10 string limits
+_MAX_GPU_USERS = 64
+_MAX_SESSIONS = 5000
+_HEALTH_LIST_CAPS = {'arrays': 128, 'disks': 512, 'volumes': 64}
+_MAX_BREAKDOWN_FOLDERS = 10000
+_MAX_BREAKDOWN_ROWS = 50000
+_MAX_USERNAME = 256
+_MAX_PATH = 4096
+_MAX_COMPONENT_ID = 64
+_MAX_CLIENT = 256
+_MAX_REASONS, _MAX_REASON_LEN = 10, 200
+_BREAKDOWN_NUMBERS = ('bytes', 'files', 'cold_1y_bytes', 'cold_3y_bytes')
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _validate_known_fields(table: str, payload: dict):
     """Reject messages whose well-known fields have unusable values."""
     for field in _NUMERIC_FIELDS.get(table, ()):
         value = payload.get(field)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+        if value is not None and not _is_number(value):
             raise RejectedMessage(f"field '{field}' must be a number or null")
     if table == 'user_metrics':
         username = payload.get('username')
@@ -750,6 +838,231 @@ def _validate_known_fields(table: str, payload: dict):
         rf = payload.get('ram_formatted')
         if rf is not None and not isinstance(rf, str):
             raise RejectedMessage("field 'ram_formatted' must be a string or null")
+    elif table == 'system_metrics':
+        name = payload.get('disk_busy_max_name')
+        if name is not None and not isinstance(name, str):
+            raise RejectedMessage("field 'disk_busy_max_name' must be a string or null")
+        gpus = payload.get('gpus')
+        # JSON text is what stored rows hold (an older Manager kept any form;
+        # tools that rebuild messages from rows re-send it): accepted as is
+        if gpus is not None and not isinstance(gpus, (list, str)):
+            raise RejectedMessage("field 'gpus' must be a list or null")
+        for gpu in gpus if isinstance(gpus, list) else ():
+            users = gpu.get('users') if isinstance(gpu, dict) else None
+            if users is not None and (not isinstance(users, list) or len(users) > _MAX_GPU_USERS):
+                raise RejectedMessage(f"field 'gpus[].users' must be a list of at most "
+                                      f"{_MAX_GPU_USERS} entries or null")
+    elif table == 'sessions':
+        _check_list(payload, 'sessions', _MAX_SESSIONS)
+        state = payload.get('_list_state')
+        if state is not None and state not in _LIST_STATES:
+            raise RejectedMessage("field '_list_state' must be one of " + ', '.join(_LIST_STATES))
+        list_hash = payload.get('_list_hash')
+        if list_hash is not None and (not isinstance(list_hash, str) or len(list_hash) > 64):
+            raise RejectedMessage("field '_list_hash' must be a string of at most 64 characters or null")
+        sources = payload.get('_sources')
+        if sources is not None and not isinstance(sources, dict):
+            raise RejectedMessage("field '_sources' must be an object or null")
+    elif table == 'storage_health':
+        status = payload.get('overall_status')
+        if status is not None and status not in _HEALTH_STATUS:
+            raise RejectedMessage("field 'overall_status' must be one of " + ', '.join(_HEALTH_STATUS))
+        for key, cap in _HEALTH_LIST_CAPS.items():
+            _check_list(payload, key, cap)
+        reasons = payload.get('status_reasons')
+        if reasons is not None and not isinstance(reasons, list):
+            raise RejectedMessage("field 'status_reasons' must be a list or null")
+    elif table == 'storage_breakdown':
+        folders = _check_list(payload, 'folders', _MAX_BREAKDOWN_FOLDERS)
+        device = payload.get('device')
+        if device is not None and not isinstance(device, dict):
+            raise RejectedMessage("field 'device' must be an object or null")
+        rows = _breakdown_rows(device) if device else 0
+        for folder in folders or ():
+            if isinstance(folder, dict):
+                other = folder.get('other')
+                if other is not None and not isinstance(other, dict):
+                    raise RejectedMessage("field 'folders[].other' must be an object or null")
+                rows += _breakdown_rows(folder)
+        if rows > _MAX_BREAKDOWN_ROWS:
+            raise RejectedMessage(f"storage_breakdown has {rows} rows (max {_MAX_BREAKDOWN_ROWS})")
+
+
+def _check_list(payload: dict, key: str, cap: int):
+    value = payload.get(key)
+    if value is not None and (not isinstance(value, list) or len(value) > cap):
+        raise RejectedMessage(f"field '{key}' must be a list of at most {cap} entries or null")
+    return value
+
+
+def _breakdown_rows(entry: dict) -> int:
+    """Narrow rows one storage_breakdown folder (or device) entry costs: total + owners + other."""
+    owners = entry.get('owners')
+    other = entry.get('other')
+    return 1 + (len(owners) if isinstance(owners, list) else 0) + (1 if isinstance(other, dict) else 0)
+
+
+def _finite_numbers(row: dict, keys=None) -> bool:
+    """No non-finite number among row's values (or the given keys)."""
+    values = row.values() if keys is None else (row.get(k) for k in keys)
+    return not any(isinstance(v, float) and not math.isfinite(v) for v in values)
+
+
+def _short_str(value, limit: int, required: bool = False) -> bool:
+    if value is None:
+        return not required
+    return isinstance(value, str) and (value != '' or not required) and len(value) <= limit
+
+
+def _ids_ok(value) -> bool:
+    return value is None or (isinstance(value, list) and
+                             all(_short_str(v, _MAX_COMPONENT_ID, required=True) for v in value))
+
+
+def _gpu_user_ok(row) -> bool:
+    return (isinstance(row, dict) and _short_str(row.get('username'), _MAX_USERNAME, required=True)
+            and all(row.get(k) is None or _is_number(row.get(k))
+                    for k in ('vram_bytes', 'util_percent', 'processes'))
+            and _finite_numbers(row))
+
+
+def _session_ok(row) -> bool:
+    if not isinstance(row, dict) or not _finite_numbers(row):
+        return False
+    service = row.get('service')
+    return (isinstance(service, str) and _SERVICE_RE.fullmatch(service) is not None
+            and _short_str(row.get('username'), _MAX_USERNAME)
+            and _short_str(row.get('client'), _MAX_CLIENT)
+            and _short_str(row.get('client_host'), _MAX_CLIENT)
+            and (row.get('connections') is None or _is_number(row.get('connections'))))
+
+
+def _component_ok(row) -> bool:
+    """A storage_health arrays / disks / volumes row (status in the enum, ids within R10)."""
+    return (isinstance(row, dict) and row.get('status') in _HEALTH_STATUS
+            and _short_str(row.get('id'), _MAX_COMPONENT_ID, required=True)
+            and all(_ids_ok(row.get(k)) for k in ('members', 'faulty_members', 'arrays'))
+            and _finite_numbers(row))
+
+
+def _breakdown_numbers_ok(row: dict) -> bool:
+    for key in _BREAKDOWN_NUMBERS:
+        value = row.get(key)
+        if value is None:
+            continue
+        if not _is_number(value) or not math.isfinite(value) or value < 0:
+            return False
+    return _finite_numbers(row)
+
+
+def _owner_ok(row) -> bool:
+    return (isinstance(row, dict) and _short_str(row.get('owner'), _MAX_USERNAME, required=True)
+            and _breakdown_numbers_ok(row))
+
+
+def _sanitize_breakdown_entry(entry: dict, is_folder: bool):
+    """(sanitized copy, rows dropped) of a folder or device entry, or (None, 1) if unusable."""
+    if not isinstance(entry, dict) or not _breakdown_numbers_ok(entry):
+        return None, 1
+    if is_folder and not (_short_str(entry.get('path'), _MAX_PATH, required=True)
+                          and _short_str(entry.get('folder_owner'), _MAX_USERNAME)):
+        return None, 1
+    out, dropped = dict(entry), 0
+    owners = entry.get('owners')
+    if owners is not None:
+        if not isinstance(owners, list):
+            return None, 1
+        kept, seen = [], set()
+        for o in owners:
+            # a second row for the same owner is dropped too (one narrow row per owner)
+            if _owner_ok(o) and o['owner'] not in seen:
+                seen.add(o['owner'])
+                kept.append(o)
+        out['owners'] = kept
+        dropped += len(owners) - len(kept)
+    other = entry.get('other')
+    if isinstance(other, dict) and not _breakdown_numbers_ok(other):
+        out['other'] = None
+        dropped += 1
+    return out, dropped
+
+
+def _sanitize_known(table: str, payload: dict) -> dict:
+    """
+    A copy of a validated payload with the bad parts of the new data types
+    removed (R8), so the same payload is stored and used for side effects:
+      - pattern-matched numeric keys (sessions <svc>_clients / <svc>_users,
+        storage_health disk_* / array_* / volume_*) holding anything but a
+        number or null are dropped and listed in "_dropped_fields";
+      - nested rows that are not objects, whose status is outside its enum,
+        with strings over the R10 limits, non-finite numbers, or (in
+        storage_breakdown) negative byte counts, a folder path or an owner
+        already listed are dropped and counted in "_dropped_rows";
+      - storage_health status_reasons keeps at most 10 strings of at most
+        200 characters.
+    Messages without such keys (every old collector's) come back unchanged.
+    """
+    out = dict(payload)
+    pattern = _NUMERIC_PATTERNS.get(table)
+    dropped_fields = []
+    if pattern is not None:
+        for key, value in payload.items():
+            if isinstance(key, str) and pattern.fullmatch(key) and value is not None and not _is_number(value):
+                del out[key]
+                dropped_fields.append(key)
+    dropped_rows = 0
+
+    def keep(key, ok):
+        nonlocal dropped_rows
+        rows = out.get(key)
+        if isinstance(rows, list):
+            kept = [r for r in rows if ok(r)]
+            dropped_rows += len(rows) - len(kept)
+            out[key] = kept
+
+    if table == 'system_metrics' and isinstance(out.get('gpus'), list):
+        gpus = []
+        for gpu in out['gpus']:
+            if isinstance(gpu, dict) and isinstance(gpu.get('users'), list):
+                users = [u for u in gpu['users'] if _gpu_user_ok(u)]
+                dropped_rows += len(gpu['users']) - len(users)
+                gpu = dict(gpu, users=users)
+            gpus.append(gpu)
+        out['gpus'] = gpus
+    elif table == 'sessions':
+        keep('sessions', _session_ok)
+    elif table == 'storage_health':
+        for key in _HEALTH_LIST_CAPS:
+            keep(key, _component_ok)
+        reasons = out.get('status_reasons')
+        if isinstance(reasons, list):
+            kept = [r[:_MAX_REASON_LEN] for r in reasons if isinstance(r, str)][:_MAX_REASONS]
+            dropped_rows += sum(1 for r in reasons if not isinstance(r, str))
+            out['status_reasons'] = kept
+    elif table == 'storage_breakdown':
+        if isinstance(out.get('folders'), list):
+            folders, paths = [], set()
+            for folder in out['folders']:
+                clean, n = _sanitize_breakdown_entry(folder, is_folder=True)
+                if clean is not None and clean['path'] in paths:
+                    clean, n = None, 1          # the same folder twice: the first entry is kept
+                dropped_rows += n
+                if clean is not None:
+                    paths.add(clean['path'])
+                    folders.append(clean)
+            out['folders'] = folders
+        if isinstance(out.get('device'), dict):
+            clean, n = _sanitize_breakdown_entry(out['device'], is_folder=False)
+            dropped_rows += n
+            out['device'] = clean
+
+    if dropped_fields:
+        earlier = payload.get('_dropped_fields')
+        out['_dropped_fields'] = (earlier if isinstance(earlier, list) else []) + dropped_fields
+    if dropped_rows:
+        earlier = payload.get('_dropped_rows')
+        out['_dropped_rows'] = (earlier if _is_number(earlier) else 0) + dropped_rows
+    return out
 
 
 def _process_message(batch_name: str, system_id, msg) -> dict:
@@ -808,6 +1121,7 @@ def _process_message(batch_name: str, system_id, msg) -> dict:
 
         table = _data_store.ingest_table(dev_name, data_type)
         _validate_known_fields(table, payload)
+        payload = _sanitize_known(table, payload)
 
         central_name = _metrics_db.resolve_name(dev_name, dev_id)
 
@@ -994,6 +1308,101 @@ def get_all_user_metrics():
     return jsonify(_user_metrics.get_all_snapshots()), 200
 
 
+@app.route('/api/user_metrics/usage', methods=['GET'])
+@require_scope('read')
+def get_user_usage():
+    """
+    Per-user CPU and GPU totals over a window (requires Bearer token).
+
+    Query parameters:
+        - window: 24h (default), 7d or 30d (ending now)
+        - device: only this system (404 if unknown)
+        - top:    users per device, 1-200 (default 50)
+
+    Returns: {"window", "from", "to", "devices": {"<name>": {"source": "rollups"|"raw",
+              "complete": bool, "users": [{"username", "samples", "cpu_core_hours", "avg_cores",
+              "peak_cores", "gpu_busy_hours", "gpu_held_hours", "peak_gpu_vram_bytes"}]}}}
+    Users are sorted by gpu_busy_hours, then cpu_core_hours (descending, null
+    last); a value with no measurement in the window is null.  From the
+    hourly rollups once they are complete ("rollups": they include the hour
+    the window starts in, so a total can hold up to one hour more), else
+    from the raw rows ("raw", complete false while the rollup backfill is
+    pending).  Answers are reused for usage_cache_seconds (default 300).
+    This static route shadows a device named "usage" in
+    /api/user_metrics/<device_name>.
+    """
+    window = request.args.get('window') or '24h'
+    if window not in USAGE_WINDOWS:
+        return _error(400, "'window' must be one of " + ', '.join(USAGE_WINDOWS))
+    try:
+        top = _int_arg('top', 50, minimum=1, maximum=200)
+    except _BadArg as e:
+        return _error(400, str(e))
+    device = request.args.get('device')
+    if device is not None:
+        if not validate_nas_name(device):
+            return _error(400, "Invalid device name")
+        if not _system_known(device):
+            return _error(404, "System not found")
+
+    key = (window, device, top)
+    now = time.monotonic()
+    with _usage_cache_lock:
+        hit = _usage_cache.get(key)
+    if hit is not None and now - hit[0] < _usage_cache_seconds:
+        return jsonify(hit[1]), 200
+    answer = _compute_usage(window, device, top)
+    if _usage_cache_seconds > 0:
+        with _usage_cache_lock:
+            for k in [k for k, (t, _) in _usage_cache.items() if now - t >= _usage_cache_seconds]:
+                del _usage_cache[k]
+            _usage_cache[key] = (now, answer)
+    return jsonify(answer), 200
+
+
+def _compute_usage(window: str, device, top: int) -> dict:
+    seconds = USAGE_WINDOWS[window]
+    now = datetime.now(timezone.utc)
+    start, end = format_timestamp(now - timedelta(seconds=seconds)), format_timestamp(now)
+    # every system with a history database, under the name the Dashboard knows it by
+    targets = [(device, device)] if device is not None else \
+        [(_metrics_db.resolve_read_name(d), d) for d in _data_store.list_systems()]
+    devices = {}
+    for name, system in targets:
+        try:
+            usage = _data_store.user_usage(system, start, end)
+        except Exception:
+            _logger.error(f"Usage totals of {system} failed", exc_info=True)
+            continue
+        if usage is not None:
+            devices[name] = {'source': usage['source'], 'complete': usage['complete'],
+                             'users': _usage_users(usage['users'], seconds, top)}
+    return {'window': window, 'from': start, 'to': end, 'devices': devices}
+
+
+def _usage_users(users: dict, seconds: int, top: int) -> list:
+    def hours(v):
+        return v / 3600.0 if v is not None else None
+
+    out = []
+    for username, u in users.items():
+        cpu = u['sums']['cpu_seconds']
+        vram = u['peaks']['gpu_vram_bytes']
+        out.append({
+            'username':            username,
+            'samples':             u['samples'],
+            'cpu_core_hours':      hours(cpu),
+            'avg_cores':           cpu / seconds if cpu is not None else None,
+            'peak_cores':          u['peaks']['cpu_cores'],
+            'gpu_busy_hours':      hours(u['sums']['gpu_busy_seconds']),
+            'gpu_held_hours':      hours(u['sums']['gpu_held_seconds']),
+            'peak_gpu_vram_bytes': int(vram) if isinstance(vram, float) and vram.is_integer() else vram,
+        })
+    out.sort(key=lambda r: (r['gpu_busy_hours'] is None, -(r['gpu_busy_hours'] or 0),
+                            r['cpu_core_hours'] is None, -(r['cpu_core_hours'] or 0), r['username']))
+    return out[:top]
+
+
 @app.route('/api/user_metrics/<device_name>', methods=['GET'])
 @require_scope('read')
 def get_device_user_metrics(device_name: str):
@@ -1147,6 +1556,19 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                           down to N points ("downsampled") rather than cut off.
         ?max_points=N     Bucket-average the selected range server-side into at
                           most N points (equal-width time buckets).
+        ?resolution=R     auto (default), raw, hour or day.  With auto a window
+                          query on a rolled-up field is answered from its
+                          hourly / daily rollups when the points would be at
+                          least an hour / a day wide; raw while the rollup
+                          backfill is pending, for a tail query, for
+                          user_metrics without entity and when the window
+                          holds at most max_points values.  A rollup point
+                          lies at the count-weighted centre of its hours /
+                          days, never outside the window's first and last
+                          value.
+        ?entity=USER      Only this user's values (user_metrics; 1-256
+                          printable characters).  Without it every user's
+                          values are mixed into one series, as before.
 
     Returns:
         {
@@ -1159,8 +1581,12 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                 ...
             ],
             "truncated": false,
-            "downsampled": false
+            "downsampled": false,
+            "entity": null, "resolution": "raw", "bucket_seconds": null, "downsampled_from": null
         }
+    A point that averages several values (downsampled raw data, rollups)
+    also has "min", "max" and "count"; bucket_seconds is the width of such a
+    point and downsampled_from the number of values averaged.
     404 if the system is unknown.
     """
     if not validate_nas_name(system_name):
@@ -1173,6 +1599,15 @@ def get_metric_history(system_name: str, data_type: str, field: str):
         use_window = bool(from_param)
         limit      = _int_arg('limit', DEFAULT_ROW_LIMIT if use_window else 500)
         max_points = _int_arg('max_points', None, minimum=1, maximum=100000)
+        resolution = request.args.get('resolution') or 'auto'
+        if resolution not in HISTORY_RESOLUTIONS:
+            raise _BadArg("'resolution' must be one of " + ', '.join(HISTORY_RESOLUTIONS))
+        entity = request.args.get('entity')
+        if entity is not None:
+            if not 1 <= len(entity) <= MAX_ENTITY_LEN or not entity.isprintable():
+                raise _BadArg(f"'entity' must be 1-{MAX_ENTITY_LEN} printable characters")
+            if not (rollups.REGISTRY.get(_table_of(data_type)) or {}).get('entity'):
+                raise _BadArg("'entity' is only supported for user_metrics")
     except _BadArg as e:
         return _error(400, str(e))
     if not _system_known(system_name):
@@ -1190,8 +1625,9 @@ def get_metric_history(system_name: str, data_type: str, field: str):
     series = _data_store.get_field_series(
         system_name, data_type, field_norm,
         start=from_param, end=to_param if use_window else None,
-        limit=limit, max_points=max_points,
+        limit=limit, max_points=max_points, entity=entity, resolution=resolution,
     )
+    plain = {'entity': entity, 'resolution': 'raw', 'bucket_seconds': None, 'downsampled_from': None}
 
     if series is None:
         if data_type == FOLDER_USAGE:
@@ -1211,7 +1647,7 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                 val_raw = snapshot.get(fn)
                 if ts and val_raw is not None:
                     try:
-                        return jsonify({
+                        return jsonify(dict({
                             'system_name': system_name,
                             'data_type':   data_type,
                             'field':       fn,
@@ -1219,27 +1655,163 @@ def get_metric_history(system_name: str, data_type: str, field: str):
                             'data':        [{'timestamp': ts, 'value': float(val_raw)}],
                             'truncated':   False,
                             'downsampled': False,
-                        }), 200
+                        }, **plain)), 200
                     except (ValueError, TypeError):
                         pass
-        return jsonify({
+        return jsonify(dict({
             'system_name': system_name,
             'data_type':   data_type,
             'field':       field_norm,
             'data':        [],
             'truncated':   False,
             'downsampled': False,
-        }), 200
+        }, **plain)), 200
 
     return jsonify({
         'system_name': system_name,
         'data_type':   data_type,
         'field':       series['field'],
         'unit':        series['unit'],
-        'data':        [{'timestamp': ts, 'value': v} for ts, v in series['points']],
+        'data':        [_history_point(p) for p in series['points']],
         'truncated':   series['truncated'],
         'downsampled': series['downsampled'],
+        'entity':      series['entity'],
+        'resolution':  series['resolution'],
+        'bucket_seconds':   series['bucket_seconds'],
+        'downsampled_from': series['downsampled_from'],
     }), 200
+
+
+def _history_point(p) -> dict:
+    """(timestamp, value) or (timestamp, average, min, max, count) as a history point."""
+    if len(p) == 5:
+        return {'timestamp': p[0], 'value': p[1], 'min': p[2], 'max': p[3], 'count': p[4]}
+    return {'timestamp': p[0], 'value': p[1]}
+
+
+def _table_of(data_type) -> str:
+    """The table a history data_type label reads (rollups.REGISTRY keys)."""
+    try:
+        return table_for_data_type(data_type)
+    except RejectedMessage:
+        return ''
+
+
+@app.route('/api/rollups/status', methods=['GET'])
+@require_scope('read')
+def get_rollup_status():
+    """
+    Rollup backfill progress per system and table (requires Bearer token).
+
+    Returns: {"<system directory>": {"<table>": {
+                 "pending_ids":   ids still to roll up (id span, not a row count),
+                 "done_ids":      ids rolled up so far (id span),
+                 "frozen_before": retention cutoff (rows older are never rolled up again) or null,
+                 "series":        number of rollup series,
+                 "complete":      no backfill range pending,
+                 "last_live_id":  newest row id rolled up live or queued}}}
+    {} when no database has rollups yet (or rollups have never been enabled).
+    """
+    return jsonify(_data_store.rollup_status()), 200
+
+
+# ---------------------------------------------------------------------------
+# Latest state of the newer data types (sessions, storage health and
+# storage breakdown).  A Manager before them answers 404, which the
+# Dashboard reads as "feature not available".  The static .../all routes
+# shadow a device named "all".
+# ---------------------------------------------------------------------------
+
+def _one_system(name: str, read):
+    """The answer of read(name) for one system: 400 bad name, 404 unknown system or nothing reported."""
+    if not validate_nas_name(name):
+        return _error(400, "Invalid system name")
+    if not _system_known(name):
+        return _error(404, "System not found")
+    entry = read(name)
+    if entry is None:
+        return _error(404, "Nothing reported for this system yet")
+    return jsonify(entry), 200
+
+
+@app.route('/api/sessions/all', methods=['GET'])
+@require_scope('read')
+def get_all_sessions():
+    """
+    Who is connected, per system (requires Bearer token).
+    Returns: {name: {"timestamp", "list_timestamp", "list_confirmed_at",
+              "summary": {counts, _sources, ...}, "sessions": [rows]}}
+    list_timestamp: when the list was last sent in full; list_confirmed_at:
+    when a later message last confirmed it unchanged (the list's real age).
+    """
+    return jsonify(_metrics_db.get_all_sessions()), 200
+
+
+@app.route('/api/sessions/<name>', methods=['GET'])
+@require_scope('read')
+def get_system_sessions(name: str):
+    """One entry of /api/sessions/all; 404 if the system is unknown or sent no sessions yet."""
+    return _one_system(name, _metrics_db.get_sessions)
+
+
+@app.route('/api/storage/health/all', methods=['GET'])
+@require_scope('read')
+def get_all_storage_health():
+    """
+    Latest storage health per system (requires Bearer token).
+    Returns: {name: {"timestamp", "overall_status", "status_reasons", "sources",
+              "arrays", "disks", "volumes", "events"}} (the flattened history keys are left out)
+    """
+    return jsonify(_metrics_db.get_all_storage_health()), 200
+
+
+@app.route('/api/storage/health/<name>', methods=['GET'])
+@require_scope('read')
+def get_system_storage_health(name: str):
+    """One entry of /api/storage/health/all; 404 if the system is unknown or sent none yet."""
+    return _one_system(name, _metrics_db.get_storage_health)
+
+
+@app.route('/api/storage/breakdown/all', methods=['GET'])
+@require_scope('read')
+def get_all_storage_breakdown():
+    """
+    Storage attribution summary per system (requires Bearer token).
+    Returns: {name: {"timestamp", "owner_source", "reference_time", "cold_thresholds_days",
+              "device": {bytes, files, cold_1y_bytes, cold_3y_bytes, owners (top 25), other},
+              "folders": [{path, folder_owner, bytes, files, cold_1y_bytes, cold_3y_bytes,
+                           top_owner, top_owner_bytes}],
+              "folders_truncated", "volume_owners"}}
+    At most 50 KB per system: folders sorted by bytes (descending) and cut.
+    """
+    return jsonify(_metrics_db.get_all_breakdown()), 200
+
+
+@app.route('/api/storage/breakdown/<name>', methods=['GET'])
+@require_scope('read')
+def get_system_storage_breakdown(name: str):
+    """
+    The latest storage_breakdown run of one system from its history database,
+    with every owner row (requires Bearer token).
+
+    Query parameters:
+        - folder: only this folder (a path of at most 4096 characters; 404 if
+                  the latest run does not list it)
+
+    Returns: {"system", "id", "msg_id", "timestamp", "device_type", ...the run as sent:
+              "reference_time", "owner_source", "cold_thresholds_days", "device",
+              "folders": [{path, folder_owner, bytes, ..., "owners": [...], "other"}], ...}
+    """
+    folder = request.args.get('folder')
+    if folder is not None and (not folder or len(folder) > MAX_FOLDER_LEN or '\x00' in folder):
+        return _error(400, f"'folder' must be a path of 1-{MAX_FOLDER_LEN} characters")
+
+    def read(n):
+        run = _data_store.latest_storage_breakdown(n, folder)
+        if run is None or (folder is not None and not run.get('folders')):
+            return None
+        return dict(run, system=n)
+    return _one_system(name, read)
 
 
 @app.route('/api/dead_letter', methods=['GET'])
@@ -1262,8 +1834,10 @@ def delete_system(name: str):
     Removes:
       - Per-system history DB:  data/<normalized name>/data.db
       - Central summary rows:   devices, device_snapshot, device_totals,
-                                device_user_snapshot, user_metrics_history
-                                of this one device (see MetricsDB.delete_system)
+                                device_user_snapshot, user_metrics_history and
+                                the sessions / storage health / storage
+                                breakdown snapshots of this one device (see
+                                MetricsDB.delete_system)
 
     An older Manager could register two spellings that normalize alike
     ('lab-a' and 'lab_a', or a name from before a rename).  They share one
@@ -1294,6 +1868,8 @@ def delete_system(name: str):
     else:
         db_deleted = _data_store.delete_system(name)
 
+    with _usage_cache_lock:
+        _usage_cache.clear()
     _logger.info(f"System '{name}' wiped: db_deleted={db_deleted}, central_rows_cleared={rows_deleted}")
 
     body = {
@@ -1338,6 +1914,23 @@ def start_retention_thread(config: dict, logger: logging.Logger):
     t = threading.Thread(target=loop, name='history-retention', daemon=True)
     t.start()
     return t
+
+
+def start_rollup_backfill_thread(config: dict, logger: logging.Logger):
+    """
+    Roll up, in the background, the history stored before rollups existed
+    (or while they were off): bounded batches of rollups.backfill_batch_ids
+    ids, each one short write transaction, at most rollups.backfill_max_duty
+    of the time.  Progress: GET /api/rollups/status.
+    """
+    global _rollup_backfill
+    if _data_store is None or _data_store.rollups is None:
+        return None
+    _rollup_backfill = rollups.start_backfill_thread(_data_store, logging.getLogger('rollups'))
+    settings = rollups.settings_from_config(config)
+    logger.info(f"Rollup backfill running in the background (batches of {settings['backfill_batch_ids']} "
+                f"ids, max duty {settings['backfill_max_duty']}); progress: GET /api/rollups/status")
+    return _rollup_backfill
 
 
 def main():
@@ -1402,9 +1995,11 @@ def main():
     logger.info("=" * 60)
     logger.info("Lab Monitor Manager starting")
     logger.info(f"Data directory: {config.get('data_dir')}")
+    logger.info(f"SQLite {sqlite3.sqlite_version} (Python sqlite3 module)")
     logger.info("=" * 60)
 
     start_retention_thread(config, logger)
+    start_rollup_backfill_thread(config, logger)
 
     host = config.get("host", "0.0.0.0")
     port = config.get("port", 5000)

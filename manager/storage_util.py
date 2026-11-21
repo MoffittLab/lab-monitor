@@ -31,6 +31,7 @@ Storage helpers shared by the Manager's two databases.
 
 import errno
 import glob
+import hashlib
 import logging
 import os
 import re
@@ -368,18 +369,40 @@ def logical_fingerprint(conn: sqlite3.Connection) -> dict:
     database that is only ever appended to (and gains columns), two equal
     fingerprints mean the same data.
     """
-    out = {}
     tables = [r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")]
-    for t in sorted(tables):
-        q = t.replace('"', '""')
-        cols = tuple(r[1] for r in conn.execute(f'PRAGMA table_info("{q}")'))
-        try:
-            count, top = conn.execute(f'SELECT COUNT(*), MAX(rowid) FROM "{q}"').fetchone()
-        except sqlite3.OperationalError:     # WITHOUT ROWID table
-            count, top = conn.execute(f'SELECT COUNT(*), NULL FROM "{q}"').fetchone()
-        out[t] = (cols, count, top)
-    return out
+    return {t: table_fingerprint(conn, t) for t in sorted(tables)}
+
+
+def table_fingerprint(conn: sqlite3.Connection, table: str):
+    """(columns, row count, max rowid) of one table, None if it does not exist."""
+    q = table.replace('"', '""')
+    cols = tuple(r[1] for r in conn.execute(f'PRAGMA table_info("{q}")'))
+    if not cols:
+        return None
+    try:
+        count, top = conn.execute(f'SELECT COUNT(*), MAX(rowid) FROM "{q}"').fetchone()
+    except sqlite3.OperationalError:     # WITHOUT ROWID table
+        count, top = conn.execute(f'SELECT COUNT(*), NULL FROM "{q}"').fetchone()
+    return (cols, count, top)
+
+
+def row_keys_digest(conn: sqlite3.Connection, table: str, columns=('timestamp', 'msg_id')):
+    """
+    sha1 of every row's rowid and `columns` (those the table has), in rowid
+    order; None if the table does not exist.  With table_fingerprint() it
+    tells apart a table renamed away and then made again by an older
+    Manager with as many rows (its AUTOINCREMENT ids start at 1 again).
+    """
+    q = table.replace('"', '""')
+    have = {r[1].lower(): r[1] for r in conn.execute(f'PRAGMA table_info("{q}")')}
+    if not have:
+        return None
+    cols = ['"%s"' % have[c].replace('"', '""') for c in columns if c in have]
+    digest = hashlib.sha1()
+    for row in conn.execute(f'SELECT {", ".join(["rowid"] + cols)} FROM "{q}" ORDER BY rowid'):
+        digest.update(repr(tuple(row)).encode('utf-8'))
+    return digest.hexdigest()
 
 
 def _backup_matches(path: str, check) -> bool:
@@ -396,7 +419,7 @@ def _backup_matches(path: str, check) -> bool:
 
 
 def backup_database(conn: sqlite3.Connection, db_path: str, reason: str = '',
-                    original_layout=None, append_only: bool = False):
+                    original_layout=None, append_only: bool = False, covered=None):
     """
     Copy the database open on `conn` to
         <db_path>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak
@@ -418,7 +441,10 @@ def backup_database(conn: sqlite3.Connection, db_path: str, reason: str = '',
         tables / columns or copy and rename, nothing is deleted);
       - append_only (the older Manager only ever appended rows and added
         columns to this database) and a backup with the original layout has
-        the same logical_fingerprint().
+        the same logical_fingerprint();
+      - covered (callable(backup connection) -> bool) says an existing
+        backup already holds everything this migration changes (the one
+        table it moves, unchanged since), however much else was written.
     """
     backups = existing_backups(db_path)
     if backups:
@@ -432,6 +458,13 @@ def backup_database(conn: sqlite3.Connection, db_path: str, reason: str = '',
                 return newest
         except OSError:
             pass
+
+    if covered is not None:
+        for b in reversed(backups):
+            if _backup_matches(b, covered):
+                logger.warning(f"Pre-upgrade backup {b} already holds what this migration of {db_path} "
+                               f"changes ({reason}); not taking another")
+                return b
 
     if original_layout is not None:
         if not original_layout(conn):

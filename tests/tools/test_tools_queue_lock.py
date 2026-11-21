@@ -70,6 +70,32 @@ def test_reset_moves_queue_and_corrupt_files_but_not_the_lock(tmp_path, capsys):
     assert 'WARNING' not in capsys.readouterr().out
 
 
+def test_reset_moves_the_manager_state_files_but_not_the_host_state(tmp_path, capsys):
+    """
+    sessions_state.json / storage_health_state.json record what the Manager was last sent: after
+    the wipe they would make the collector send "unchanged" session lists and skip health
+    messages for up to an hour.  perf_snapshot.json and storage_breakdown_state.json describe
+    the host and stay.
+    """
+    system_dir = _system(tmp_path)
+    for name in ('sessions_state.json', 'storage_health_state.json', 'perf_snapshot.json',
+                 'storage_breakdown_state.json'):
+        (system_dir / name).write_text('{}\n')
+    backup = Path(reset_system.backup_and_clear(str(tmp_path / 'data'), 'Triton'))
+    moved = sorted(p.name for p in backup.iterdir())
+    assert 'sessions_state.json' in moved and 'storage_health_state.json' in moved
+    assert 'perf_snapshot.json' not in moved and 'storage_breakdown_state.json' not in moved
+    left = sorted(p.name for p in system_dir.iterdir() if p.is_file())
+    assert left == ['network_snapshot.json', 'perf_snapshot.json', 'queue.json.lock', 'storage_breakdown_state.json']
+    # absent state files (an older collector) are simply not there to move
+    other = tmp_path / 'other'
+    (other / 'data' / 'Atlas').mkdir(parents=True)
+    (other / 'data' / 'Atlas' / 'queue.json').write_text('[]\n')
+    assert reset_system.find_manager_state_files(str(other / 'data'), 'Atlas') == []
+    backup = Path(reset_system.backup_and_clear(str(other / 'data'), 'Atlas'))
+    assert [p.name for p in backup.iterdir()] == ['queue.json']
+
+
 @posix_only
 def test_reset_waits_for_a_running_collector(tmp_path):
     system_dir = _system(tmp_path)

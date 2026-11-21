@@ -12,9 +12,13 @@ Also proven here: the source data_dir is left byte-identical (including the
 read path is reported.
 """
 import json
+import logging
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -393,6 +397,100 @@ def test_detects_unreadable_orphans_and_metadata(orphans_data_dir, old_code, com
     assert any('folder_usage' in d['endpoint'] and '_scan_seconds' in d['what'] for d in diffs), _summary(text)
 
 
+# --------------------------------------------------------------------------- #
+# More than 2000 hours of OLD data: "All Available" answered from rollups     #
+# --------------------------------------------------------------------------- #
+
+LONG_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
+LONG_HOURS = 2403          # 2403 hour buckets: merged two at a time, the last one alone
+
+# stdin: queue bodies; the OLD Manager stores them through its own route
+_OLD_INGEST = r'''
+import json, logging, sys
+sys.path.insert(0, sys.argv[1])
+import manager as m
+job = json.load(sys.stdin)
+m.init_app({"data_dir": job["data_dir"], "auth_tokens": [job["token"]]}, logging.getLogger("old"))
+client = m.app.test_client()
+for body in job["bodies"]:
+    r = client.post("/api/data/queue", json=body, headers={"Authorization": "Bearer " + job["token"]})
+    assert r.status_code == 200 and r.get_json()["stored"] == len(body["messages"]), r.get_data()
+'''
+
+
+def _long_history_messages():
+    """
+    LongNas: a first test run at 00:01, the 5-minute collector from 01:00 to
+    01:55, then one run an hour at hh:10 (the newest at 02:10 on day 100):
+    the first and the last rollup bucket are partly filled.
+    """
+    stamps = [LONG_START + timedelta(minutes=1)] + [LONG_START + timedelta(hours=1, minutes=5 * i) for i in range(12)]
+    stamps += [LONG_START + timedelta(hours=h, minutes=10) for h in range(2, LONG_HOURS)]
+    msgs = []
+    for i, t in enumerate(stamps):
+        h = {'device_name': 'LongNas', 'device_id': 'id-long', 'device_type': 'synology',
+             'timestamp': t.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}
+        msgs.append({'header': h, 'data': {'data_type': 'system_metrics', 'cpu_percent': float(i % 97),
+                                           'cpu_percent_unit': '%', 'ram_percent': 20.0 + i % 50,
+                                           'uptime_seconds': 1000 + i * 3600, 'network_bytes_in': 10 ** 6 * i,
+                                           'network_bytes_out': 10 ** 5 * i}})
+        for u in ('alice', 'bob'):
+            msgs.append({'header': h, 'data': {'data_type': 'user_metrics', 'username': u,
+                                               'cpu_percent': float(i % 41), 'ram_bytes': 10 ** 8 + i,
+                                               'ram_formatted': 'x'}})
+    return [{'queue_id': 'LongNas-%05d' % n, 'name': 'LongNas', 'id': 'id-long', 'messages': msgs[i:i + 600]}
+            for n, i in enumerate(range(0, len(msgs), 600))]
+
+
+def test_verify_passes_on_more_than_2000_hours_of_old_data(old_code, compat_dir):
+    """
+    About 100 days: the Dashboard's "All Available" query (2000 points) is
+    answered from hourly rollups merged two hours a point.  Its first and
+    last points stay within the OLD series' first and last value (N17).
+    """
+    data = compat_dir / 'fixture-long' / 'data'
+    data.mkdir(parents=True)
+    proc = subprocess.run([sys.executable, '-c', _OLD_INGEST, str(old_code / 'manager')],
+                          input=json.dumps({'data_dir': str(data), 'token': OLD_TOKEN,
+                                            'bodies': _long_history_messages()}),
+                          capture_output=True, text=True, timeout=600,
+                          env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    before = snapshot(data)
+    work = compat_dir / 'work-long'
+    work.mkdir()
+    report = compat_dir / 'verify-report-long.json'
+    rc, rep, text = run_verify('--data-dir', data, '--old-code', old_code, '--work-dir', work, '--report', report)
+    assert snapshot(data) == before
+    assert rep is not None, text[-4000:]
+    assert rc == 0 and rep['result'] == 'PASS', _summary(text)
+    assert rep['intended_differences']['N17']['applied'] >= 4
+
+    # what the NEW Manager answered: hourly rollups, inside the values' range
+    copy = compat_dir / 'fixture-long-new' / 'data'
+    shutil.copytree(str(data), str(copy))
+    sys.path.insert(0, str(REPO / 'manager'))
+    try:
+        import manager as mgr
+        mgr.init_app({'data_dir': str(copy), 'read_tokens': ['rd-' + 'b2' * 16]}, logging.getLogger('test-long'))
+        try:
+            assert mgr._data_store.run_rollup_backfill('longnas')
+            r = mgr.app.test_client().get(
+                '/api/history/LongNas/system_metrics/cpu_percent',
+                query_string={'from': '2000-01-01T00:00:00Z', 'to': '9999-12-31T23:59:59Z', 'max_points': 2000},
+                headers={'Authorization': 'Bearer ' + 'rd-' + 'b2' * 16})
+            h = r.get_json()
+        finally:
+            mgr._close_stores()
+    finally:
+        sys.path.remove(str(REPO / 'manager'))
+    assert (h['resolution'], h['bucket_seconds']) == ('hour', 7200) and len(h['data']) <= 2000
+    first = (LONG_START + timedelta(minutes=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    last = (LONG_START + timedelta(hours=LONG_HOURS - 1, minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    assert first <= h['data'][0]['timestamp'] and h['data'][-1]['timestamp'] == last
+    assert sum(p['count'] for p in h['data']) == LONG_HOURS + 11
+
+
 def test_refuses_a_work_dir_inside_the_data_dir(old_data_dir, compat_dir):
     data = compat_dir / 'fixture-copy' / 'data'
     shutil.copytree(str(old_data_dir), str(data))
@@ -473,3 +571,11 @@ def test_downsampled_chart_must_cover_the_whole_range():
     assert 'ends at' in vu.downsampled_problem(good[:1] + [('2026-08-10T00:00:00.000000Z', 10.0)], 10, st)
     assert 'range' in vu.downsampled_problem([(good[0][0], 0.5), good[1]], 10, st)
     assert vu.downsampled_problem([], 10, st) == 'no points'
+    # a rollup answer's point covers bucket_seconds (whole hours / days merged): within one point
+    late = [('2026-08-05T00:00:00.000000Z', 4.5)] + good[1:]
+    assert 'starts at' in vu.downsampled_problem(late, 10, st)
+    assert vu.downsampled_problem(late, 10, st, 5 * 86400) is None
+    assert 'starts at' in vu.downsampled_problem(late, 10, st, 3 * 86400)
+    assert vu.rollup_point_seconds({'resolution': 'hour', 'bucket_seconds': 7200}) == 7200
+    assert vu.rollup_point_seconds({'resolution': 'raw', 'bucket_seconds': 7200}) is None
+    assert vu.rollup_point_seconds(None) is None

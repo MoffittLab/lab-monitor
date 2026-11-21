@@ -206,10 +206,47 @@ INTENDED = OrderedDict([
              'spelling and requires the other rows to stay exactly as they were.')),
     ('N17', ('"All Available" charts are bucket-averaged',
              'With more points than max_points the NEW Manager averages equal-width time buckets '
-             '(the Dashboard says "downsampled"). Accepted only if the chart has at most max_points '
-             'points, every average lies within the OLD values\' range, and the first and last '
-             'points lie within one bucket of the OLD series\' first and last point.')),
+             '(the Dashboard says "downsampled"); with about 83+ days of data it answers from its '
+             'hourly or daily rollups, merged into points of bucket_seconds each. Accepted only if '
+             'the chart has at most max_points points, every average lies within the OLD values\' '
+             'range, and the first and last points lie within one bucket (for a rollup answer: one '
+             'point, bucket_seconds) of the OLD series\' first and last point.')),
+    ('N18', ('history units of user_metrics and storage_health fields',
+             'user_metrics rows carry no *_unit fields, so the old Manager charted per-user history '
+             'without a unit; the new one reports the unit of its rollup registry (cpu_percent %, '
+             'ram_bytes bytes, cpu_seconds s, cpu_cores cores, gpu_vram_bytes bytes, gpu_util_percent %, '
+             'gpu_busy_seconds s, gpu_held_seconds s). storage_health keys have none either: their unit '
+             'follows from the name (_temperature_c, _percent, _hours, _sectors/_errors/_code/_degraded). '
+             'Accepted only where the old unit was empty and the new one is exactly that unit.')),
+    ('N19', ('Dashboard /api/data: sections of the newer data types',
+             'The NEW Dashboard adds "sessions", "storage_health", "breakdown" and "usage" to a system '
+             'when the NEW Manager answers /api/sessions/all, /api/storage/health/all, '
+             '/api/storage/breakdown/all and /api/user_metrics/usage (an OLD Manager answers 404 and '
+             'they stay absent). They add information; nothing the old Dashboard showed changes. Not '
+             'compared.')),
 ])
+
+# N18: the units the NEW Manager reports where the stored rows carry none
+# (manager/rollups.py REGISTRY 'units', manager/data_store.py _SUFFIX_UNITS)
+NEW_DEFAULT_UNITS = {
+    'user_metrics': {'cpu_percent': '%', 'ram_bytes': 'bytes', 'cpu_seconds': 's', 'cpu_cores': 'cores',
+                     'gpu_vram_bytes': 'bytes', 'gpu_util_percent': '%', 'gpu_busy_seconds': 's',
+                     'gpu_held_seconds': 's'},
+}
+NEW_SUFFIX_UNITS = {'storage_health': (('_temperature_c', '°C'), ('_percent', '%'), ('_hours', 'h'),
+                                       ('_sectors', 'count'), ('_errors', 'count'), ('_code', 'count'),
+                                       ('_degraded', 'count'))}
+# N19: per-system sections of the NEW Dashboard's /api/data
+NEW_DASHBOARD_SECTIONS = ('sessions', 'storage_health', 'breakdown', 'usage')
+
+
+def new_default_unit(table, field):
+    """The unit the NEW Manager gives a field whose rows carry no unit (N18), or None."""
+    low = str(field).lower()
+    unit = NEW_DEFAULT_UNITS.get(table, {}).get(low)
+    if unit:
+        return unit
+    return next((u for suffix, u in NEW_SUFFIX_UNITS.get(table, ()) if low.endswith(suffix)), None)
 
 HINTS = {
     'name-rejected': ('manager/storage_util.py DEVICE_NAME_RE / manager.py validate_nas_name: the '
@@ -489,12 +526,15 @@ def series_stats_of(pts):
             'tmin': min(t for t, _ in vals), 'tmax': max(t for t, _ in vals)}
 
 
-def downsampled_problem(pts, max_points, stats):
+def downsampled_problem(pts, max_points, stats, point_seconds=None):
     """
     Why a bucket-averaged chart (N17) does not faithfully cover the OLD series,
     or None: at most max_points points, every average within the OLD values'
     range, and the first / last point within one bucket of the OLD series'
     first / last point (the whole time range is shown, nothing cut off).
+    point_seconds: the width of one point of a rollup answer (its
+    bucket_seconds: whole hours / days merged, so it can be wider than an
+    equal-width bucket); a point sits at the count-weighted centre of it.
     """
     if not stats['n']:
         return 'points where the OLD series has none' if pts else None
@@ -510,11 +550,20 @@ def downsampled_problem(pts, max_points, stats):
     p0, p1 = parse_ts(pts[0][0]), parse_ts(pts[-1][0])
     if None in (t0, t1, p0, p1):
         return None
-    width = (t1 - t0) / max(1, max_points) + timedelta(seconds=1)
+    width = max((t1 - t0) / max(1, max_points), timedelta(seconds=point_seconds or 0)) + timedelta(seconds=1)
     if not (t0 - timedelta(seconds=1) <= p0 <= t0 + width):
         return 'starts at %s, the OLD series at %s (part of the range missing)' % (pts[0][0], stats['tmin'])
     if not (t1 - width <= p1 <= t1 + timedelta(seconds=1)):
         return 'ends at %s, the OLD series at %s (part of the range missing)' % (pts[-1][0], stats['tmax'])
+    return None
+
+
+def rollup_point_seconds(answer):
+    """bucket_seconds of a NEW /api/history answer from rollups (resolution hour / day), else None."""
+    answer = answer if isinstance(answer, dict) else {}
+    seconds = answer.get('bucket_seconds')
+    if answer.get('resolution') in ('hour', 'day') and isinstance(seconds, int) and not isinstance(seconds, bool):
+        return seconds
     return None
 
 
@@ -2085,7 +2134,10 @@ class Verifier:
         if od.get('field') != nd.get('field'):
             problems.append(('field', od.get('field'), nd.get('field')))
         if (od.get('unit') or None) != (nd.get('unit') or None) and a:
-            problems.append(('unit', od.get('unit'), nd.get('unit')))
+            if not od.get('unit') and nd.get('unit') == new_default_unit(table, nd.get('field')):
+                self.intended(pattern, 'N18')
+            else:
+                problems.append(('unit', od.get('unit'), nd.get('unit')))
         if nd.get('downsampled'):
             problems.append(('downsampled', False, True))
         if a != b:
@@ -2283,6 +2335,7 @@ class Verifier:
             self.diff(pattern, npath, '%s: HTTP %s' % (field, r.status), 200, r.status, hint='history', system=name)
             return
         pts = sort_points(norm_points((r.data or {}).get('data')))
+        point_seconds = rollup_point_seconds(r.data)
         old_enough = [p for p in (full or []) if p[0] >= canon_ts(DASHBOARD_ALL_FROM)]
         if full is not None and stats['n'] <= mp:
             if pts != sort_points(old_enough):
@@ -2291,7 +2344,7 @@ class Verifier:
                           hint='history', system=name)
                 return
         else:
-            why = downsampled_problem(pts, mp, stats)
+            why = downsampled_problem(pts, mp, stats, point_seconds)
             if why:
                 vals = [v for _, v in pts if isinstance(v, (int, float))]
                 self.diff(pattern, npath, '%s: downsampled "All Available" chart: %s' % (field, why),
@@ -2404,7 +2457,7 @@ class Verifier:
                     a = sort_points(norm_points((o.data or {}).get('data')))
                     b = sort_points(norm_points((n.data or {}).get('data')))
                     if (n.data or {}).get('downsampled'):
-                        ok = not downsampled_problem(b, mp, series_stats_of(a))
+                        ok = not downsampled_problem(b, mp, series_stats_of(a), rollup_point_seconds(n.data))
                         if ok:
                             self.intended(pattern, 'N17')
                             continue
@@ -2468,6 +2521,10 @@ class Verifier:
         systems = {}
         for name, s in ((payload or {}).get('systems') or {}).items():
             s = strip(canon(s, ap))
+            for k in NEW_DASHBOARD_SECTIONS:
+                if isinstance(s, dict) and k in s:
+                    s.pop(k)
+                    ap.add('N19')
             disk = s.get('disk')
             if isinstance(disk, dict):
                 # new keys: the scan warnings the NEW Dashboard shows (the old one had none)
