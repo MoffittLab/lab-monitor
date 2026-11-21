@@ -343,3 +343,52 @@ After all installations:
 - [METRICS.md](METRICS.md) — Metrics reference
 - [manager/README.md](manager/README.md) — Manager API reference
 - [collector/README.md](collector/README.md) — Collector reference
+
+---
+
+## Collector on Linux (Ubuntu / Debian)
+
+**Prerequisites:** Ubuntu 22.04 / 24.04 or Debian 12 with systemd, `sudo`, and network access to the Manager
+(and to PyPI for the pinned packages; offline, the installer falls back to the distribution's
+`python3-requests` / `python3-psutil`).
+
+```bash
+git clone https://github.com/MoffittLab/lab-monitor.git
+cd lab-monitor
+sudo ./install-collector-linux.sh            # asks for the Manager URL, token, name, folders
+```
+
+Non-interactive, generating this device's token:
+
+```bash
+sudo ./install-collector-linux.sh --non-interactive \
+     --manager-url http://atlantis.med.harvard.edu:5000 --generate-token \
+     --scan-paths '/home/*,/data/*'
+```
+
+`--generate-token` prints the exact `"collector_tokens": {"<name>": "<token>"}` entry to add to the Manager
+config (then restart the Manager). `--dry-run` prints every action without changing anything;
+`--print-config` prints the config it would write. `--help` lists all flags (`--name`, `--volumes`,
+`--repo/--ref`, ...).
+
+**What it does:** installs `python3-venv` if missing; creates the system user `labmon`; copies the collector to
+`/opt/lab-monitor` and builds `/opt/lab-monitor/venv`; writes `/etc/lab-monitor/collector.json`
+(`0640 root:labmon`); installs and enables `lab-monitor-metrics.timer` (every 5 minutes) and
+`lab-monitor-disk.timer` (daily 02:00); runs one metrics collection and shows whether the Manager
+acknowledged it. Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
+they name). Details: [collector/README.md](collector/README.md#linux--ubuntu).
+
+**Shared storage:** folders on NFS/SMB or cluster filesystems (Lustre, GPFS, ...) are not scanned by
+default, so a server whose `/home` is an NFS mount reports `/home` in the disk scan's errors instead of
+walking the shared tree every night. Measure shared storage on its file server, or set
+`"include_network_mounts": true` on one node.
+
+**Verify:**
+```bash
+systemctl list-timers 'lab-monitor-*'
+journalctl -u lab-monitor-metrics.service -n 30
+sudo systemctl start lab-monitor-metrics.service   # run once more now
+```
+
+**Uninstall:** `sudo /opt/lab-monitor/install-collector-linux.sh --uninstall` (keeps config, data and logs;
+add `--purge` to delete them and the `labmon` user).

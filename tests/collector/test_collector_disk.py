@@ -363,7 +363,8 @@ def test_unreadable_volume_in_legacy_mode_is_reported_in_errors(
     vol = denied_dir('vol')
     # tmp paths aren't /volumeN or /mnt paths; let them pass the volume check
     monkeypatch.setattr(disk_usage, 'is_valid_volume_path', lambda path, system=None: True)
-    config.update({'volumes': [str(vol)], 'scan_paths': []})
+    # The one-level-deep fallback is Synology's (Linux reports capacity only)
+    config.update({'platform': 'synology', 'volumes': [str(vol)], 'scan_paths': []})
     captured = _capture_disk_message(collector, monkeypatch)
     collector.collect_disk_usage(config, logging.getLogger('test'))
     assert captured[0]['data']['_errors'] == [str(vol)]

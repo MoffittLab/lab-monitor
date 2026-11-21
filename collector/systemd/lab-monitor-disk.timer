@@ -1,0 +1,14 @@
+# Starts lab-monitor-disk.service daily at 02:00 (+ up to 15 min random delay,
+# so a fleet of servers does not scan shared storage at the same moment).
+[Unit]
+Description=Lab Monitor collector - daily disk usage scan
+Documentation=file:///opt/lab-monitor/collector/README.md
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=lab-monitor-disk.service
+
+[Install]
+WantedBy=timers.target
