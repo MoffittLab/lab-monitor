@@ -1,17 +1,21 @@
 """
 Dashboard server tests: Manager outage / partial failure handling, /api/data
 cache, optional basic auth, folder_usage parsing, history proxy validation and
-max_points pass-through.  The Manager is mocked by patching
-requests.Session.get, so no network is used.
+max_points pass-through; the usage-metrics sections (sessions, storage health,
+storage owners, usage totals) against a NEW Manager and against CURRENT
+(fb6498c) and OLD (f086e7e) Managers that don't have them.  The Manager is
+mocked by patching requests.Session.get, so no network is used.
 """
 import base64
 import importlib.util
 import json
 import logging
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import pytest
 import requests
@@ -79,6 +83,9 @@ def healthy_manager():
                        'ram_formatted': '10 B', 'timestamp': '2026-11-21T00:00:00Z'}],
         }),
     }
+
+
+NOT_FOUND = FakeResponse(404, {'status': 'error', 'error': 'Not found'})
 
 
 class FakeManager:
@@ -240,7 +247,7 @@ def test_manager_calls_run_concurrently(make_client):
 
     def waiting(path, params):
         barrier.wait()
-        return base[path]
+        return base.get(path, NOT_FOUND)     # a CURRENT Manager: 404 for the optional endpoints
 
     client, fake = make_client(routes={p: waiting for p in dash.POLL_ENDPOINTS})
     body = client.get('/api/data').get_json()
@@ -626,3 +633,523 @@ def test_static_assets_present():
     backdrop = static / 'img' / 'backdrop.jpg'
     assert backdrop.exists() and backdrop.stat().st_size < 300 * 1024
     assert 'backdrop.jpg' in (static / 'css' / 'style.css').read_text()
+
+
+# ---------------------------------------------------------------------------
+# Usage-metrics Manager: optional endpoints (spec §16, R7)
+# ---------------------------------------------------------------------------
+
+# Appendix A payloads, as the NEW Manager serves them (§16 shapes; B4 passes
+# the §11 system_metrics keys through /api/metrics/all)
+A1_SYSTEM_METRICS = {
+    "cpu_percent": 23.4, "cpu_percent_unit": "%", "interval_s": 300.2, "interval_s_unit": "s",
+    "cpu_count": 32, "cpu_iowait_percent": 1.2, "cpu_iowait_percent_unit": "%", "cpu_steal_percent": 0.0,
+    "cpu_steal_percent_unit": "%", "proc_cpu_coverage_percent": 96.5, "proc_cpu_coverage_percent_unit": "%",
+    "disk_read_bytes_per_s": 1250000, "disk_read_bytes_per_s_unit": "B/s", "disk_write_bytes_per_s": 310000,
+    "disk_write_bytes_per_s_unit": "B/s", "disk_read_iops": 41.2, "disk_read_iops_unit": "ops/s",
+    "disk_write_iops": 12.0, "disk_write_iops_unit": "ops/s", "disk_await_ms": 6.3, "disk_await_ms_unit": "ms",
+    "disk_busy_max_percent": 17.0, "disk_busy_max_percent_unit": "%", "disk_busy_max_name": "sata2",
+    "gpu_sample_seconds": 300.2, "gpu_sample_seconds_unit": "s", "gpu_count": 1,
+    "gpus": [{"index": 0, "name": "NVIDIA RTX A6000", "gpu_percent": 87, "vram_used_bytes": 22548578304,
+              "vram_total_bytes": 51527024640, "vram_used_formatted": "21.0 GB", "vram_total_formatted": "48.0 GB",
+              "temperature_c": 71, "power_watts": 250.1, "uuid": "GPU-8f2c0000-1111-2222-3333-444455556666",
+              "process_source": "nvml", "util_split": "single_user",
+              "users": [{"username": "LAB\\alice", "vram_bytes": 21474836480, "util_percent": 87.0, "processes": 2}],
+              "users_truncated": 0, "unattributed_vram_bytes": 1073741824, "unattributed_processes": 1}],
+}
+A2_USERS = [
+    {"username": "LAB\\alice", "cpu_percent": 12.5, "ram_bytes": 8589934592, "ram_formatted": "8.0 GB",
+     "cpu_seconds": 1200.4, "cpu_cores": 4.0, "interval_s": 300.2, "process_count": 17,
+     "gpu_vram_bytes": 21474836480, "gpu_util_percent": 87.0, "gpu_busy_seconds": 261.2, "gpus_held": 1,
+     "gpu_held_seconds": 300.2, "gpu_processes": 2, "timestamp": "2026-11-21T00:00:01Z"},
+    {"username": "LAB\\bob", "cpu_percent": None, "ram_bytes": None, "ram_formatted": None,
+     "gpu_vram_bytes": 1073741824, "gpu_util_percent": 0.0, "gpu_busy_seconds": 0.0, "gpus_held": 1,
+     "gpu_held_seconds": 300.2, "gpu_processes": 1, "timestamp": "2026-11-21T00:00:01Z"},
+]
+A3_SESSIONS = {
+    "data_type": "sessions", "_schema": 1, "_unit": "count", "_detail": "full",
+    "_sources": {"tcp": "ok", "utmp": "ok", "smb": "not_permitted"}, "_collect_seconds": 0.04,
+    "_list_state": "full", "_list_hash": "3f9a1c2b7d4e5f60",
+    "clients_total": 9, "users_total": 1, "smb_clients": 7, "nfs_clients": 1, "ssh_clients": 1, "ssh_users": 1,
+    "dsm_clients": 2, "rsync_clients": 0, "sessions_truncated": False,
+    "sessions": [{"service": "ssh", "username": "jeff", "client": "10.11.2.40", "connections": 1,
+                  "since": "2026-11-21T12:35:00Z", "source": "utmp"},
+                 {"service": "smb", "client": "10.11.2.17", "connections": 2, "source": "tcp"}],
+}
+A4_HEALTH = {
+    "data_type": "storage_health", "_schema": 1, "trigger": "change", "overall_status": "warning",
+    "overall_status_code": 1, "status_reasons": ["md2 rebuilding 37.5% (ETA 5h 12m)"],
+    "sources": {"md": "ok", "sysfs": "ok", "mounts": "ok", "snmp": "off", "smart": "not_permitted"},
+    "arrays": [{"id": "md2", "kind": "md", "name": None, "level": "raid5", "role": "data", "state": "active",
+                "status": "warning", "members_total": 4, "members_active": 3, "degraded": 1,
+                "sync_action": "recover", "sync_percent": 37.5, "sync_speed_kbps": 120000,
+                "sync_eta_seconds": 18720, "mismatch_cnt": 0, "size_bytes": 11995903803392,
+                "faulty_members": [], "members": ["sata1", "sata2", "sata4", "sata3"]}],
+    "disks": [{"id": "sata3", "model": "WD80EFZX", "serial": None, "size_bytes": 8001563222016, "media": "hdd",
+               "bus": "sata", "status": "ok", "health_source": "sysfs", "smart_passed": None,
+               "temperature_c": None, "power_on_hours": None, "reallocated_sectors": None,
+               "pending_sectors": None, "uncorrectable_sectors": None, "read_errors_uncorrected": None,
+               "write_errors_uncorrected": None, "wear_used_percent": None, "remaining_life_percent": None,
+               "bad_sectors": None, "io_errors": 0, "device_state": "running", "in_standby": None,
+               "arrays": ["md2"]}],
+    "volumes": [{"id": "/volume1", "fs": "btrfs", "read_only": False, "health": None, "status": "ok"}],
+    "events": None, "_flat_truncated": False,
+}
+A5_BREAKDOWN = {
+    "reference_time": "2026-11-21T02:00:03Z", "cold_thresholds_days": [365, 1095], "owner_source": "posix_uid",
+    "folders": [{"path": "/volume1/Lab", "folder_owner": "jeff", "bytes": 5000, "files": 120,
+                 "cold_1y_bytes": 3000, "cold_3y_bytes": 1000}],
+    "device": {"bytes": 5000, "files": 120, "cold_1y_bytes": 3000, "cold_3y_bytes": 1000,
+               "owners": [{"owner": "jeff", "bytes": 4000, "files": 100, "cold_1y_bytes": 2500, "cold_3y_bytes": 900}],
+               "other": {"owner_count": 3, "bytes": 1000, "files": 20, "cold_1y_bytes": 500, "cold_3y_bytes": 100}},
+    "volume_owners": None,
+}
+USAGE_ROW = {"username": "LAB\\alice", "samples": 288, "cpu_core_hours": 30.0, "avg_cores": 1.25, "peak_cores": 4.0,
+             "gpu_busy_hours": 18.2, "gpu_held_hours": 23.9, "peak_gpu_vram_bytes": 21474836480}
+
+
+def new_manager():
+    """healthy_manager() plus what the usage-metrics Manager adds."""
+    routes = healthy_manager()
+    atlas = dict(routes['/api/metrics/all']._payload['Atlas'])
+    atlas.update({k: v for k, v in A1_SYSTEM_METRICS.items() if not k.endswith('_unit')})
+    atlas['units'] = {k: v for k, v in A1_SYSTEM_METRICS.items() if k.endswith('_unit')}
+    routes['/api/metrics/all'] = FakeResponse(200, {'Atlas': atlas})
+    routes['/api/user_metrics/all'] = FakeResponse(200, {'Atlas': [dict(u) for u in A2_USERS]})
+    ts = '2026-11-21T00:00:00Z'
+    routes[dash.SESSIONS_ENDPOINT] = FakeResponse(200, {'Triton': {
+        'timestamp': ts, 'list_timestamp': ts, 'list_confirmed_at': ts,
+        'summary': {k: v for k, v in A3_SESSIONS.items() if k not in ('data_type', 'sessions')},
+        'sessions': A3_SESSIONS['sessions']}})
+    routes[dash.HEALTH_ENDPOINT] = FakeResponse(200, {'Triton': dict(
+        {k: A4_HEALTH[k] for k in ('overall_status', 'status_reasons', 'sources', 'arrays', 'disks', 'volumes', 'events')},
+        timestamp=ts)})
+    folders = [dict({k: f[k] for k in ('path', 'folder_owner', 'bytes', 'files', 'cold_1y_bytes', 'cold_3y_bytes')},
+                    top_owner='jeff', top_owner_bytes=4000) for f in A5_BREAKDOWN['folders']]
+    routes[dash.BREAKDOWN_ENDPOINT] = FakeResponse(200, {'Triton': dict(
+        {k: A5_BREAKDOWN[k] for k in ('owner_source', 'reference_time', 'cold_thresholds_days', 'device', 'volume_owners')},
+        timestamp=ts, folders=folders, folders_truncated=False)})
+    routes[dash.USAGE_ENDPOINT] = FakeResponse(200, {
+        'window': '24h', 'from': '2026-11-20T00:00:00Z', 'to': ts,
+        'devices': {'Atlas': {'source': 'rollups', 'complete': True, 'users': [USAGE_ROW]}}})
+    return routes
+
+
+def test_current_manager_404s_are_not_errors(make_client):
+    # healthy_manager() has none of the optional endpoints: FakeManager answers 404
+    client, fake = make_client()
+    body = client.get('/api/data').get_json()
+    assert body['success'] is True and body['degraded'] is False and body['errors'] == []
+    assert body['features'] == {'sessions': False, 'storage_health': False, 'breakdown': False, 'usage': False}
+    for sys_ in body['systems'].values():
+        assert not {'sessions', 'storage_health', 'breakdown', 'usage'} & set(sys_)
+    assert {fake.count(p) for p in dash.OPTIONAL_ENDPOINTS} == {1}
+
+
+def test_old_manager_usage_route_answers_a_user_list(make_client):
+    # OLD (f086e7e) routes /api/user_metrics/usage to /api/user_metrics/<device_name>: 200 []
+    routes = healthy_manager()
+    routes[dash.USAGE_ENDPOINT] = FakeResponse(200, [])
+    client, _ = make_client(routes=routes)
+    body = client.get('/api/data').get_json()
+    assert body['degraded'] is False and body['errors'] == []
+    assert body['features']['usage'] is False
+
+
+@pytest.mark.parametrize('path', sorted(dash.OPTIONAL_ENDPOINTS))
+def test_optional_endpoint_failure_is_degraded(make_client, path):
+    routes = new_manager()
+    routes[path] = FakeResponse(500, {'status': 'error', 'error': 'Internal error'})
+    client, _ = make_client(routes=routes)
+    body = client.get('/api/data').get_json()
+    assert body['success'] is True and body['degraded'] is True
+    assert body['errors'] == [{'endpoint': path, 'error': 'HTTP 500'}]
+    key = dash.OPTIONAL_ENDPOINTS[path]
+    assert body['features'][key] is None       # unknown, not "unsupported"
+    assert all(v is True for k, v in body['features'].items() if k != key)
+
+
+@pytest.mark.parametrize('path', sorted(dash.OPTIONAL_ENDPOINTS))
+def test_optional_endpoint_wrong_top_level_shape_is_degraded(make_client, path):
+    routes = new_manager()
+    routes[path] = FakeResponse(200, 'not a dict')
+    client, _ = make_client(routes=routes)
+    body = client.get('/api/data').get_json()
+    assert {'endpoint': path, 'error': 'unexpected response'} in body['errors']
+
+
+def test_new_manager_sections_are_merged(make_client):
+    client, _ = make_client(routes=new_manager())
+    body = client.get('/api/data').get_json()
+    assert body['degraded'] is False and body['errors'] == []
+    assert body['features'] == {'sessions': True, 'storage_health': True, 'breakdown': True, 'usage': True}
+    atlas, triton = body['systems']['Atlas'], body['systems']['Triton']
+
+    m = atlas['metrics']
+    assert m['interval_s'] == 300.2 and m['cpu_count'] == 32 and m['disk_read_bytes_per_s'] == 1250000
+    assert m['disk_busy_max_name'] == 'sata2' and m['units']['disk_read_bytes_per_s_unit'] == 'B/s'
+    assert m['gpus'][0]['users'] == [{'username': 'LAB\\alice', 'vram_bytes': 21474836480,
+                                      'util_percent': 87.0, 'processes': 2}]
+    assert m['gpus'][0]['unattributed_vram_bytes'] == 1073741824 and m['gpus'][0]['uuid'].startswith('GPU-')
+    assert [u['username'] for u in atlas['users']] == ['LAB\\alice', 'LAB\\bob']
+    assert atlas['users'][1]['cpu_percent'] is None and atlas['users'][1]['gpus_held'] == 1
+
+    s = triton['sessions']
+    assert s['list_confirmed_at'] == '2026-11-21T00:00:00Z'
+    assert s['summary']['clients_total'] == 9 and s['summary']['rsync_clients'] == 0
+    assert s['summary']['_sources'] == {'tcp': 'ok', 'utmp': 'ok', 'smb': 'not_permitted'}
+    assert s['summary']['_detail'] == 'full' and s['summary']['sessions_truncated'] is False
+    assert s['sessions'][1] == {'service': 'smb', 'client': '10.11.2.17', 'connections': 2, 'source': 'tcp'}
+
+    h = triton['storage_health']
+    assert h['overall_status'] == 'warning' and h['status_reasons'] == ['md2 rebuilding 37.5% (ETA 5h 12m)']
+    assert h['arrays'][0]['members'] == ['sata1', 'sata2', 'sata4', 'sata3'] and h['arrays'][0]['sync_percent'] == 37.5
+    assert h['disks'][0]['model'] == 'WD80EFZX' and h['disks'][0]['temperature_c'] is None
+    assert h['volumes'][0] == {'id': '/volume1', 'fs': 'btrfs', 'health': None, 'status': 'ok', 'read_only': False}
+    assert 'disk_sata3_status_code' not in h and h['events'] is None
+
+    b = triton['breakdown']
+    assert b['owner_source'] == 'posix_uid' and b['cold_thresholds_days'] == [365, 1095]
+    assert b['folders'][0]['cold_1y_bytes'] == 3000 and b['folders'][0]['top_owner'] == 'jeff'
+    assert b['device']['owners'][0] == {'owner': 'jeff', 'bytes': 4000, 'files': 100,
+                                       'cold_1y_bytes': 2500, 'cold_3y_bytes': 900}
+    assert b['device']['other']['owner_count'] == 3
+
+    u = atlas['usage']
+    assert u['window'] == '24h' and u['source'] == 'rollups' and u['complete'] is True
+    assert u['users'] == [USAGE_ROW]
+    # Sections only attach to systems the device registry lists
+    assert 'usage' not in triton and 'sessions' not in atlas
+
+
+def test_malformed_rows_are_ignored(make_client):
+    routes = new_manager()
+    long = 'x' * 257
+    routes[dash.SESSIONS_ENDPOINT] = FakeResponse(200, {
+        'Triton': {'summary': {'clients_total': 'many', 'smb_clients': '7', 'Bad_clients': 3, 'x_users': None,
+                               '_sources': ['tcp'], '_detail': 5},
+                   'sessions': [{'username': long, 'client': 7, 'connections': 'two'}, 'row', None,
+                                {'service': 'ssh', 'username': 'jeff', 'pid': 123}]},
+        'Atlas': 'not a dict',
+        'Ghost': {'summary': {}, 'sessions': []},          # not in the device registry
+    })
+    routes[dash.HEALTH_ENDPOINT] = FakeResponse(200, {'Triton': {
+        'overall_status': 'on fire', 'status_reasons': ['r' * 300] + [str(i) for i in range(20)] + [5],
+        'sources': {'md': 'ok', 'smart': 3}, 'arrays': 'md2', 'disks': [{'id': 'sda', 'status': 'melted',
+        'temperature_c': float('nan')}, 'sdb'], 'volumes': [{'id': '/v', 'read_only': 'yes'}], 'events': [1]}})
+    routes[dash.BREAKDOWN_ENDPOINT] = FakeResponse(200, {'Triton': {
+        'folders': [{'path': '/a', 'bytes': '12'}, {'bytes': 5}, 'x'], 'device': {'owners': None, 'other': 'x'},
+        'cold_thresholds_days': 'soon'}})
+    routes[dash.USAGE_ENDPOINT] = FakeResponse(200, {'window': '24h', 'devices': {
+        'Atlas': {'users': [{'username': 5}, {'username': 'ok', 'cpu_core_hours': 'lots'}], 'complete': 'yes'},
+        'Triton': []}})
+    client, _ = make_client(routes=routes)
+    body = client.get('/api/data').get_json()
+    assert body['degraded'] is False and body['errors'] == []
+    systems = body['systems']
+    assert 'Ghost' not in systems and 'sessions' not in systems['Atlas']
+
+    s = systems['Triton']['sessions']
+    assert s['summary'] == {'clients_total': None, 'smb_clients': 7.0, 'x_users': None, '_detail': None, '_sources': {}}
+    assert s['sessions'] == [{'username': None, 'client': None, 'connections': None},
+                             {'service': 'ssh', 'username': 'jeff'}]
+    assert s['timestamp'] is None
+
+    h = systems['Triton']['storage_health']
+    assert h['overall_status'] is None and h['arrays'] == [] and h['events'] is None
+    assert len(h['status_reasons']) == 10 and h['status_reasons'][0] == 'r' * 200
+    assert h['sources'] == {'md': 'ok'}
+    assert h['disks'] == [{'id': 'sda', 'status': None, 'temperature_c': None}]
+    assert h['volumes'] == [{'id': '/v', 'status': None, 'read_only': None}]
+
+    b = systems['Triton']['breakdown']
+    assert b['folders'] == [{'path': '/a', 'bytes': 12.0}]
+    assert b['device'] == {'owners': None, 'other': None} and b['cold_thresholds_days'] is None
+
+    u = systems['Atlas']['usage']
+    assert u['users'] == [{'username': 'ok', 'cpu_core_hours': None}] and u['complete'] is None
+    assert 'usage' not in systems['Triton']
+
+
+@pytest.mark.parametrize('status', [[], ['warning'], {}, {'a': 1}, [None], [[]], 3, None])
+def test_unhashable_overall_status_is_ignored(make_client, status):
+    # A list or dict must not reach the frozenset lookup (TypeError -> HTTP 500 for every viewer)
+    routes = new_manager()
+    health = routes[dash.HEALTH_ENDPOINT]._payload['Triton']
+    health['overall_status'] = status
+    client, _ = make_client(routes=routes)
+    r = client.get('/api/data')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['degraded'] is False and body['errors'] == []
+    h = body['systems']['Triton']['storage_health']
+    assert h['overall_status'] is None and h['disks']        # the rest of the section still merges
+
+
+def test_stale_user_rows_are_dropped(make_client):
+    routes = healthy_manager()      # Atlas system_metrics at 2026-11-21T00:00:00Z
+    routes['/api/user_metrics/all'] = FakeResponse(200, {'Atlas': [
+        {'username': 'now', 'timestamp': '2026-11-21T00:00:00Z'},
+        {'username': 'newer', 'timestamp': '2026-11-21T00:00:09.123456Z'},
+        {'username': 'two-min', 'timestamp': '2026-11-20T23:58:00Z'},              # exactly 120 s: kept
+        {'username': 'offset', 'timestamp': '2026-11-21T01:00:00+01:00'},           # same instant: kept
+        {'username': 'gone', 'timestamp': '2026-11-20T23:57:59Z'},                  # 121 s older: dropped
+        {'username': 'naive-old', 'timestamp': '2026-11-20 20:00:00'},               # no zone = UTC: dropped
+        {'username': 'no-ts'}, {'username': 'bad-ts', 'timestamp': 'yesterday'},   # age unknown: kept
+    ]})
+    client, _ = make_client(routes=routes)
+    users = client.get('/api/data').get_json()['systems']['Atlas']['users']
+    assert [u['username'] for u in users] == ['now', 'newer', 'two-min', 'offset', 'no-ts', 'bad-ts']
+
+    # No system_metrics timestamp: every row is kept
+    routes['/api/metrics/all'] = FakeResponse(200, {})
+    client, _ = make_client(routes=routes)
+    assert len(client.get('/api/data').get_json()['systems']['Atlas']['users']) == 8
+
+
+def test_gpu_users_are_cleaned(make_client):
+    routes = healthy_manager()
+    gpus = [
+        {'index': 0, 'name': 'A', 'users': [
+            {'username': 'LAB\\alice', 'vram_bytes': '1024', 'util_percent': float('nan'), 'processes': True, 'pid': 7},
+            {'username': None, 'vram_bytes': 1}, {'username': 'u' * 257}, 'bob', None,
+            {'username': 'carol'}],
+         'users_truncated': 'two', 'unattributed_vram_bytes': -1, 'process_source': 'nvml'},
+        {'index': 1, 'name': 'B', 'users': 'not a list'},
+        {'index': 2, 'name': 'C'},                      # gpu_per_user "off": no users key
+        'not a gpu',
+    ]
+    routes['/api/metrics/all'] = FakeResponse(200, {'Atlas': {'timestamp': '2026-11-21T00:00:00Z', 'gpus': gpus}})
+    client, _ = make_client(routes=routes)
+    out = client.get('/api/data').get_json()['systems']['Atlas']['metrics']['gpus']
+    assert len(out) == 3
+    assert out[0]['users'] == [{'username': 'LAB\\alice', 'vram_bytes': 1024.0, 'util_percent': None, 'processes': None},
+                               {'username': 'carol'}]
+    assert out[0]['users_truncated'] is None and out[0]['unattributed_vram_bytes'] == -1
+    assert out[0]['process_source'] == 'nvml' and out[0]['name'] == 'A'
+    assert out[1]['users'] is None
+    assert 'users' not in out[2]
+
+
+# ---------------------------------------------------------------------------
+# Per-endpoint TTL cache
+# ---------------------------------------------------------------------------
+
+def test_endpoint_ttls_and_failures(make_client, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dash, '_monotonic', clock)
+    client, fake = make_client({'refresh_interval_seconds': 30}, routes=new_manager())
+
+    def polls(path):
+        return fake.count(path)
+
+    assert client.get('/api/data').get_json()['degraded'] is False
+    assert all(polls(p) == 1 for p in dash.POLL_ENDPOINTS)
+
+    # 31 s: the /api/data cache expired; only sessions (no TTL) and the core calls are fetched again,
+    # so a failure of the cached endpoints isn't even seen
+    fake.routes[dash.HEALTH_ENDPOINT] = FakeResponse(500, {'status': 'error', 'error': 'x'})
+    clock.now += 31
+    body = client.get('/api/data').get_json()
+    assert body['degraded'] is False
+    assert body['systems']['Triton']['storage_health']['overall_status'] == 'warning'   # cached good value
+    assert polls(dash.SESSIONS_ENDPOINT) == 2 and polls('/api/devices') == 2
+    assert polls(dash.HEALTH_ENDPOINT) == polls(dash.USAGE_ENDPOINT) == polls(dash.BREAKDOWN_ENDPOINT) == 1
+
+    # 62 s: health's 60 s TTL is over - the failed fetch is reported, and not cached
+    clock.now += 31
+    body = client.get('/api/data').get_json()
+    assert body['degraded'] is True and body['errors'] == [{'endpoint': dash.HEALTH_ENDPOINT, 'error': 'HTTP 500'}]
+    assert polls(dash.HEALTH_ENDPOINT) == 2
+    fake.routes[dash.HEALTH_ENDPOINT] = new_manager()[dash.HEALTH_ENDPOINT]
+    clock.now += 6                                  # past the 5 s degraded /api/data TTL
+    assert client.get('/api/data').get_json()['degraded'] is False
+    assert polls(dash.HEALTH_ENDPOINT) == 3         # retried at once, not after another TTL
+
+    # usage (300 s) and breakdown (600 s)
+    clock.now += 300 - 68 + 1
+    client.get('/api/data')
+    assert polls(dash.USAGE_ENDPOINT) == 2 and polls(dash.BREAKDOWN_ENDPOINT) == 1
+    clock.now += 300
+    client.get('/api/data')
+    assert polls(dash.BREAKDOWN_ENDPOINT) == 2
+
+
+def test_endpoint_404_is_cached_for_its_ttl(make_client, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(dash, '_monotonic', clock)
+    client, fake = make_client({'refresh_interval_seconds': 30})      # CURRENT Manager: 404s
+    client.get('/api/data')
+    clock.now += 31
+    body = client.get('/api/data').get_json()
+    assert body['features']['breakdown'] is False and body['degraded'] is False
+    assert fake.count(dash.BREAKDOWN_ENDPOINT) == 1 and fake.count(dash.SESSIONS_ENDPOINT) == 2
+
+
+# ---------------------------------------------------------------------------
+# History proxy: entity, resolution, storage_breakdown fields, aggregates
+# ---------------------------------------------------------------------------
+
+def _entity_history(path, params):
+    payload = {'system_name': 'Atlas', 'data_type': 'user_metrics', 'field': 'cpu_cores', 'unit': 'cores',
+               'entity': (params or {}).get('entity'), 'resolution': 'hour', 'bucket_seconds': 3600,
+               'data': [{'timestamp': '2026-11-21T00:30:00Z', 'value': 1.5, 'min': 1.0, 'max': 2.0, 'count': 12}]}
+    return FakeResponse(200, payload)
+
+
+def test_history_forwards_entity_and_resolution(make_client):
+    client, fake = make_client(routes={HISTORY: _entity_history})
+    resp = client.get('/api/history/Atlas/user_metrics/cpu_cores?from=2026-11-01&entity=LAB%5Calice&resolution=hour')
+    assert resp.status_code == 200
+    params = fake.calls[-1]['params']
+    assert params['entity'] == 'LAB\\alice' and params['resolution'] == 'hour'
+    assert resp.get_json()['data'][0] == {'timestamp': '2026-11-21T00:30:00Z', 'value': 1.5,
+                                          'min': 1.0, 'max': 2.0, 'count': 12}
+    # Neither is sent unless given
+    client.get('/api/history/Atlas/system_metrics/cpu_percent')
+    assert 'entity' not in fake.calls[-1]['params'] and 'resolution' not in fake.calls[-1]['params']
+
+
+@pytest.mark.parametrize('query', [
+    'entity=', 'entity=' + 'a' * 257, 'entity=al%01ice', 'entity=al%0Aice',
+    'resolution=minute', 'resolution=', 'resolution=HOUR',
+])
+def test_history_rejects_bad_entity_or_resolution(make_client, query):
+    client, fake = make_client(routes={HISTORY: _entity_history})
+    resp = client.get('/api/history/Atlas/user_metrics/cpu_cores?' + query)
+    assert resp.status_code == 400 and fake.count() == 0
+
+
+def test_history_entity_ignored_by_older_manager_is_not_charted(make_client):
+    # CURRENT / OLD Managers ignore ?entity and return every user's values mixed together
+    client, _ = make_client(routes=_history_routes())
+    resp = client.get('/api/history/Atlas/user_metrics/cpu_percent?entity=alice')
+    assert resp.status_code == 404
+    assert resp.get_json() == {'success': False, 'error': 'Per-user history needs a newer Manager'}
+
+
+def test_history_storage_breakdown_field_length(make_client):
+    client, fake = make_client(routes=_history_routes())
+    # A folder path at the R10 limit (4096 characters) fits
+    longest = 'folder/' + '/volume1/' + 'd' * (4096 - 9) + '/bytes'
+    assert client.get('/api/history/Triton/storage_breakdown/' + quote(longest, safe='')).status_code == 200
+    assert fake.calls[-1]['url'].endswith('/storage_breakdown/' + quote(longest, safe=''))
+    assert client.get('/api/history/Triton/storage_breakdown/folder/' + 'd' * 4387 + '/bytes').status_code == 200  # 4400
+    assert client.get('/api/history/Triton/storage_breakdown/folder/' + 'd' * 4388 + '/bytes').status_code == 400  # 4401
+    # The exception is only for storage_breakdown
+    assert client.get('/api/history/Triton/system_metrics/' + 'a' * 513).status_code == 400
+    assert client.get('/api/history/Triton/folder_usage/' + 'a' * 600).status_code == 400
+    # "." / ".." segments are still refused, with / or \ separators
+    for bad in ('folder/volume1/../x/bytes', 'folder%2Fvolume1%2F..%2Fx%2Fbytes', 'owner/./bytes', 'folder/a\\..\\b/bytes'):
+        assert client.get('/api/history/Triton/storage_breakdown/' + bad).status_code == 400, bad
+    assert client.get('/api/history/Triton/storage_breakdown/owner%2FLAB%5Cjeff%2Fbytes').status_code == 200
+    assert fake.calls[-1]['url'].endswith('/storage_breakdown/owner%2FLAB%5Cjeff%2Fbytes')
+
+
+def test_downsample_keeps_min_max_count():
+    points = [{'timestamp': f't{i}', 'value': float(i), 'min': float(i) - 1, 'max': float(i) + 1, 'count': i + 1}
+              for i in range(10)]
+    out = dash.downsample(points, 5)
+    assert len(out) == 5
+    # bucket 0: values 0,1 with counts 1,2 -> weighted mean 2/3
+    assert out[0] == {'timestamp': 't1', 'value': pytest.approx(2 / 3), 'count': 3, 'min': -1.0, 'max': 2.0}
+    # Plain points stay plain (older Managers): no aggregate keys appear
+    plain = dash.downsample([{'timestamp': f't{i}', 'value': i} for i in range(4)], 2)
+    assert plain == [{'timestamp': 't1', 'value': 0.5}, {'timestamp': 't3', 'value': 2.5}]
+    # All-null buckets stay null, never 0
+    assert dash.downsample([{'timestamp': 'a', 'value': None, 'count': 0}] * 4, 2)[0]['value'] is None
+
+
+# ---------------------------------------------------------------------------
+# /api/storage/breakdown/<system>?folder= proxy
+# ---------------------------------------------------------------------------
+
+def test_breakdown_proxy(make_client):
+    answer = {'timestamp': 't', 'folders': [dict(A5_BREAKDOWN['folders'][0], owners=[{'owner': 'jeff', 'bytes': 4000}])]}
+    client, fake = make_client(routes={'/api/storage/breakdown/*': FakeResponse(200, answer)})
+    resp = client.get('/api/storage/breakdown/Triton?folder=/volume1/Lab')
+    assert resp.status_code == 200 and resp.get_json() == answer
+    assert fake.calls[-1]['url'] == 'http://manager.test:5000/api/storage/breakdown/Triton'
+    assert fake.calls[-1]['params'] == {'folder': '/volume1/Lab'}
+    client.get('/api/storage/breakdown/Triton')
+    assert fake.calls[-1]['params'] is None
+    calls = fake.count()
+    for url in ('/api/storage/breakdown/Triton?folder=/volume1/../etc',
+                '/api/storage/breakdown/Triton?folder=..',
+                '/api/storage/breakdown/Triton?folder=E:%5C..%5Cx',
+                '/api/storage/breakdown/Triton?folder=/' + 'a' * 4096,
+                '/api/storage/breakdown/bad%20name!?folder=/x'):
+        assert client.get(url).status_code == 400, url
+    assert fake.count() == calls
+
+
+def test_breakdown_proxy_passes_404_and_hides_errors(make_client):
+    client, _ = make_client(routes={})      # older Manager, or no breakdown for this system
+    assert client.get('/api/storage/breakdown/Triton?folder=/volume1/Lab').status_code == 404
+    client, _ = make_client(routes={'/api/storage/breakdown/*': requests.exceptions.ConnectionError('db-host refused')})
+    resp = client.get('/api/storage/breakdown/Triton?folder=/volume1/Lab')
+    assert resp.status_code == 502 and resp.get_json() == {'success': False, 'error': 'Manager unavailable'}
+
+
+# ---------------------------------------------------------------------------
+# Unchanged against the CURRENT (fb6498c) and OLD (f086e7e) Managers
+# ---------------------------------------------------------------------------
+
+CURRENT_COMMIT = 'fb6498c'
+
+
+def _load_current_dashboard(tmp_path):
+    """dashboard/app.py as released in CURRENT, loaded from git as its own module."""
+    git = shutil.which('git')
+    if git is None:
+        pytest.skip('git not installed')
+    res = subprocess.run([git, '-C', str(REPO), 'show', f'{CURRENT_COMMIT}:dashboard/app.py'],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        pytest.skip(f'{CURRENT_COMMIT} not available in this checkout')
+    path = tmp_path / 'current_dashboard_app.py'
+    path.write_text(res.stdout, encoding='utf-8')
+    spec = importlib.util.spec_from_file_location('current_dashboard_app', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def old_manager():
+    """healthy_manager() as the OLD Manager shapes it: total_ram_bytes defaults to 0,
+    /api/user_metrics/usage hits /api/user_metrics/<device_name>, history has no flags."""
+    routes = healthy_manager()
+    atlas = dict(routes['/api/metrics/all']._payload['Atlas'], total_ram_bytes=0)
+    routes['/api/metrics/all'] = FakeResponse(200, {'Atlas': atlas})
+    routes[dash.USAGE_ENDPOINT] = FakeResponse(200, [])
+    routes[HISTORY] = FakeResponse(200, {'system_name': 'Atlas', 'data_type': 'system_metrics',
+                                         'field': 'cpu_percent', 'unit': '%',
+                                         'data': [{'timestamp': '2026-11-21T00:00:00Z', 'value': 1.0}]})
+    return routes
+
+
+@pytest.mark.parametrize('routes_for', [healthy_manager, old_manager], ids=['current', 'old'])
+def test_older_manager_gives_the_same_data_as_the_current_dashboard(make_client, tmp_path, routes_for):
+    current = _load_current_dashboard(tmp_path)
+    routes = routes_for()
+    routes.setdefault(HISTORY, _history_routes()[HISTORY])
+    client, _ = make_client(routes=routes)
+    new_body = client.get('/api/data').get_json()
+
+    current.init_app(dict(dash._config), logging.getLogger('test-dashboard-current'))
+    payload, status = current.build_data_payload()
+    old_body = json.loads(json.dumps(payload))
+    assert status == 200 and old_body['degraded'] is False
+
+    assert new_body['degraded'] is False and new_body['errors'] == []
+    assert set(new_body) == set(old_body) | {'features'}
+    assert new_body['global_totals'] == old_body['global_totals']
+    assert set(new_body['systems']) == set(old_body['systems'])
+    # Every system exactly as the CURRENT Dashboard presented it: no new keys
+    # appear for data an older Manager serves (tools/verify_upgrade.py compares this too)
+    assert new_body['systems'] == old_body['systems']
+
+    # Charts work as before (no entity or resolution sent by default)
+    resp = client.get('/api/history/Atlas/system_metrics/cpu_percent?from=2026-11-01')
+    assert resp.status_code == 200
+    assert resp.get_json()['data'] == [{'timestamp': '2026-11-21T00:00:00Z', 'value': 1.0}]
