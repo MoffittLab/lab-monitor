@@ -319,8 +319,19 @@ const okMetrics = extra => Object.assign({ timestamp: isoAgo(1), cpu_percent: 10
         { username: 'LAB\\alice', cpu_core_hours: 30, gpu_busy_hours: 18.2, gpu_held_hours: 23.9 },
         { username: 'bob', cpu_core_hours: 50, gpu_busy_hours: null, gpu_held_hours: 2 }] };
     const g = card({ metrics: okMetrics({}), users: [{ username: 'alice', cpu_percent: 1 }], usage });
-    check(g.includes('Last 24 h</span> alice 18.2 h busy / 23.9 h held'), 'gpu usage line: ' + g);
-    check(!g.includes('bob 50'), 'null busy hours sort out of the GPU list');
+    check(g.includes('Last 24 h</span> alice 18.2 h busy / 23.9 h held · bob — busy / 2.0 h held</div>'), 'gpu usage line: ' + g);
+    check(!g.includes('bob 50'), 'GPU list shows GPU hours, not core-hours');
+    // Unknown busy hours (no utilisation reading, or a shared busy GPU) never hide a GPU holder:
+    // ranked after every known busy total, then by held hours
+    const unknownBusy = { window: '24h', users: [
+        { username: 'LAB\\alice', cpu_core_hours: 0.36, gpu_busy_hours: null, gpu_held_hours: 0.333 },
+        { username: 'LAB\\bob', cpu_core_hours: 1, gpu_busy_hours: 0.015, gpu_held_hours: 0.167 },
+        { username: 'carol', cpu_core_hours: 1, gpu_busy_hours: null, gpu_held_hours: 5 },
+        { username: 'dave', cpu_core_hours: 9, gpu_busy_hours: null, gpu_held_hours: null }] };
+    const ub = card({ metrics: okMetrics({}), users: [{ username: 'alice', cpu_percent: 1 }], usage: unknownBusy });
+    check(ub.includes('Last 24 h</span> bob 0.0 h busy / 0.2 h held · carol — busy / 5.0 h held · alice — busy / 0.3 h held</div>'),
+          'unknown busy hours keep the GPU holder: ' + ub);
+    check(ub.includes('Busy hours count only the runs whose GPU use could be attributed'), 'partial busy hint: ' + ub);
     // A GPU host's measured zeros are not GPU use: core-hours, and no "0.0 h busy" rows
     const idleGpu = { window: '24h', users: [
         { username: 'alice', cpu_core_hours: 310.5, gpu_busy_hours: 0, gpu_held_hours: 0 },

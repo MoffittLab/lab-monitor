@@ -540,15 +540,76 @@ def test_backfill_of_current_format_data(make_client, data_dir):
     paths = [os.path.join(data_dir, d, 'data.db') for d in ('triton', 'atlas')]
     for p in paths:
         assert not [t for t in tables_of(p) if t.startswith('_')]
+    layouts = {p: _layout(p) for p in paths}
     client = make_client()
     for p in paths:
-        assert backups(p) == []                     # CURRENT format: nothing to migrate, no copy
+        # CURRENT format: only the rollup tables are added, after one copy of the database as it was
+        (bak,) = backups(p)
+        assert _layout(bak) == layouts[p] and not [t for t in tables_of(bak) if t.startswith('_')]
         assert {x[4] for x in pending(p)} == {'initial'}
     finish_backfill()
     for p in paths:
         assert_rollups_match(p)
     post_all(client, random_messages(seed=43, n=20))
     assert_rollups_match(paths[0])
+    make_client()                                   # a restart takes no second copy
+    assert all(len(backups(p)) == 1 for p in paths)
+
+
+def test_rollup_tables_wait_for_their_backup(make_client, data_dir, monkeypatch, caplog):
+    """CURRENT-format data: a failed backup holds the rollup tables back, never ingest."""
+    _build_current(data_dir, {'Triton': [seed_message()] + random_messages(seed=44, n=30)})
+    path = os.path.join(data_dir, 'triton', 'data.db')
+
+    def no_space(conn, db_path, *a, **kw):
+        if db_path.endswith('data.db'):
+            raise OSError(28, 'No space left on device')
+        return real(conn, db_path, *a, **kw)
+    real = data_store.backup_database
+    monkeypatch.setattr(data_store, 'backup_database', no_space)
+    with caplog.at_level(logging.ERROR):
+        client = make_client()
+    assert 'NOT adding the rollup tables' in caplog.text
+    assert not backups(path) and not [t for t in tables_of(path) if t.startswith('_')]
+    assert set(post_all(client, random_messages(seed=45, n=5))) == {'stored'}
+    assert not [t for t in tables_of(path) if t.startswith('_')]
+    # a retry once there is room: one copy (without the rollup tables), then everything is rolled up
+    monkeypatch.setattr(data_store, 'backup_database', real)
+    mgr._data_store._get_db('Triton').rollups_attempted -= rollups.INIT_RETRY_SECONDS
+    assert set(post_all(client, random_messages(seed=46, n=5))) == {'stored'}
+    (bak,) = backups(path)
+    assert not [t for t in tables_of(bak) if t.startswith('_')] and '_rollup_state' in tables_of(path)
+    finish_backfill()
+    assert_rollups_match(path)
+
+
+def test_rollup_tables_added_by_a_first_rolled_up_row_are_backed_up_first(make_client, data_dir):
+    """A CURRENT-format database with only folder_usage gets its copy when system_metrics first comes."""
+    folders = [make_msg('folder_usage', {'/volume1/Lab': 100 + i, '_unit': 'bytes'},
+                        ts=f'2026-08-0{i + 1}T02:00:00.000000Z') for i in range(3)]
+    _build_current(data_dir, {'Triton': folders})
+    path = os.path.join(data_dir, 'triton', 'data.db')
+    before = _layout(path)
+    client = make_client()
+    assert not backups(path) and '_rollup_state' not in tables_of(path)
+    assert post_all(client, [seed_message()]) == ['stored']
+    (bak,) = backups(path)
+    assert _layout(bak) == before and '_rollup_state' in tables_of(path)
+    make_client()
+    assert backups(path) == [bak]
+    # a database this Manager creates gets the tables with its first row, without a copy
+    assert post_all(client, [seed_message('Atlas')], name='Atlas') == ['stored']
+    atlas = os.path.join(data_dir, 'atlas', 'data.db')
+    assert '_rollup_state' in tables_of(atlas) and not backups(atlas)
+
+
+def _layout(path):
+    con = sqlite3.connect(path)
+    try:
+        return {t: [r[1] for r in con.execute(f'PRAGMA table_info("{t}")')] for (t,) in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite%' ORDER BY name")}
+    finally:
+        con.close()
 
 
 def _bulk_rows(path, n, start=datetime(2025, 1, 1, tzinfo=timezone.utc), step=300, fields=12, seed=5):

@@ -192,8 +192,10 @@ def _get(client, path):
 def test_deployed_manager_stores_new_payloads_and_new_manager_takes_over(deployed, tmp_path):
     data_dir = tmp_path / 'data'
     data_dir.mkdir()
+    sb_history = [f'/api/history/Triton/storage_breakdown/{f}' for f in ('top_owners', 'top_owners_effective', '_schema')]
     reads = ['/api/data/Triton'] + [f'/api/data/Triton/{t}?limit=1000' for t in NEW_TYPES] + \
-            ['/api/user_metrics/all', '/api/user_metrics/history/Triton/LAB%5Calice', '/api/metrics/all', '/api/totals']
+            ['/api/user_metrics/all', '/api/user_metrics/history/Triton/LAB%5Calice', '/api/metrics/all', '/api/totals'] + \
+            sb_history
     out = run_deployed(deployed['code'], deployed['config'](str(data_dir)), deployed['token'],
                        posts=[queue_body(m, i) for i, m in enumerate(RUNS)], gets=reads)
     for run, post in zip(RUNS, out['posts']):
@@ -236,6 +238,12 @@ def test_deployed_manager_stores_new_payloads_and_new_manager_takes_over(deploye
             assert _by_time(got) == _by_time(want), t
         for path in ('/api/user_metrics/all', '/api/user_metrics/history/Triton/LAB%5Calice'):
             assert _get(client, path) == (200, before[path]), path
+        # history of a top-level storage_breakdown number: same points, same unit (the message's _unit)
+        for path in sb_history:
+            status, now = _get(client, path)
+            assert status == 200 and now['unit'] == before[path]['unit'] == 'bytes', path
+            assert [(p['timestamp'][:19], p['value']) for p in now['data']] == \
+                [(p['timestamp'][:19], p['value']) for p in before[path]['data']], path
         totals = _get(client, '/api/totals')[1]
         for row in totals['devices'].values():
             row.pop('network_last_updated', None) if deployed['name'] == 'old' else None
@@ -339,11 +347,15 @@ def test_downgrade_gate_new_data_dir_opened_by_current(tmp_path):
         mgr._close_stores()
 
     # the cycle once more: CURRENT makes a new wide storage_breakdown table (the
-    # migrated one no longer holds its index names) and NEW migrates that too
+    # migrated one no longer holds its index names) and NEW migrates that too.
+    # The first time CURRENT also gets a run NEW already holds (a re-send after a
+    # lost ACK): NEW's second migration skips it instead of failing on its msg_id
     for n, cycle in enumerate((collector_run(50), collector_run(60))):
+        resent = [m for m in later if m['data']['data_type'] == 'storage_breakdown'] if n == 0 else []
         out = run_deployed(current_manager_dir(), base_config(str(data_dir)), ADMIN,
-                           posts=[queue_body(cycle, 50 + n)], gets=['/api/data/Triton'])
-        assert out['posts'][0]['json']['counts'] == {'stored': len(cycle), 'duplicate': 0, 'rejected': 0, 'error': 0}
+                           posts=[queue_body(cycle + resent, 50 + n)], gets=['/api/data/Triton'])
+        assert out['posts'][0]['json']['counts'] == {'stored': len(cycle) + len(resent), 'duplicate': 0,
+                                                     'rejected': 0, 'error': 0}
         assert sorted(out['gets']['/api/data/Triton']['json']['data_types']) == sorted(NEW_TYPES)
         client = _new_client(data_dir)
         try:
@@ -352,7 +364,12 @@ def test_downgrade_gate_new_data_dir_opened_by_current(tmp_path):
                 {'storage_breakdown_legacy_2'} if n else set())
             assert 'storage_breakdown' not in _tables(db) and legacy <= _tables(db)
             rows = _get(client, '/api/data/Triton/storage_breakdown')[1]['rows']
-            assert len(rows) == 4 + n and rows[0]['timestamp'] == cycle[0]['header']['timestamp']
+            assert len(rows) == 4 + 2 * n and rows[0]['timestamp'] == cycle[0]['header']['timestamp']
             assert rows[0]['folders'] == APPENDIX_A[-1]['folders']
+            assert len({r['msg_id'] for r in rows}) == len(rows)
+            # and storage_breakdown keeps being stored (an older run, so the next cycle's is the newest)
+            more = [m for m in collector_run(45 + n) if m['data']['data_type'] == 'storage_breakdown']
+            r = client.post('/api/data/queue', json=queue_body(more, 70 + n), headers=auth(ADMIN))
+            assert r.get_json()['counts']['stored'] == len(more) == 1
         finally:
             mgr._close_stores()

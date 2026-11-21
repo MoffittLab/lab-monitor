@@ -16,6 +16,7 @@ decides which folders get them.
 folder_usage itself is unchanged. Sizes are apparent sizes (st_size), hard
 links counted once, as in folder_usage.
 """
+import json
 import logging
 import os
 import threading
@@ -33,6 +34,9 @@ SECONDS_PER_DAY = 86400
 OWNER_MAX_CHARS = 256          # contract R10 usernames
 PATH_MAX_CHARS = 4096          # contract R10 paths
 NUMBERS = ('bytes', 'files', 'cold_1y_bytes', 'cold_3y_bytes')
+MAX_FOLDERS = 10000            # the Manager rejects a message with more folders
+MAX_MESSAGE_BYTES = 1048576    # contract R5: a serialized message is at most 1 MiB
+MESSAGE_MARGIN_BYTES = 4096    # room for the header and data_type around the payload
 
 
 def _wall_time() -> float:
@@ -180,6 +184,11 @@ def build_payload(scan: dict, folder_order: List[str], opts: Options,
     entry remain; top_owners_effective 0). Either way owners_truncated is
     true. The device entry (at most device_top_owners + 2 rows) is outside
     the budget.
+
+    Size: at most MAX_FOLDERS folders and MAX_MESSAGE_BYTES of JSON. Over
+    either, per-folder owners are left out first (as above), then the
+    smallest folders by bytes, counted in '_folders_omitted' (a key sent
+    only then). The device entry still covers every measured folder.
     """
     sizes, files = scan.get('sizes') or {}, scan.get('files') or {}
     details = scan.get('breakdown') or {}
@@ -225,7 +234,7 @@ def build_payload(scan: dict, folder_order: List[str], opts: Options,
                 entry['owners'], entry['other'] = _owner_rows(owner_maps[entry['path']], top)
 
     device = _device(entries, owner_maps, opts)
-    return {
+    payload = {
         '_schema': SCHEMA_VERSION,
         '_unit': 'bytes',
         'reference_time': _iso(opts.reference_time),
@@ -242,6 +251,52 @@ def build_payload(scan: dict, folder_order: List[str], opts: Options,
         '_errors': list(scan.get('errors') or []),
         '_breakdown_unavailable': list(scan.get('breakdown_unavailable') or []),
     }
+    return _fit(payload)
+
+
+def _json_size(value) -> int:
+    """Bytes of value as JSON, ASCII-escaped with the default separators (the largest form it is sent or archived in)."""
+    return len(json.dumps(value))
+
+
+def _fit(payload: dict) -> dict:
+    """
+    The payload cut to MAX_FOLDERS folders and MAX_MESSAGE_BYTES: per-folder
+    owners go first, then the smallest folders (by bytes; the order of the
+    rest is kept), counted in _folders_omitted. _breakdown_unavailable keeps
+    only the folders still sent.
+    """
+    entries = payload['folders']
+    budget = MAX_MESSAGE_BYTES - MESSAGE_MARGIN_BYTES
+    if len(entries) <= MAX_FOLDERS and _json_size(payload) <= budget:
+        return payload
+    if any(e['owners'] is not None for e in entries):
+        for entry in entries:
+            entry['owners'] = entry['other'] = None
+        payload.update(top_owners_effective=0, owners_truncated=True)
+        if len(entries) <= MAX_FOLDERS and _json_size(payload) <= budget:
+            return payload
+    unavailable, paths = set(payload['_breakdown_unavailable']), {e['path'] for e in entries}
+    fixed = _json_size(dict(payload, folders=[], _folders_omitted=len(entries),
+                            _breakdown_unavailable=[p for p in payload['_breakdown_unavailable'] if p not in paths]))
+    room, keep = budget - fixed, set()
+    ranked = sorted(range(len(entries)), key=lambda i: (-(entries[i]['bytes'] or 0), i))
+    for i in ranked:
+        cost = _json_size(entries[i]) + 2
+        if entries[i]['path'] in unavailable:
+            cost += _json_size(entries[i]['path']) + 2
+        if len(keep) >= MAX_FOLDERS or cost > room:
+            break
+        room -= cost
+        keep.add(i)
+    omitted = {e['path'] for i, e in enumerate(entries) if i not in keep}
+    payload['folders'] = [e for i, e in enumerate(entries) if i in keep]
+    payload['_breakdown_unavailable'] = [p for p in payload['_breakdown_unavailable'] if p not in omitted]
+    payload['_folders_omitted'] = len(omitted)
+    logger.warning(f"Storage breakdown: {len(omitted)} of {len(entries)} folders left out (the smallest), "
+                   f"to stay within {MAX_FOLDERS} folders and {MAX_MESSAGE_BYTES // 1048576} MiB; "
+                   f"folder_usage still reports them")
+    return payload
 
 
 def _device(entries: List[dict], owner_maps: Dict[str, dict], opts: Options) -> Optional[dict]:

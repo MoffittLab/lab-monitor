@@ -102,6 +102,11 @@ USER_EXTRA_COLUMNS = (
     ('gpus_held', 'INTEGER'), ('gpu_held_seconds', 'REAL'), ('gpu_processes', 'INTEGER'),
 )
 USER_EXTRA_FIELDS = tuple(c for c, _ in USER_EXTRA_COLUMNS)
+# device_user_snapshot also keeps the timestamp its usage fields were written
+# at: an older Manager that runs on this database for a while (a downgrade)
+# updates cpu_percent, RAM and timestamp but not the usage columns, which
+# are then shown only while usage_timestamp equals timestamp
+USER_SNAPSHOT_COLUMNS = USER_EXTRA_COLUMNS + (('usage_timestamp', 'TEXT'),)
 
 # system_metrics keys (spec §11) that /api/metrics/all passes through from
 # the latest message, when that message has them
@@ -121,7 +126,7 @@ _CURRENT_SCHEMA = {
     'device_snapshot':      ('metrics_json',),
     'device_totals':        ('network_last_updated',),
     'dead_letter':          (),
-    'device_user_snapshot': USER_EXTRA_FIELDS,
+    'device_user_snapshot': tuple(c for c, _ in USER_SNAPSHOT_COLUMNS),
     'user_metrics_history': ('msg_id',) + USER_EXTRA_FIELDS,
     'device_session_snapshot':  (),
     'device_storage_health':    (),
@@ -1409,6 +1414,9 @@ class UserMetricsStore:
                                              msg_id UNIQUE for dedup.
     Both carry the usage fields (USER_EXTRA_COLUMNS); the read methods leave
     a NULL one out of a row (not measured, or stored before they existed).
+    A snapshot row's usage fields are served only when its usage_timestamp
+    is its timestamp: after a downgrade the older Manager updated the row
+    without them, so they belong to an earlier reading.
     """
 
     def __init__(self, metrics_db: MetricsDB, init: bool = True):
@@ -1420,6 +1428,7 @@ class UserMetricsStore:
 
     def _init_tables(self):
         extra = ''.join(f',\n                    {c} {t}' for c, t in USER_EXTRA_COLUMNS)
+        snapshot_extra = ''.join(f',\n                    {c} {t}' for c, t in USER_SNAPSHOT_COLUMNS)
         with self._conn.transaction() as db:
             db.execute(f'''
                 CREATE TABLE IF NOT EXISTS device_user_snapshot (
@@ -1428,7 +1437,7 @@ class UserMetricsStore:
                     cpu_percent   REAL,
                     ram_bytes     INTEGER,
                     ram_formatted TEXT,
-                    timestamp     TEXT{extra},
+                    timestamp     TEXT{snapshot_extra},
                     PRIMARY KEY (name, username)
                 )
             ''')
@@ -1449,10 +1458,11 @@ class UserMetricsStore:
                 # Migration: existing rows get NULL (UNIQUE allows many NULLs)
                 db.execute('ALTER TABLE user_metrics_history ADD COLUMN msg_id TEXT')
                 logger.info("Migrated user_metrics_history: added msg_id column")
-            for table in ('device_user_snapshot', 'user_metrics_history'):
+            for table, columns in (('device_user_snapshot', USER_SNAPSHOT_COLUMNS),
+                                   ('user_metrics_history', USER_EXTRA_COLUMNS)):
                 have = {row[1] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
-                added = [c for c, _ in USER_EXTRA_COLUMNS if c not in have]
-                for c, t in USER_EXTRA_COLUMNS:
+                added = [c for c, _ in columns if c not in have]
+                for c, t in columns:
                     if c in added:
                         # Migration: existing rows read NULL ("not measured")
                         db.execute(f'ALTER TABLE {table} ADD COLUMN {c} {t}')
@@ -1515,15 +1525,17 @@ class UserMetricsStore:
         updates = ''.join(f',\n                {c} = excluded.{c}' for c in USER_EXTRA_FIELDS)
         db.execute(f'''
             INSERT INTO device_user_snapshot
-                (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp, {', '.join(USER_EXTRA_FIELDS)})
-            VALUES ({', '.join(['?'] * (6 + len(USER_EXTRA_FIELDS)))})
+                (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp, {', '.join(USER_EXTRA_FIELDS)},
+                 usage_timestamp)
+            VALUES ({', '.join(['?'] * (7 + len(USER_EXTRA_FIELDS)))})
             ON CONFLICT(name, username) DO UPDATE SET
                 cpu_percent   = excluded.cpu_percent,
                 ram_bytes     = excluded.ram_bytes,
                 ram_formatted = excluded.ram_formatted,
-                timestamp     = excluded.timestamp{updates}
+                timestamp     = excluded.timestamp{updates},
+                usage_timestamp = excluded.usage_timestamp
         ''', [device_name, username, cpu_percent, ram_bytes, ram_formatted, timestamp]
-                   + [extra.get(c) for c in USER_EXTRA_FIELDS])
+                   + [extra.get(c) for c in USER_EXTRA_FIELDS] + [timestamp])
 
     def ingest(self, device_name: str, timestamp: str, username: str,
                cpu_percent: Optional[float], ram_bytes: Optional[int],
@@ -1537,12 +1549,19 @@ class UserMetricsStore:
     def _extra_select(self, table: str) -> str:
         """', <usage columns>' that `table` has (none while a held-back migration has not added them)."""
         have = {row[1] for row in self._conn.query(f'PRAGMA table_info({table})')}
-        return ''.join(f', {c}' for c in USER_EXTRA_FIELDS if c in have)
+        fields = USER_EXTRA_FIELDS + (('usage_timestamp',) if table == 'device_user_snapshot' else ())
+        return ''.join(f', {c}' for c in fields if c in have)
 
     @staticmethod
     def _user_row(row) -> dict:
-        """A per-user row; a usage field that is NULL (unmeasured) is left out."""
-        return {k: v for k, v in dict(row).items() if v is not None or k not in USER_EXTRA_FIELDS}
+        """
+        A per-user row; a usage field that is NULL (unmeasured) is left out,
+        and so is every usage field of a snapshot row whose usage_timestamp
+        is not its timestamp (an older Manager updated it without them).
+        """
+        d = dict(row)
+        current = 'usage_timestamp' not in d or d.pop('usage_timestamp') == d.get('timestamp')
+        return {k: v for k, v in d.items() if k not in USER_EXTRA_FIELDS or (v is not None and current)}
 
     def get_snapshot(self, device_name: str) -> list:
         """Current users for one device, sorted by cpu_percent desc."""

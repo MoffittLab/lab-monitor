@@ -100,6 +100,17 @@ HOST_MAX_CHARS = 256
 # "(ipv4:10.0.0.5:51234)"; the machine name is the last word before "("
 _SMBSTATUS_ROW = re.compile(r'^\s*(\d+)\s+(\S+)\s+(.*?)\s*\((ipv[46]):(.+):(\d+)\)')
 
+# utmp hosts that terminal programs write through libutempter. A tmux pane
+# ("tmux(<pid>).%<pane>") or a GNU screen window ("<host>:S.<n>",
+# ":pts/1:S.0") is a terminal inside another session, not a login; a
+# mosh-server writes "<ip> via mosh [<pid>]" while a client is attached and
+# "mosh [<pid>]" before the first one and after 30 s without one.
+_MULTIPLEXER_HOST = re.compile(r'^tmux\(\d+\)\.%\d+$|:S\.\d+$')
+_MOSH_HOST = re.compile(r'^(?:(\S+) via )?mosh \[\d+\]$')
+# What a utmp or logind host must look like to be sent as client_host: never
+# free text such as a process name or a PID
+_HOST_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+
 
 def _wall_time() -> float:
     return time.time()
@@ -333,14 +344,17 @@ def _utmp_addr(raw: bytes) -> Optional[str]:
 
 
 def _host_fields(host: str, client: Optional[str]) -> dict:
-    """client / client_host from a source's host text: an IP is a client, anything else a host name."""
+    """
+    client / client_host from a source's host text: an IP is a client, a
+    host name a client_host; any other text is dropped.
+    """
     fields = {}
     ip = normalize_ip(host) if host else None
     if client is None and ip is not None:
         client = ip
     if client is not None:
         fields['client'] = client
-    if host and ip is None:
+    if host and ip is None and _HOST_NAME.match(host):
         fields['client_host'] = host[:HOST_MAX_CHARS]
     return fields
 
@@ -350,7 +364,10 @@ def parse_utmp(data: bytes, alive=_pid_alive) -> Optional[List[dict]]:
     Session rows from utmp records: USER_PROCESS entries whose process is
     alive. A pts/* line with a remote host (not empty, not ':0') is ssh,
     with the client from ut_addr_v6 (or the host when it is an IP) and a
-    host name in client_host; anything else is console. None when data
+    host name in client_host; a mosh-server's "<ip> via mosh [<pid>]" is
+    ssh from <ip>. tmux panes, screen windows and a mosh-server with no
+    client attached are left out: they are terminals, not logins, and
+    their host text holds a PID. Any other line is console. None when data
     isn't whole records (another layout, or a truncated file).
     """
     if len(data) % UTMP_RECORD:
@@ -364,6 +381,13 @@ def parse_utmp(data: bytes, alive=_pid_alive) -> Optional[List[dict]]:
         user, line, host = _cstr(user), _cstr(line), _cstr(host)
         if not user or not alive(pid):
             continue
+        if _MULTIPLEXER_HOST.search(host):
+            continue        # a tmux pane or a screen window inside another session
+        mosh = _MOSH_HOST.match(host)
+        if mosh and not mosh.group(1):
+            continue        # a mosh-server with no client attached
+        if mosh:
+            host = mosh.group(1)
         ssh = line.startswith('pts/') and bool(host) and not host.startswith(':')
         row = {'service': 'ssh' if ssh else 'console', 'username': user, 'source': 'utmp'}
         if ssh:     # a console login has no client (gdm writes "login screen" as its host)

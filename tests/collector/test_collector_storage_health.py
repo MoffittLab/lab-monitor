@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -437,6 +438,41 @@ def test_sid_and_flatten(health):
     many = [dict(disk, id=f'sd{i}', status='ok', bus='sata') for i in range(50)]
     flat, truncated = health.flatten([], many, [])
     assert truncated and len(flat) == 48
+
+
+_RENDER_TEMPS_JS = r"""
+const fs = require('fs'), vm = require('vm');
+const ctx = vm.createContext({ console, setTimeout, clearTimeout, AbortController, URLSearchParams });
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), ctx);
+const disks = JSON.parse(fs.readFileSync(0, 'utf8'));
+const out = ctx.buildHealthHtml({ overall_status: 'ok', timestamp: new Date().toISOString(), disks });
+console.log(JSON.stringify([...out.matchAll(/data-metric="([^"]*)"/g)].map(m => m[1])));
+"""
+
+
+@pytest.mark.skipif(shutil.which('node') is None, reason='node not installed')
+def test_dashboard_links_exactly_the_disk_temperatures_the_collector_keeps(health):
+    """dashboard.js offers a temperature chart only for the keys flatten() stores: cap, collisions, sid rules."""
+    disk = {f: None for f in health.DISK_FIELDS}
+    disks = [dict(disk, id='usb0', bus='usb', temperature_c=30, status='ok'),          # never flattened
+             dict(disk, id='__sda__', bus='sata', temperature_c=31, status='ok'),       # sid strips '_'
+             dict(disk, id='sdb', bus='sata', temperature_c=32, status='ok'),
+             dict(disk, id='SDB', bus='sata', temperature_c=33, status='ok'),           # same key: the first wins
+             dict(disk, id='sdc', bus='sata', temperature_c=None, status='ok'),         # no temperature, no claim
+             dict(disk, id='SDC', bus='sata', temperature_c=34, status='ok'),
+             dict(disk, id='', bus='sata', temperature_c=35, status='ok'),              # 'root'
+             dict(disk, id='a' * 31 + '-x', bus='nvme', temperature_c=36, status='ok'),
+             dict(disk, id='d\U0001F600x', bus='sata', temperature_c=37, status='ok')]
+    disks += [dict(disk, id=f'pd{i}', bus='sas', temperature_c=40, status='ok') for i in range(45)]   # 52 non-USB
+    flat, truncated = health.flatten([], disks, [])
+    kept = {k for k in flat if k.endswith('_temperature_c')}
+    assert truncated and len(kept) == 46 and 'disk_pd43_temperature_c' not in kept
+    js = os.path.join(os.path.dirname(__file__), '..', '..', 'dashboard', 'static', 'js', 'dashboard.js')
+    result = subprocess.run(['node', '-e', _RENDER_TEMPS_JS, js], input=json.dumps(disks),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    linked = json.loads(result.stdout)
+    assert len(linked) == len(set(linked)) and set(linked) == kept
 
 
 @pytest.fixture

@@ -1047,23 +1047,33 @@ function buildUserGpuCellHtml(u, totalVram, username) {
 }
 
 // "Last 24 h  alice 18.2 h busy / 23.9 h held · bob ...": top 5 by GPU busy
-// hours when someone used a GPU in the window, otherwise by CPU core-hours.
-// GPU hosts report measured zeros for users who held no GPU; those rows
-// would only be "0.0 h busy / 0.0 h held", so they don't count as GPU use.
+// hours, then held hours, when someone used a GPU in the window, otherwise by
+// CPU core-hours. GPU hosts report measured zeros for users who held no GPU;
+// those rows would only be "0.0 h busy / 0.0 h held", so they don't count as
+// GPU use. A user who held a GPU whose use couldn't be attributed (no
+// utilisation reading, or a busy GPU shared without process samples) has
+// null busy hours: listed as "— busy / 2.0 h held", never left out.
 function buildUsageHtml(usage, usageCls = '') {
     if (!usage || managerFeatures.usage === false) return '';
     const users = Array.isArray(usage.users) ? usage.users.filter(u => u && typeof u === 'object') : [];
     const usedGpu = u => toNumber(u.gpu_busy_hours) > 0 || toNumber(u.gpu_held_hours) > 0;
     const gpu   = users.some(usedGpu);
-    const key   = gpu ? 'gpu_busy_hours' : 'cpu_core_hours';
-    const top   = users.filter(u => toNumber(u[key]) !== null && (!gpu || usedGpu(u)))
-                       .sort((a, b) => toNumber(b[key]) - toNumber(a[key])).slice(0, 5);
+    // descending by key, a null value after every number
+    const desc  = (a, b, key) => {
+        const x = toNumber(a[key]), y = toNumber(b[key]);
+        return (x === null) - (y === null) || (y || 0) - (x || 0);
+    };
+    const top   = (gpu
+        ? users.filter(usedGpu).sort((a, b) => desc(a, b, 'gpu_busy_hours') || desc(a, b, 'gpu_held_hours'))
+        : users.filter(u => toNumber(u.cpu_core_hours) !== null).sort((a, b) => desc(a, b, 'cpu_core_hours'))
+    ).slice(0, 5);
     if (!top.length) return '';
     const parts = top.map(u => gpu
         ? `${shortUser(u.username)} ${fmtValue(u.gpu_busy_hours, 1, 'h')} busy / ${fmtValue(u.gpu_held_hours, 1, 'h')} held`
         : `${shortUser(u.username)} ${fmtValue(u.cpu_core_hours, 1, '')} core-h`);
     const windowText = typeof usage.window === 'string' ? usage.window.replace(/^(\d+)([a-z]+)$/, '$1 $2') : '24 h';
     const tip = (gpu ? 'GPU busy / held hours' : 'CPU core-hours') + ` per user over the last ${windowText}`
+              + (gpu ? '. Busy hours count only the runs whose GPU use could be attributed ("—": none could be)' : '')
               + (usage.complete === false ? ' (history still being summarised; totals may be low)' : '');
     return html`<div class="usage-line ${usageCls}" title="${escapeHtml(tip)}"><span class="usage-label">Last ${escapeHtml(windowText)}</span> ${escapeHtml(parts.join(' · '))}</div>`;
 }
@@ -1375,12 +1385,13 @@ function buildHealthHtml(h, sectionCls = '') {
         return html`<div class="health-row ${rowCls}">${escapeHtml(p.text)}</div>`;
     }).join('');
 
+    const tempKeys  = diskTempMetrics(disks);
     const tempsHtml = disks.filter(dk => toNumber(dk.temperature_c) !== null).map(dk => {
         const tempCls = dk.status === 'critical' || dk.status === 'warning' ? dk.status : '';
         const label   = `${String(dk.id ?? '?')} ${safeFixed(dk.temperature_c, 0)}°C`;
-        // USB disks are listed but have no history (the collector doesn't flatten them)
-        const attrsHtml = dk.bus === 'usb' || typeof dk.id !== 'string' ? ''
-            : html` data-type="storage_health" data-metric="${escapeHtml(diskTempMetric(dk.id))}"`;
+        // Only disks the collector kept a history key for open a chart
+        const attrsHtml = tempKeys.has(dk)
+            ? html` data-type="storage_health" data-metric="${escapeHtml(tempKeys.get(dk))}"` : '';
         return html`<span class="health-temp ${tempCls}"${attrsHtml}>${escapeHtml(label)}</span>`;
     }).join('');
     const tempsRowHtml = tempsHtml ? html`<div class="health-temps">${tempsHtml}</div>` : '';
@@ -1440,10 +1451,30 @@ function describeVolume(v) {
             typeof v.health === 'string' ? v.health : null].filter(Boolean).join(', ');
 }
 
-// The collector's flattened history key for a disk temperature: the id
-// lowercased, anything outside [a-z0-9] as "_", at most 32 characters
+// The collector's flattened history key for a disk temperature
+// (storage_health.sid): the id lowercased, anything outside [a-z0-9] as "_",
+// leading and trailing "_" stripped, at most 32 characters, "root" if empty
 function diskTempMetric(id) {
-    return 'disk_' + String(id).toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 32) + '_temperature_c';
+    const sid = String(id).toLowerCase().replace(/[^a-z0-9]/gu, '_').replace(/^_+|_+$/g, '').slice(0, 32);
+    return 'disk_' + (sid || 'root') + '_temperature_c';
+}
+
+// Map(disk -> history key) for the disks whose temperature has history, by
+// the collector's rules (storage_health.flatten): only the first
+// FLAT_DISK_CAP non-USB disks, and a key two disks would share belongs to
+// the first of them with a temperature.
+const FLAT_DISK_CAP = 48;
+function diskTempMetrics(disks) {
+    const keys = new Map();
+    const taken = new Set();
+    for (const dk of disks.filter(d => d.bus !== 'usb').slice(0, FLAT_DISK_CAP)) {
+        if (typeof dk.id !== 'string' || toNumber(dk.temperature_c) === null) continue;
+        const key = diskTempMetric(dk.id);
+        if (taken.has(key)) continue;
+        taken.add(key);
+        keys.set(dk, key);
+    }
+    return keys;
 }
 
 // --- Storage owners: cold-data bar per folder, owner lists ---

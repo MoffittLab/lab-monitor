@@ -224,7 +224,67 @@ INTENDED = OrderedDict([
              '/api/storage/breakdown/all and /api/user_metrics/usage (an OLD Manager answers 404 and '
              'they stay absent). They add information; nothing the old Dashboard showed changes. Not '
              'compared.')),
+    ('N20', ('Dashboard /api/data: users who logged off are not listed',
+             'The Manager keeps the per-user snapshot row of a user who logged off for ever, so the old '
+             'Dashboard kept listing that user with stale values; the NEW one hides a user row more than '
+             'STALE_USER_SECONDS (120 s, dashboard/app.py) older than the system\'s latest system_metrics '
+             '(spec D17). Accepted only for an OLD row that is absent from the NEW systems.<system>.users '
+             'and whose timestamp is more than 120 s older than that system\'s metrics timestamp (both '
+             'readable); any other difference in users is reported.')),
+    ('N21', ('data a newer collector sent to the old Manager',
+             'Possible only if a usage-metrics collector reported before the Manager upgrade (the rollout '
+             'order forbids it, a test device may not). (a) /api/metrics/all, /api/metrics/nas/<system> and '
+             'the Dashboard\'s systems.<system>.metrics add the item-11 keys of the latest message '
+             '(interval_s, cpu_count, disk_*_bytes_per_s, ...): accepted only for keys the OLD answer lacks '
+             'whose NEW value equals the stored latest message (device_snapshot.metrics_json). (b) The wide '
+             'storage_breakdown table is migrated to the narrow layout and renamed storage_breakdown_legacy: '
+             'accepted only if that table holds every original row unchanged. (c) /api/data/<system>/'
+             'storage_breakdown returns the lists and objects the old Manager returned as JSON text decoded: '
+             'accepted only where the decoded OLD text equals the NEW value.')),
 ])
+
+# N21: manager/metrics.py SYSTEM_METRICS_EXTRA plus disk_busy_max_name, the
+# keys /api/metrics/all passes through from the latest message
+NEW_METRICS_PASSTHROUGH = (
+    'interval_s', 'cpu_count', 'cpu_iowait_percent', 'cpu_steal_percent', 'proc_cpu_coverage_percent',
+    'disk_read_bytes_per_s', 'disk_write_bytes_per_s', 'disk_read_iops', 'disk_write_iops',
+    'disk_await_ms', 'disk_busy_max_percent', 'gpu_sample_seconds', 'disk_busy_max_name',
+)
+
+
+def decode_json_text(value):
+    """N21 (c): the list / object a JSON text string holds, or None when it holds neither."""
+    if not isinstance(value, str) or not value[:1] in ('[', '{'):
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, (list, dict)) else None
+
+
+def passthrough_added(old_row, new_row, raw, applied=None):
+    """
+    N21 (a): copy into old_row the item-11 keys new_row adds (absent from
+    old_row) whose value equals the stored latest message `raw`; the rest
+    stay a difference.
+    """
+    if not isinstance(old_row, dict) or not isinstance(new_row, dict) or not isinstance(raw, dict):
+        return
+    for k in NEW_METRICS_PASSTHROUGH:
+        if k in new_row and k not in old_row and k in raw:
+            v = raw[k]
+            expect = canon_num(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+            if k == 'disk_busy_max_name' and not isinstance(expect, str):
+                expect = None
+            if same_scalar(canon(new_row[k]), expect) or (new_row[k] is None and expect is None):
+                old_row[k] = new_row[k]
+                if applied is not None:
+                    applied.add('N21')
+
+
+# N20: dashboard/app.py STALE_USER_SECONDS (the NEW Dashboard hides older user rows)
+NEW_STALE_USER_SECONDS = 120
 
 # N18: the units the NEW Manager reports where the stored rows carry none
 # (manager/rollups.py REGISTRY 'units', manager/data_store.py _SUFFIX_UNITS)
@@ -247,6 +307,38 @@ def new_default_unit(table, field):
     if unit:
         return unit
     return next((u for suffix, u in NEW_SUFFIX_UNITS.get(table, ()) if low.endswith(suffix)), None)
+
+
+def logged_off_users(old_payload, new_payload):
+    """
+    N20: {system: {(username, timestamp), ...}} of the OLD Dashboard's user
+    rows that the NEW Dashboard hides as logged off: the username is absent
+    from the NEW systems.<system>.users, and the OLD row's timestamp is more
+    than NEW_STALE_USER_SECONDS older than the OLD systems.<system>.metrics
+    timestamp (both parseable).  Every other user row is compared as usual.
+    """
+    out = {}
+    old_systems = (old_payload or {}).get('systems') if isinstance(old_payload, dict) else None
+    new_systems = (new_payload or {}).get('systems') if isinstance(new_payload, dict) else None
+    if not isinstance(old_systems, dict) or not isinstance(new_systems, dict):
+        return out
+    for name, s in old_systems.items():
+        n = new_systems.get(name)
+        if not isinstance(s, dict) or not isinstance(n, dict) or not isinstance(s.get('users'), list) \
+                or not isinstance(n.get('users'), list):
+            continue
+        ref = parse_ts((s.get('metrics') or {}).get('timestamp') if isinstance(s.get('metrics'), dict) else None)
+        if ref is None:
+            continue
+        shown = {u.get('username') for u in n['users'] if isinstance(u, dict)}
+        for u in s['users']:
+            if not isinstance(u, dict) or u.get('username') in shown:
+                continue
+            ts = parse_ts(u.get('timestamp'))
+            if ts is not None and (ref - ts).total_seconds() > NEW_STALE_USER_SECONDS:
+                out.setdefault(name, set()).add((u.get('username'), u.get('timestamp')))
+    return out
+
 
 HINTS = {
     'name-rejected': ('manager/storage_util.py DEVICE_NAME_RE / manager.py validate_nas_name: the '
@@ -558,13 +650,30 @@ def downsampled_problem(pts, max_points, stats, point_seconds=None):
     return None
 
 
-def rollup_point_seconds(answer):
-    """bucket_seconds of a NEW /api/history answer from rollups (resolution hour / day), else None."""
+# manager/rollups.py LEVELS: the width of one hourly / daily rollup bucket
+ROLLUP_LEVEL_SECONDS = {'hour': 3600, 'day': 86400}
+
+
+def rollup_point_seconds(answer, stats=None, max_points=None):
+    """
+    bucket_seconds of a NEW /api/history answer from rollups (resolution
+    hour / day), else None.  With the OLD series' stats and max_points it is
+    capped at what the Manager's planner can produce for that series (k
+    whole buckets a point, k = ceil(buckets / max_points), rollups.
+    merge_factor; two buckets of slack for the partly filled first and
+    last): a NEW answer that claims wider points can't widen N17's
+    tolerance for a chart that lost data at either end.
+    """
     answer = answer if isinstance(answer, dict) else {}
     seconds = answer.get('bucket_seconds')
-    if answer.get('resolution') in ('hour', 'day') and isinstance(seconds, int) and not isinstance(seconds, bool):
-        return seconds
-    return None
+    level = ROLLUP_LEVEL_SECONDS.get(answer.get('resolution'))
+    if level is None or not isinstance(seconds, int) or isinstance(seconds, bool):
+        return None
+    t0, t1 = (parse_ts(stats.get('tmin')), parse_ts(stats.get('tmax'))) if stats else (None, None)
+    if max_points and t0 is not None and t1 is not None:
+        buckets = int(math.ceil((t1 - t0).total_seconds() / level)) + 2
+        seconds = min(seconds, level * max(1, int(math.ceil(buckets / max(1, int(max_points))))))
+    return seconds
 
 
 def same_scalar(a, b) -> bool:
@@ -624,7 +733,10 @@ def describe_diffs(d):
 
 
 def norm_row(row, table, applied=None):
-    """One /api/data row: N1/N3/N4, drop msg_id (N2), folder null/'' keys (N5)."""
+    """
+    One /api/data row: N1/N3/N4, drop msg_id (N2), folder null/'' keys (N5),
+    storage_breakdown JSON text decoded (N21).
+    """
     if not isinstance(row, dict):
         return canon(row, applied)
     folder = table == 'folder_usage'
@@ -635,6 +747,12 @@ def norm_row(row, table, applied=None):
             if applied:
                 applied.add('N2')
             continue
+        if table == 'storage_breakdown' and k not in TS_KEYS:
+            decoded = decode_json_text(v)
+            if decoded is not None:
+                if applied:
+                    applied.add('N21')
+                v = decoded
         if isinstance(v, float):
             v = canon_num(v, applied)
         elif isinstance(v, str):
@@ -1530,6 +1648,7 @@ class Verifier:
         self.new_admin = Http('127.0.0.1', self.new_proc.port, self.admin_token, self.args.request_timeout)
 
         self._timed('warm_up', self.warm_up)
+        self._timed('rollup_backfill', self.wait_for_rollups)
         self._timed('storage_after_migration', self.check_storage, 'after first start')
         self._timed('compare', self.compare_all)
         if self.args.with_dashboard:
@@ -1637,6 +1756,40 @@ class Verifier:
         say('  %d databases, %d systems, %d rows' % (len(inv['dbs']), len(inv['systems']), total_rows))
         return inv
 
+    def wait_for_rollups(self):
+        """
+        Wait until the NEW Manager's rollup backfill is complete
+        (/api/rollups/status), so every answer compared in pass 1 is the one
+        the migrated data_dir keeps giving: a long window is answered from
+        raw rows while its table's backfill is pending and from hourly
+        rollups once it is done, and the restart check must not see that
+        switch.  A NEW Manager without the endpoint (404) has no rollups.
+        """
+        deadline = time.monotonic() + max(0.0, self.args.rollup_timeout)
+        first = True
+        while True:
+            r = self.new.get('/api/rollups/status')
+            if r.status == 404:
+                return
+            status = r.data if r.status == 200 and isinstance(r.data, dict) else None
+            pending = None
+            if status is not None:
+                pending = sum(1 for tables in status.values() if isinstance(tables, dict)
+                              for t in tables.values() if not (isinstance(t, dict) and t.get('complete')))
+                if not pending:
+                    return
+            if time.monotonic() >= deadline:
+                self.warn('the NEW Manager\'s rollup backfill was not complete after %ds (%s); answers of '
+                          'long windows can change once it is, so the restart check may report them'
+                          % (self.args.rollup_timeout, '%d tables pending' % pending if pending is not None
+                             else 'HTTP %s' % r.status))
+                return
+            if first:
+                say('Waiting for the NEW Manager\'s rollup backfill (%s tables pending) ...'
+                    % (pending if pending is not None else '?'))
+                first = False
+            time.sleep(1.0)
+
     def warm_up(self):
         """First read of every system on the NEW Manager (runs the folder_usage migration)."""
         times = {}
@@ -1670,7 +1823,10 @@ class Verifier:
                         self._check_folder_storage(rel, conn, btables, info, problems, notes)
                         continue
                     if t not in btables:
-                        problems.append('%s: table %s is gone' % (rel, t))
+                        if dbinv['kind'] == 'system' and t == 'storage_breakdown':
+                            self._check_renamed_storage(rel, conn, btables, t, info, problems, notes)
+                        else:
+                            problems.append('%s: table %s is gone' % (rel, t))
                         continue
                     missing = [c for c in orig_cols if c not in btables[t]['columns']]
                     if missing:
@@ -1692,6 +1848,27 @@ class Verifier:
         else:
             self.check('storage', 'PASS', '%s: every original table and row is intact in copy B%s'
                        % (phase, ' (%s)' % '; '.join(notes[:3]) if notes else ''), notes=notes)
+
+    def _check_renamed_storage(self, rel, conn, btables, t, info, problems, notes):
+        """
+        N21 (b): a wide storage_breakdown table the NEW Manager migrated is kept
+        as storage_breakdown_legacy (_1, ... after a downgrade): one of those
+        must hold every original row unchanged over the original columns.
+        """
+        orig_cols = info['columns']
+        for legacy in sorted(x for x in btables if x == t + '_legacy' or x.startswith(t + '_legacy_')):
+            if [c for c in orig_cols if c not in btables[legacy]['columns']]:
+                continue
+            n = conn.execute('SELECT COUNT(*) FROM %s' % qi(legacy)).fetchone()[0]
+            if n != info['rows']:
+                continue
+            if 'hash' in info and table_hash(conn, legacy, orig_cols)[0] != info['hash']:
+                continue
+            notes.append('%s: %s migrated, kept as %s with every row' % (rel, t, legacy))
+            self.applied.add('N21')
+            return
+        problems.append('%s: table %s is gone (no %s_legacy table holds its %d rows unchanged)'
+                        % (rel, t, t, info['rows']))
 
     def _check_folder_storage(self, rel, conn, btables, info, problems, notes):
         legacy = sorted(t for t in btables if t == 'folder_usage_legacy' or t.startswith('folder_usage_legacy_'))
@@ -1921,6 +2098,7 @@ class Verifier:
             if not isinstance(rb, dict):
                 continue
             raw = mj.get(name, {})
+            passthrough_added(ra, rb, raw, self.applied)
             for k in ('network_bytes_in', 'network_bytes_out', 'total_ram_bytes'):
                 if k in ra and k in rb and not same_scalar(ra[k], rb[k]):
                     v = raw.get(k)
@@ -2335,7 +2513,7 @@ class Verifier:
             self.diff(pattern, npath, '%s: HTTP %s' % (field, r.status), 200, r.status, hint='history', system=name)
             return
         pts = sort_points(norm_points((r.data or {}).get('data')))
-        point_seconds = rollup_point_seconds(r.data)
+        point_seconds = rollup_point_seconds(r.data, stats, mp)
         old_enough = [p for p in (full or []) if p[0] >= canon_ts(DASHBOARD_ALL_FROM)]
         if full is not None and stats['n'] <= mp:
             if pts != sort_points(old_enough):
@@ -2426,7 +2604,10 @@ class Verifier:
                 if not nd_.get('success') or nd_.get('degraded') or nd_.get('errors'):
                     problems.append('new /api/data success=%s degraded=%s errors=%s'
                                     % (nd_.get('success'), nd_.get('degraded'), short(nd_.get('errors'))))
-                a, b = self.norm_dash(o.data), self.norm_dash(n.data)
+                hidden = logged_off_users(o.data, n.data)
+                old_data = json.loads(json.dumps(o.data))
+                self.dash_passthrough(old_data, n.data)
+                a, b = self.norm_dash(old_data, hidden), self.norm_dash(n.data)
                 for p, x, y in diff_obj(a, b, '$', limit=20):
                     problems.append('%s: old %s new %s' % (p, short(x, 80), short(y, 80)))
                     self.diff('dashboard /api/data', '/api/data', p, x, y)
@@ -2457,7 +2638,8 @@ class Verifier:
                     a = sort_points(norm_points((o.data or {}).get('data')))
                     b = sort_points(norm_points((n.data or {}).get('data')))
                     if (n.data or {}).get('downsampled'):
-                        ok = not downsampled_problem(b, mp, series_stats_of(a), rollup_point_seconds(n.data))
+                        st = series_stats_of(a)
+                        ok = not downsampled_problem(b, mp, st, rollup_point_seconds(n.data, st, mp))
                         if ok:
                             self.intended(pattern, 'N17')
                             continue
@@ -2497,8 +2679,21 @@ class Verifier:
                 out.append(('folder_usage', vols[0]))
         return out
 
-    def norm_dash(self, payload):
-        """N13: presentation-only differences of the Dashboard's /api/data."""
+    def dash_passthrough(self, old_payload, new_payload):
+        """N21 (a) for the Dashboards: the item-11 metrics keys the NEW one adds from the stored message."""
+        mj = self.inv['central']['metrics_json']
+        new_systems = (new_payload or {}).get('systems') or {}
+        for name, s in ((old_payload or {}).get('systems') or {}).items():
+            ns = new_systems.get(name)
+            if isinstance(s, dict) and isinstance(ns, dict):
+                passthrough_added(s.get('metrics'), ns.get('metrics'), mj.get(name), self.applied)
+
+    def norm_dash(self, payload, hidden_users=None):
+        """
+        N13: presentation-only differences of the Dashboard's /api/data.
+        hidden_users ({system: {(username, timestamp)}}, from logged_off_users)
+        are the OLD user rows the NEW Dashboard hides as logged off (N20).
+        """
         ap = self.applied
 
         def strip(x):
@@ -2520,6 +2715,12 @@ class Verifier:
 
         systems = {}
         for name, s in ((payload or {}).get('systems') or {}).items():
+            gone = (hidden_users or {}).get(name)
+            if gone and isinstance(s, dict) and isinstance(s.get('users'), list):
+                kept = [u for u in s['users']
+                        if not (isinstance(u, dict) and (u.get('username'), u.get('timestamp')) in gone)]
+                ap.add('N20', len(s['users']) - len(kept))
+                s = dict(s, users=kept)
             s = strip(canon(s, ap))
             for k in NEW_DASHBOARD_SECTIONS:
                 if isinstance(s, dict) and k in s:
@@ -3151,6 +3352,8 @@ def parse_args(argv=None):
                          'full-range answer is computed from the OLD Manager\'s rows of the same window, which '
                          'is the same query; this option re-reads every row once per field: slow on big data)')
     ap.add_argument('--startup-timeout', type=float, default=300, help='seconds to wait for /health')
+    ap.add_argument('--rollup-timeout', type=float, default=3600,
+                    help='seconds to wait for the NEW Manager\'s rollup backfill before comparing (default 3600)')
     ap.add_argument('--request-timeout', type=float, default=1800,
                     help='seconds per HTTP request (the first read of a big system runs its migration)')
     ap.add_argument('--no-hash', action='store_true', help='skip per-table content hashes (faster; '

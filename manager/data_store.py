@@ -36,7 +36,10 @@ a newer collector's runs one column per key, the entries as JSON text) is
 migrated like folder_usage, after the pre-upgrade backup: copied in one
 transaction, then renamed to storage_breakdown_legacy (never dropped).  A
 failed copy blocks only new storage_breakdown messages ('error') and is
-retried; the wide table keeps being served meanwhile.
+retried.  Meanwhile a first migration's wide table (no narrow tables yet)
+keeps being served; after a downgrade, when the older Manager made the wide
+table again next to the narrow tables, only the narrow runs are served until
+the copy succeeds (the runs in the wide table are not lost, only not shown).
 
 Every other data_type uses a WIDE table: one column per payload key.
 Schema evolution: when a message carries a key the table hasn't seen, the
@@ -88,8 +91,11 @@ hourly and daily rollups in the same transaction, and the rows already stored
 when a database is first opened are rolled up by the background backfill
 (rollups.start_backfill_thread).  The _rollup_* tables are created after a
 needed migration has run (never while it is held back), only in a database
-that has a rolled-up table, and only ever added to: no backup is taken for
-them.
+that has a rolled-up table, and only ever added to.  Adding them is a schema
+change, so a database that already holds rows gets a pre-upgrade backup
+first (_rollup_backup), unless the migration of the same open already took
+one; a database this Manager creates gets them with its first rolled-up
+row, no backup.
 
 History reads (get_field_series) of a rolled-up field may be answered from
 its rollups: resolution 'auto' picks raw rows, hourly or daily rollups from
@@ -661,6 +667,8 @@ class TypedDataStore:
             db.upgrade_attempted = 0.0
             db.rollups_ready = False      # rollup tables checked / gaps queued for this open
             db.rollups_attempted = 0.0
+            db.migration_backed_up = False  # this open's migration decided its pre-upgrade backup
+            db.rollup_backup_done = False   # the rollup tables may be added (backed up, or not needed)
             try:
                 self._upgrade_db(db)
             except BaseException:
@@ -776,6 +784,9 @@ class TypedDataStore:
                     f"(backup_before_migration is false): {reason}"
                 )
             db.upgrade_blocked = None
+            # The backup (or the decision not to take one) is from before any
+            # change of this open, so it covers the rollup tables added next
+            db.migration_backed_up = True
 
             self._try_folder_migration(db)
             try:
@@ -835,9 +846,12 @@ class TypedDataStore:
     def _try_breakdown_migration(self, db: LockedConnection) -> bool:
         """
         Run the wide -> narrow storage_breakdown copy; True when done (or not
-        needed).  On failure the wide table stays and keeps being served, and
-        only new storage_breakdown messages get 'error' until a retry
-        succeeds (_check_breakdown_writable), as for folder_usage.
+        needed).  On failure the wide table stays, and only new
+        storage_breakdown messages get 'error' until a retry succeeds
+        (_check_breakdown_writable), as for folder_usage.  The wide table is
+        served meanwhile only while no narrow table exists (a first
+        migration); next to the narrow tables (after a downgrade) its runs
+        are not shown until the copy succeeds.
         """
         with db.lock:
             db.breakdown_attempted = time.monotonic()
@@ -845,9 +859,14 @@ class TypedDataStore:
                 self._migrate_wide_storage_breakdown(db)
             except Exception as e:
                 db.breakdown_error = f'{type(e).__name__}: {e}'
+                if _SB_MSGS in self._list_tables(db.conn):
+                    served = ("are not shown until it succeeds (the runs already in the narrow tables "
+                              "are; nothing is lost)")
+                else:
+                    served = "are still served"
                 logger.error(
-                    f"[data_store] storage_breakdown migration failed for {db.path}: {e}. The old "
-                    f"storage_breakdown rows stay in the wide table and are still served; new "
+                    f"[data_store] storage_breakdown migration failed for {db.path}: {e}. The "
+                    f"storage_breakdown rows in the wide table stay there and {served}; new "
                     f"storage_breakdown messages for this system get 'error' (kept queued by the "
                     f"collector) until the migration succeeds. Retried on the next storage_breakdown "
                     f"message after {UPGRADE_RETRY_SECONDS}s and at every start.",
@@ -930,12 +949,67 @@ class TypedDataStore:
             with db.lock:
                 if [r for r in self._upgrade_reasons(db.conn) if r != _SB_REASON]:
                     return
+            if not self._rollup_backup(db):
+                return
             self.rollups.init_db(db)
             db.rollups_ready = True
         except Exception as e:
             logger.error(f"[data_store] rollup setup failed for {db.path} ({type(e).__name__}: {e}); "
                          f"history is stored as usual and rolled up once a retry succeeds "
                          f"(every {rollup_engine.INIT_RETRY_SECONDS}s)")
+
+    @staticmethod
+    def _layout(conn) -> dict:
+        """{table: columns} of every table but SQLite's own."""
+        return {t: tuple(r[1] for r in conn.execute(f'PRAGMA table_info("{_quote_col(t)}")'))
+                for t in sorted(TypedDataStore._list_tables(conn)) if not t.startswith('sqlite_')}
+
+    def _rollup_backup(self, db: LockedConnection, adding: Optional[str] = None) -> bool:
+        """
+        Whether the _rollup_* tables may be added to this database now (by
+        RollupEngine.init_db, or with the first row of `adding`, a rolled-up
+        table it doesn't have yet).  A database that holds rows and has no
+        rollup tables gets one pre-upgrade backup first (CLAUDE.md: schema
+        changes add tables only after a backup_database copy), unless this
+        open's migration already decided its backup.  False (rollups wait,
+        retried after rollups.INIT_RETRY_SECONDS) while that backup fails;
+        ingest is never blocked by it.  A copy already taken of the layout
+        the database has now, without rollup tables, is reused, so a retry
+        never takes a second one.
+        """
+        if db.rollup_backup_done:
+            return True
+        with db.lock:
+            conn = db.conn
+            tables = self._list_tables(conn)
+            if '_rollup_state' in tables or db.migration_backed_up:
+                db.rollup_backup_done = True
+                return True
+            if not ({adding} | tables) & set(rollup_engine.TABLE_ORDER):
+                return True            # nothing to add yet (decided again when a rolled-up table comes)
+            if not any(conn.execute(f'SELECT 1 FROM "{_quote_col(t)}" LIMIT 1').fetchone()
+                       for t in tables if not t.startswith('sqlite_')):
+                db.rollup_backup_done = True     # nothing stored yet: nothing to back up
+                return True
+            reason = 'adding the rollup tables (_rollup_*)'
+            if not self.backup_before_migration:
+                logger.warning(f"[data_store] {reason} to {db.path} WITHOUT a backup "
+                               f"(backup_before_migration is false)")
+                db.rollup_backup_done = True
+                return True
+            layout = self._layout(conn)
+            try:
+                backup_database(conn, db.path, reason, covered=lambda c: self._layout(c) == layout)
+            except Exception as e:
+                logger.error(
+                    f"[data_store] NOT adding the rollup tables to {db.path}: the pre-upgrade backup "
+                    f"failed ({type(e).__name__}: {e}). History is stored and served as usual; it is "
+                    f"rolled up once a retry of the backup succeeds (every "
+                    f"{rollup_engine.INIT_RETRY_SECONDS}s). Free disk space / fix permissions, or set "
+                    f"\"backup_before_migration\": false.")
+                return False
+            db.rollup_backup_done = True
+            return True
 
     def _ensure_rollups(self, db: LockedConnection):
         if self.rollups is not None and not db.rollups_ready and not db.upgrade_blocked and \
@@ -1294,6 +1368,14 @@ class TypedDataStore:
         narrow keeps them as sent in meta_json, so every row stays readable.
         Other values stay as the older Manager stored them (a boolean as
         0 / 1, a number in a REAL column as a float).
+
+        A second migration (after a downgrade the older Manager made the
+        wide table again next to the narrow ones) skips the runs already
+        stored narrow: the older Manager stores a run again when its ACK
+        was lost or an archive is replayed.  The rule is store_message's:
+        the same msg_id, or the same timestamp as a run stored before this
+        copy without a msg_id (or, for a row without one, with any).  The
+        skipped rows stay in the renamed table like every other.
         """
         with db.lock:
             tables = self._list_tables(db.conn)
@@ -1309,20 +1391,26 @@ class TypedDataStore:
                 legacy_name = f'{_SB_LEGACY}_{n}'
                 n += 1
 
-            copied = kept = 0
+            copied = kept = skipped = 0
             with db.transaction() as conn:
                 if STORAGE_BREAKDOWN not in self._list_tables(conn):
                     db.breakdown_migrated = True
                     return
                 self._ensure_breakdown_tables(conn)
                 keep_ids = conn.execute(f'SELECT COUNT(*) FROM {_SB_MSGS}').fetchone()[0] == 0
+                # The newest run stored before this copy (None: a first migration, nothing to skip)
+                before = None if keep_ids else conn.execute(f'SELECT MAX(id) FROM {_SB_MSGS}').fetchone()[0]
                 cursor = conn.execute(f'SELECT * FROM "{STORAGE_BREAKDOWN}" ORDER BY id')
                 while True:
                     batch = cursor.fetchmany(100)
                     if not batch:
                         break
                     for row in batch:
-                        if not self._copy_wide_breakdown_row(conn, dict(row), data_cols, has_msg_id, keep_ids):
+                        row = dict(row)
+                        if before is not None and self._breakdown_run_stored(conn, row, has_msg_id, before):
+                            skipped += 1
+                            continue
+                        if not self._copy_wide_breakdown_row(conn, row, data_cols, has_msg_id, keep_ids):
                             kept += 1
                         copied += 1
                 conn.execute(f'ALTER TABLE "{STORAGE_BREAKDOWN}" RENAME TO "{legacy_name}"')
@@ -1333,8 +1421,36 @@ class TypedDataStore:
                 f"[data_store] migrated {copied} storage_breakdown rows in {db.path} from the wide "
                 f"layout to storage_breakdown_msgs/rows"
                 + (f" ({kept} with entries kept as sent: not storable narrow)" if kept else '')
+                + (f"; {skipped} already stored here (the same msg_id or timestamp) not copied again"
+                   if skipped else '')
                 + f"; old table kept as '{legacy_name}'"
             )
+
+    @staticmethod
+    def _breakdown_run_stored(conn, row: dict, has_msg_id: bool, before: int) -> bool:
+        """
+        Whether a wide storage_breakdown row is a run the narrow tables already
+        hold (_migrate_wide_storage_breakdown): its msg_id is there, or a run
+        stored before this copy (id <= before) has its timestamp and no
+        msg_id (any msg_id when the row has none).
+        """
+        msg_id = row.get('msg_id') if has_msg_id else None
+        if msg_id is not None and conn.execute(
+                f'SELECT 1 FROM {_SB_MSGS} WHERE msg_id = ?', (msg_id,)).fetchone():
+            return True
+        raw_ts = row.get('timestamp')
+        stamps = [raw_ts] if isinstance(raw_ts, str) else []
+        try:
+            stamps.append(canonical_timestamp(raw_ts))
+        except ValueError:
+            pass
+        if not stamps:
+            return False
+        ph = ', '.join(['?'] * len(stamps))
+        null_id = '' if msg_id is None else ' AND msg_id IS NULL'
+        return conn.execute(
+            f'SELECT 1 FROM {_SB_MSGS} INDEXED BY idx_{_SB_MSGS}_ts '
+            f'WHERE timestamp IN ({ph}) AND id <= ?{null_id} LIMIT 1', stamps + [before]).fetchone() is not None
 
     @staticmethod
     def _rename_inherited_indexes(conn, old_table: str, new_table: str):
@@ -1450,6 +1566,12 @@ class TypedDataStore:
         elif table == STORAGE_BREAKDOWN:
             self._check_breakdown_writable(db)
         self._ensure_rollups(db)
+        if db.rollups_ready and table in rollup_engine.REGISTRY and not db.rollup_backup_done \
+                and not self._rollup_backup(db, adding=table):
+            # This row would add the rollup tables to a database holding other
+            # data, and its backup failed: store it without them (a 'gap' later)
+            db.rollups_ready = False
+            db.rollups_attempted = time.monotonic()
 
         natural_ts = tuple(dict.fromkeys(t for t in (raw_timestamp, timestamp) if isinstance(t, str)))
 
@@ -2052,7 +2174,9 @@ class TypedDataStore:
         if self._folder_meta_key(conn, field, _SB_MSGS, slash=False) is None:
             return None
         val = f'lm_meta_number(m.meta_json, {_sql_literal(field)})'
-        return f'{_SB_MSGS} m', 'm.timestamp', val, [_numeric_filter(val)], [], field, unit_of.get(f'{field}_unit')
+        # the two-tier rule of every wide table (_wide_unit): {field}_unit, then the message's _unit
+        unit = unit_of.get(f'{field}_unit') or unit_of.get('_unit')
+        return f'{_SB_MSGS} m', 'm.timestamp', val, [_numeric_filter(val)], [], field, unit if isinstance(unit, str) else None
 
     @staticmethod
     def _breakdown_unit(conn) -> dict:

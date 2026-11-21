@@ -650,6 +650,88 @@ def test_failed_storage_breakdown_migration_keeps_the_wide_rows_served(make_clie
     assert _backups(db) == [bak]
 
 
+def test_per_user_usage_fields_a_downgraded_manager_left_behind_are_not_served(make_client, data_dir):
+    """NEW -> CURRENT -> NEW: CURRENT updates a user's CPU / RAM row but not the usage columns."""
+    client = make_client()
+    assert _send(client, (A2_USER, _at(0)), (A1_SYSTEM_METRICS, _at(0))) == ['stored'] * 2
+    mgr._close_stores()
+    idle = {'username': 'LAB\\alice', 'cpu_percent': 0.5, 'ram_bytes': 500, 'ram_formatted': '500 B'}
+    out = run_current(base_config(data_dir), ADMIN, posts=[
+        {'queue_id': 'Triton-current03', 'name': 'Triton', 'id': 'id-triton',
+         'messages': [make_msg('user_metrics', idle, ts=_at(5)), make_msg('system_metrics', metrics_payload(), ts=_at(5))]}])
+    assert out['posts'][0]['json']['counts']['stored'] == 2
+
+    client = make_client()
+    expected = [dict(idle, timestamp=_at(5))]
+    assert _get(client, '/api/user_metrics/Triton').get_json() == expected
+    assert _get(client, '/api/user_metrics/all').get_json()['Triton'] == expected
+    # the reading NEW stored keeps its usage fields in the history
+    hist = _get(client, '/api/user_metrics/history/Triton/LAB%5Calice').get_json()
+    assert [(h['timestamp'], h.get('cpu_cores')) for h in hist] == [(_at(5), None), (_at(0), 4.0)]
+    # the next reading NEW stores brings them back
+    assert _send(client, (dict(A2_USER, cpu_cores=2.0), _at(6))) == ['stored']
+    (alice,) = _get(client, '/api/user_metrics/Triton').get_json()
+    assert alice['cpu_cores'] == 2.0 and alice['gpus_held'] == 1 and alice['timestamp'] == _at(6)
+    assert 'usage_timestamp' not in alice
+
+
+def test_a_second_breakdown_migration_skips_runs_already_stored(make_client, data_dir, caplog):
+    """NEW -> CURRENT -> NEW: CURRENT stored again a run NEW had (lost ACK, archive replay); no UNIQUE failure."""
+    client = make_client()
+    assert _send(client, (A5_STORAGE_BREAKDOWN, _at(0), 'a' * 32), (A5_STORAGE_BREAKDOWN, _at(1), 'b' * 32),
+                 (A5_STORAGE_BREAKDOWN, _at(2), 'c' * 32)) == ['stored'] * 3
+    mgr._close_stores()
+    db = os.path.join(data_dir, 'triton', 'data.db')
+    con = sqlite3.connect(db)
+    with con:   # run b as if migrated from an OLD Manager's wide table (it dropped msg_ids)
+        con.execute("UPDATE storage_breakdown_msgs SET msg_id = NULL WHERE msg_id = ?", ('b' * 32,))
+    con.close()
+    # CURRENT stores a and b again (with their msg_ids), and a new run d
+    _wide_breakdown_by_current(data_dir, [(A5_STORAGE_BREAKDOWN, _at(0), 'a' * 32),
+                                          (A5_STORAGE_BREAKDOWN, _at(1), 'b' * 32),
+                                          (A5_STORAGE_BREAKDOWN, _at(3), 'd' * 32)])
+    with caplog.at_level(logging.WARNING):
+        client = make_client()
+    assert len(_backups(db)) == 1
+    assert 'storage_breakdown' not in _tables(db) and 'storage_breakdown_legacy' in _tables(db)
+    assert '2 already stored here' in caplog.text and 'IntegrityError' not in caplog.text
+    rows = _get(client, '/api/data/Triton/storage_breakdown').get_json()['rows']
+    assert [(r['timestamp'], r['msg_id']) for r in rows] == [
+        (_at(3), 'd' * 32), (_at(2), 'c' * 32), (_at(1), None), (_at(0), 'a' * 32)]
+    con = sqlite3.connect(db)
+    try:   # every row CURRENT stored stays in the renamed table
+        assert con.execute('SELECT COUNT(*) FROM storage_breakdown_legacy').fetchone()[0] == 3
+    finally:
+        con.close()
+    # new runs are stored, re-sends are duplicates
+    assert _send(client, (A5_STORAGE_BREAKDOWN, _at(4), 'e' * 32), (A5_STORAGE_BREAKDOWN, _at(3), 'd' * 32)) == [
+        'stored', 'duplicate']
+    assert _get(client, '/api/storage/breakdown/Triton').get_json()['timestamp'] == _at(4)
+
+
+def test_breakdown_run_stored_rules(tmp_path):
+    """_breakdown_run_stored: the same msg_id, or a run stored before the copy at the same timestamp."""
+    con = sqlite3.connect(str(tmp_path / 'x.db'))
+    con.row_factory = sqlite3.Row
+    data_store.TypedDataStore._ensure_breakdown_tables(con)
+    for mid, ts in (('a' * 32, _at(0)), (None, _at(1)), ('c' * 32, _at(2))):
+        con.execute('INSERT INTO storage_breakdown_msgs (msg_id, timestamp, device_type, meta_json) '
+                    "VALUES (?, ?, 'synology', '{}')", (mid, ts))
+    stored = data_store.TypedDataStore._breakdown_run_stored
+
+    def is_stored(mid, ts, has_msg_id=True, before=3):
+        return stored(con, {'msg_id': mid, 'timestamp': ts}, has_msg_id, before)
+    assert is_stored('a' * 32, _at(9))                       # its msg_id
+    assert is_stored('x' * 32, _at(1))                       # a pre-upgrade run (msg_id NULL) at its time
+    assert is_stored('x' * 32, '2026-11-01T12:01:00Z')       # in another form of that time
+    assert not is_stored('x' * 32, _at(2))                   # another message at the time of one with an id
+    assert is_stored(None, _at(2)) and is_stored(None, _at(1))      # no msg_id: any run at its time
+    assert is_stored('x' * 32, _at(1), has_msg_id=False)     # a table without msg_id: the row has none
+    assert not is_stored(None, _at(1), before=1)             # only runs stored before this copy
+    assert not is_stored(None, None) and not is_stored(None, 'garbage')
+    con.close()
+
+
 def test_retention_skips_storage_breakdown_until_it_is_migrated(make_client, data_dir, monkeypatch, caplog):
     # CURRENT stored a newer collector's runs (wide storage_breakdown) and metrics, all old enough to prune
     sb = copy.deepcopy(A5_STORAGE_BREAKDOWN)

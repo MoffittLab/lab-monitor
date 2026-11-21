@@ -11,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 TOOLS = REPO / 'tools'
 OLD_REF = 'f086e7e'
+CURRENT_REF = 'fb6498c'                                  # the release before this one
 OLD_TOKEN = 'fixture-old-auth-token-0123456789abcdef'   # make_old_fixture.TOKEN
 
 

@@ -333,6 +333,48 @@ def test_row_budget_lowers_n_then_drops_owners(breakdown):
     assert len(dropped['device']['owners']) == 25 and dropped['device']['other']['owner_count'] == 25
 
 
+def test_more_folders_than_the_manager_accepts_are_cut_to_the_largest(breakdown, monkeypatch, caplog):
+    """Over MAX_FOLDERS the smallest folders are left out and counted; the device still covers all of them."""
+    monkeypatch.setattr(breakdown, 'MAX_FOLDERS', 3)
+    folders = {f'/v/f{i}': {1000: [10 * (i + 1), 1, 0, 0]} for i in range(5)}
+    folders['/v/f1/sub'] = {1001: [1, 1, 0, 0]}
+    scan = _scan(folders)
+    scan['breakdown']['/v/f3'] = {'acc': None, 'folder_owner': 1000}
+    scan['breakdown_unavailable'] = ['/v/f0', '/v/f3']
+    with caplog.at_level(logging.WARNING):
+        payload = breakdown.build_payload(scan, list(folders), _opts(breakdown), NAMES)
+    assert [f['path'] for f in payload['folders']] == ['/v/f2', '/v/f3', '/v/f4']      # order kept
+    assert payload['_folders_omitted'] == 3 and payload['_breakdown_unavailable'] == ['/v/f3']
+    assert all(f['owners'] is None for f in payload['folders']) and payload['owners_truncated'] is True
+    assert payload['top_owners_effective'] == 0
+    assert payload['device']['bytes'] == 150 and payload['device']['files'] == 5       # every top-level folder
+    assert '3 of 6 folders left out' in caplog.text
+    small = breakdown.build_payload(_scan({'/v/a': {1000: [5, 1, 0, 0]}}), ['/v/a'], _opts(breakdown), NAMES)
+    assert '_folders_omitted' not in small and small['folders'][0]['owners'] is not None
+
+
+def test_a_huge_disk_run_stays_within_the_manager_caps(breakdown):
+    """10,001 measured folders (a '/volume1/homes/*' glob): at most 10,000 folders and 1 MiB are sent."""
+    paths = [f'/volume1/homes/user{i:05d}' for i in range(10001)]
+    folders = {p: {1000 + i % 50: [1000 + i, 10, 100, 10]} for i, p in enumerate(paths)}
+    payload = breakdown.build_payload(_scan(folders), paths, _opts(breakdown), {1000 + k: f'u{k}' for k in range(50)})
+    message = {'header': {'msg_id': 'f' * 32, 'device_name': 'nas', 'device_id': 'nas', 'device_type': 'synology',
+                          'timestamp': '2026-11-21T02:00:00Z'},
+               'data': dict(payload, data_type='storage_breakdown')}
+    assert len(json.dumps(message)) <= breakdown.MAX_MESSAGE_BYTES
+    sent = [f['path'] for f in payload['folders']]
+    assert 0 < len(sent) <= 10000 and payload['_folders_omitted'] == 10001 - len(sent)
+    assert sent == paths[-len(sent):]                     # the largest ones, in their order
+    assert payload['device']['bytes'] == sum(1000 + i for i in range(10001))
+
+
+def test_the_folder_cap_matches_the_manager(breakdown):
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), '..', '..', 'manager', 'manager.py'), encoding='utf-8').read()
+    m = re.search(r'^_MAX_BREAKDOWN_FOLDERS\s*=\s*(\d+)\s*$', src, re.M)
+    assert m and int(m.group(1)) == breakdown.MAX_FOLDERS
+
+
 def test_nothing_measured_gives_no_message(breakdown):
     assert breakdown.build_payload({'sizes': {}, 'timed_out': ['/v/a']}, [], _opts(breakdown), NAMES) is None
 

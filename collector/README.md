@@ -55,7 +55,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `request_timeout_seconds` | HTTP timeout per POST to the Manager (default 30) |
 | `max_batch_messages` | Max messages per POST (default 100) |
 | `max_queue_messages` | Max messages kept in `queue.json` while the Manager is unreachable (default 50000; `0` = unlimited). When exceeded, the **oldest** are dropped from the queue with a warning — they stay in the monthly archive. |
-| `exclude_users` | (Optional) Username patterns to exclude from user activity metrics. Supports wildcards. Built-in defaults already exclude `UMFD-*`, `NT AUTHORITY\*`, etc. |
+| `exclude_users` | (Optional) Username patterns to exclude from user activity metrics, per-user GPU data, the sessions list and the `*_users` counts (not from storage owners, and not from `clients_total` / `<svc>_clients`, which count client IPs from the TCP table: use `sessions.exclude_clients` for those). Case-insensitive wildcards. Built-in defaults already exclude `UMFD-*`, `NT AUTHORITY\*`, etc.; sessions also leave out machine accounts (`*$`). |
 | `exclude_system_accounts` | (Optional, Linux/Synology) `true` = leave daemon accounts out of the per-user metrics: UID 1 to `UID_MIN`−1 (from `/etc/login.defs`, 1000 on Ubuntu) and `nobody` (65534), such as `systemd-resolve`, `messagebus` or `nvidia-persistenced`. `root` and UIDs without an account on the host (e.g. a container's own user, shown as the number) are kept. Default `true` on Linux, `false` on Synology (its previous behaviour). The collector's own service account (`labmon`, a system account) is never counted either way, including the nightly disk scan. |
 | `platform` | (Optional) `synology`, `linux` or `windows`. Default: detected — Windows; Synology if `/etc/synoinfo.conf` or `/usr/syno` exists; any other host is `linux`. |
 | `include_network_mounts` | (Optional, Linux) `true` = also auto-discover network and cluster filesystems (nfs/nfs4/cifs/smb3, ceph, Lustre, GPFS, BeeGFS, GlusterFS, AFS) as volumes and let scans enter them. Default `false`: a `scan_paths` entry on one is not scanned and is listed in `_errors`. |
@@ -71,6 +71,62 @@ installing user, who must also be the Task Scheduler user — or use root). Re-r
 existing, more open `config.json` asks before restricting it, because tasks running as any other user would
 then fail to read it. The Windows installer restricts `collector\local\` to SYSTEM and Administrators.
 
+### Usage-metrics settings
+
+Interval counters, per-user CPU and GPU, who is connected, storage health and the storage breakdown
+(the usage-metrics release). Every key is optional: a missing key means the default, and an invalid
+value falls back to the default with a `WARNING` in the log, so a typo never stops a run. Nested keys
+live in a block (`"sessions": {"detail": "users"}`). The installers write all of them into new configs;
+existing configs are not changed. The definitions are in [`lib/settings.py`](lib/settings.py) (`SCHEMA`),
+which the collector and `config_tool.py` share.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `perf_counters` | `true` | `false` restores the old 1-s CPU sample and psutil per-user seeding (no interval averages, no per-user CPU-seconds, no disk I/O) |
+| `counter_max_window_seconds` | `86400` | Longest averaging window (minimum 60); a longer gap starts a new baseline |
+| `user_metrics` | `"auto"` | `all`, `active`, `off` or `auto` (= `active` on Synology, `all` elsewhere). `active`: a user is reported when `cpu_cores` ≥ `user_metrics_min_cores`, RAM ≥ `user_metrics_min_ram_bytes`, or they hold a GPU. `off`: no `user_metrics` messages |
+| `user_metrics_min_cores` | `0.02` | Threshold for `active` |
+| `user_metrics_min_ram_bytes` | `1073741824` | Threshold for `active` (1 GiB) |
+| `user_cpu_count_children` | `true` | Linux and DSM: credit the CPU time of exited child processes to their parent's user |
+| `disk_io` | `true` | Disk throughput, IOPS, latency and busiest disk |
+| `disk_io_exclude` | `[]` | Device-name globs left out of the disk totals, e.g. `["sdz", "usb*"]` (`PhysicalDrive3` on Windows) |
+| `gpu_per_user` | `"auto"` | `"off"` = GPU stats per device only |
+| `metrics_interval_seconds` | `300` | The GPU-seconds interval when `interval_s` is unusable |
+| `sessions.enabled` | `true` | Send the `sessions` message (who is connected) |
+| `sessions.detail` | `"full"` | `full`; `users` (no client IPs or host names); `counts` (no list) |
+| `sessions.history` | `"changes"` | `changes` (the list when it changed, plus the heartbeat) or `every_run` |
+| `sessions.list_heartbeat_seconds` | `3600` | Send the full list at least this often (minimum 60) |
+| `sessions.max_entries` | `200` | List rows (1–5000); the counts are always complete |
+| `sessions.ports` | `null` | `null` = the platform's map; `{"service": port or [ports]}` replaces it |
+| `sessions.extra_ports` | `{}` | Added to the map, e.g. `{"jupyter": 8888}` |
+| `sessions.exclude_clients` | `[]` | IPs or CIDRs left out of counts and list |
+| `sessions.timeout_seconds` | `20` | Time budget of the sessions step |
+| `storage_health.enabled` | `true` | Send `storage_health` (`--mode health` runs even when this is false) |
+| `storage_health.interval_seconds` | `3600` | Heartbeat, and how often the expensive sources run (hwmon, Windows PowerShell); minimum 60 |
+| `storage_health.timeout_seconds` | `90` | Windows PowerShell timeout; the step is abandoned after this + 10 s |
+| `storage_health.temperature_c` | `{"hdd": [50, 60], "ssd": [70, 80]}` | Warning / critical °C; NVMe uses `ssd`. On Windows a reported `TemperatureMax` gives critical = that and warning = that − 5 |
+| `storage_health.ignore` | `[]` | Component ids to leave out, e.g. `"sdb"`, `"/volume2"`, `"pd3"`, `"E:"` |
+| `storage_breakdown.enabled` | `true` | Send `storage_breakdown` from the daily disk run (Linux, DSM and Windows) |
+| `storage_breakdown.owners` | `"file"` | `file` (per-owner usage from file owners) or `none`; ignored on Windows, which has no owners |
+| `storage_breakdown.top_owners` | `10` | Owners listed per folder (1–1000) |
+| `storage_breakdown.device_top_owners` | `25` | Owners listed for the whole device (1–1000) |
+| `storage_breakdown.max_rows` | `5000` | Owner rows over all folders (100–45000) |
+| `storage_breakdown.cold_days` | `[365, 1095]` | The two "not modified for" thresholds, in days (two increasing integers) |
+| `storage_breakdown.name_lookup_budget_seconds` | `30` | Total time for uid → name lookups; the rest stay `uid:<n>` |
+| `storage_breakdown.max_timeout_fraction` | `0.6` | Time guard: a folder gets the breakdown walk only if its previous scan took at most this fraction of `timeout_seconds` (0.05–1) |
+
+Service names in `sessions.ports` / `extra_ports` must match `^[a-z][a-z0-9]{0,15}$` and ports 1–65535;
+an invalid entry is dropped on its own with a warning. Check a config without running anything:
+
+```bash
+python3 config_tool.py --config local/config.json check          # exit code 3 if a value is invalid
+python3 config_tool.py --config local/config.json set sessions.detail users
+python3 config_tool.py --config local/config.json set disk_io_exclude '["sdz"]'
+```
+
+`set` takes `block.key` for nested keys and parses values starting with `[`, `{`, `"` or `null` as JSON.
+A value the collector would reject is replaced by its default, with a warning.
+
 ---
 
 ## Modes
@@ -78,7 +134,19 @@ then fail to read it. The Windows installer restricts `collector\local\` to SYST
 ```bash
 python collector.py --config local/config.json --mode disk      # Daily
 python collector.py --config local/config.json --mode metrics   # Every 5 min
+python collector.py --config local/config.json --mode health    # By hand: a full storage-health check, sent now
+python collector.py --config local/config.json --mode metrics --dry-run   # Print, send nothing
 ```
+
+**`--dry-run`** works with every mode. It prints the messages as one JSON list on stdout (the log goes to
+stderr) and archives, queues, sends and saves nothing: no state file, no network or perf snapshot, no
+lock, no data directory. It still writes to the configured log file. Because it saves no baseline, a
+metrics dry run shows interval averages only after at least one real run has written
+`perf_snapshot.json`.
+
+**`--mode health`** runs every storage-health source at once (`trigger: "manual"`) and sends the message,
+even when `storage_health.enabled` is false. With `--dry-run` it is a quick way to see what the collector
+account can read: `"sources"` lists each source's status.
 
 ### Unmeasured values are `null`
 
@@ -168,9 +236,59 @@ is scanned instead.)
   `total_timeout_seconds` + 1 hour (4 h with the defaults, the same limit older installs already have).
   **If you raise `total_timeout_seconds`, raise that task setting too** (or re-run the installer).
 
+#### Storage breakdown (`storage_breakdown`)
+
+With `storage_breakdown.enabled` (default) the same walk also measures, per scanned folder, the file count,
+how much has not been modified for 1 and 3 years (`cold_days`, by mtime; atime is never used), and on Linux
+and DSM the same per file owner (`st_uid`, resolved to the account name, `uid:<n>` without one). It is sent
+as a second message, `storage_breakdown`, next to `folder_usage`, which is built exactly as without it.
+Windows gets bytes, file counts and cold data from the same PowerShell pass (`LastWriteTimeUtc`), with no
+owners. Fields: [METRICS.md](../METRICS.md#storage_breakdown).
+
+- **Time guard.** The breakdown walker is slower than the plain one. A folder gets it only when the previous
+  disk run measured that folder in at most `max_timeout_fraction` (0.6) of `timeout_seconds`; the times are
+  kept in `storage_breakdown_state.json`. So the **first disk run after the upgrade** measures every folder
+  the old way and sends bytes and file counts only (every folder in `_breakdown_unavailable`); the second
+  run has cold data and owners. If a breakdown walk still runs out of time, the folder is measured again
+  without it in the same run, so `folder_usage` never loses a folder to the breakdown.
+- **Cost.** No second walk: the counts come from the `lstat` the scan already makes. Measured on an x86 test
+  box with a warm cache: +7.6 % wall time for 966k files. Not measured on armv7 or Windows yet: see
+  [docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md); turn it off with `"storage_breakdown": {"enabled": false}`
+  if a NAS gets more than 15 % slower.
+- Owner-name lookups (NSS, LDAP, winbind) get `name_lookup_budget_seconds` (30) in total; owners not
+  resolved by then are sent as `uid:<n>`.
+- The log line `Storage breakdown: N folder(s), M measured without it (first run, or too close to their
+  timeout)` follows each disk run.
+
 ### Metrics mode (`system_metrics`)
 
-Measures CPU%, RAM%, uptime, and network traffic. Network bandwidth is computed by comparing against the previous run's snapshot.
+Measures CPU%, RAM%, uptime, network traffic, disk I/O and GPUs, plus per-user metrics, who is connected and
+storage health (below). Network bandwidth is computed by comparing against the previous run's snapshot.
+
+**Interval averages.** CPU %, iowait, steal, disk throughput, IOPS, latency, the busiest disk and per-user
+CPU-seconds are averages over the whole time since the previous run, from the kernel's counters
+(`/proc/stat`, `/proc/diskstats` and `/proc/<pid>/stat` on Linux and DSM; `GetSystemTimes` and psutil on
+Windows). The previous run's counters are kept in `perf_snapshot.json`. `interval_s` in the message is the
+window. There is no window, and `cpu_percent` is the old 1-second sample, on the first run after the upgrade,
+after a run less than 5 s ago (the old baseline is kept), after a gap longer than
+`counter_max_window_seconds`, when another run holds `perf_snapshot.json.lock` for more than 20 s, and with
+`perf_counters: false`. After a reboot the averages are since boot. Without a boot id (Windows) a wall-clock
+step of 600 s or more starts a new baseline instead (logged at INFO). Fields:
+[METRICS.md](../METRICS.md#system_metrics).
+
+The INFO line of each run looks like:
+
+```
+CPU: 6.7% (avg 299s) | iowait: 0.7% | RAM: 15.9% | Uptime: 35d 5h | Network: {...} | Disk: r 0.0 B/s w 5.0 MB/s busy 11% sda | Users: 2 (coverage 100%) | GPUs: 2 (NVIDIA RTX A6000 37%, Tesla T4 n/a)
+```
+
+The first run shows `(1-s sample)`. `GPUs: ...` stays the last segment (`install-collector-linux.sh` reads it).
+
+**Order of a run.** System and user metrics are archived and queued first. Then sessions and storage health
+run in parallel threads within their budgets (`sessions.timeout_seconds`; `storage_health.timeout_seconds` +
+10 s), their messages are recorded, the queue is sent once, and their state files are written last, only if
+the record succeeded. A source that hangs or fails costs only its own message; a failed sessions step still
+sends a `sessions` message with null counts and `_sources` set to `timeout` or `error`.
 
 **Message generated:**
 ```json
@@ -216,9 +334,49 @@ loopback from the first run. Virtual interfaces follow the same rule (`"virtual"
 upgraded from a collector that counted them keeps counting them until its counters next go backwards (a reboot,
 or a container stopping, which the Manager already reads as a reset), then stops.
 
-Without psutil (common on Synology armv7l) the collector reads `/proc`: CPU from two `/proc/stat` samples one
-second apart, RAM from `/proc/meminfo` (`MemAvailable`, or `MemFree + Buffers + Cached` on older kernels),
-network from `/proc/net/dev`, uptime from `/proc/uptime`.
+Without psutil (common on Synology armv7l) the collector reads `/proc`: CPU and per-user CPU-seconds from the
+counters above (the 1-s fallback is two `/proc/stat` samples one second apart), per-user RAM and process
+counts from `/proc/<pid>/status`, RAM from `/proc/meminfo` (`MemAvailable`, or `MemFree + Buffers + Cached`
+on older kernels), network from `/proc/net/dev`, uptime from `/proc/uptime`. Windows without psutil gets
+system CPU % through `GetSystemTimes` (ctypes), but no per-user metrics, no disk I/O and no TCP session
+counts.
+
+#### Per-user metrics (`user_metrics`)
+
+One message per reported user (config `user_metrics`; on Synology only active users by default). Each
+process's CPU time is compared with the previous run's, so `cpu_seconds` covers the whole interval;
+`cpu_percent` is now `cpu_cores / cpu_count × 100`. On Linux and DSM the CPU time of exited children is
+recovered from their parents (`user_cpu_count_children`). `proc_cpu_coverage_percent` in `system_metrics`
+says how much of the CPU the processes seen account for. Accounts left out: `exclude_users` (plus the
+Windows defaults), on Linux `exclude_system_accounts`, and the collector's own account. A uid without an
+account is `uid:<n>`. Per-user accounting is skipped, with a WARNING, when `/proc` is mounted with
+`hidepid` (and the collector is neither root nor in its `gid=` group) or more than 20 % of
+`/proc/<pid>` entries can't be read.
+
+#### Who is connected (`sessions`)
+
+Counts clients per service from the TCP table (a service counts only while something listens on one of its
+ports; default ports in [METRICS.md](../METRICS.md#sessions)), and names users from utmp (or logind when
+there is no utmp file, Ubuntu 25.10+; tmux panes, screen windows and detached mosh sessions are not
+logins and are left out), `smbstatus -b` (only when the collector itself runs as root; never
+sudo, never plain `smbstatus`, 15 s timeout), and on Windows WTS (console and RDP) and NetSessionEnum
+(SMB; needs Administrators, which SYSTEM has). Without root on a NAS, SMB, NFS, AFP and the other services are
+listed by client IP only. The full list is sent when it changes and every `list_heartbeat_seconds`; other
+runs send the counts and `_list_state: "unchanged"`. `sessions_state.json` remembers the last full list's
+hash; deleting it forces a full list. Log line:
+`Sessions: 9 clients, 1 user (tcp ok, utmp ok, smb not_permitted) 0.01s`.
+
+#### Storage health (`storage_health`)
+
+Every run reads md RAID state (md sysfs, else `/proc/mdstat`), the disks in `/sys/block` (model, serial,
+`device/state`, `ioerr_cnt`), `/proc/mounts` and, where it exists, `zpool list`; once per
+`storage_health.interval_seconds` also the drivetemp / nvme temperatures (hwmon). On Windows one PowerShell
+run per interval reads `Get-PhysicalDisk` with `Get-StorageReliabilityCounter`, Storage Spaces, volumes and
+the System log's disk events. The message is sent when a status changes, once per interval, and by
+`--mode health`. SMART is not read on Linux or DSM (it needs root). Rules:
+[METRICS.md](../METRICS.md#storage_health). Log line:
+`Storage health: ok (2 disk(s), 0 array(s), 1 volume(s); md ok, sysfs ok, mounts ok, hwmon unavailable); sent (change)`
+or `...; unchanged, not sent`.
 
 ---
 
@@ -230,11 +388,24 @@ data/<name>/
 ├── queue.json               ← messages not yet acknowledged by the Manager
 ├── queue.json.lock          ← lock file guarding queue.json (empty; safe to leave)
 ├── queue.corrupt-<ts>.json  ← only if a queue.json was ever unreadable (see below)
-└── network_snapshot.json    ← previous network counters, for bandwidth
+├── network_snapshot.json    ← previous network counters, for bandwidth
+├── perf_snapshot.json       ← previous CPU, disk and process counters, for the interval averages
+├── perf_snapshot.json.lock  ← lock file guarding it (empty; safe to leave)
+├── sessions_state.json      ← {last_full_utc, hash} of the last full session list
+├── storage_health_state.json ← last sent / last full run, signature, cached hwmon and Windows results, error baselines
+└── storage_breakdown_state.json ← {folder: seconds} of the last disk run (the breakdown time guard)
 ```
 
 Both the archive and the queue use the same message format. The archive is a permanent local record written
 before any network call — it is never deleted regardless of whether the Manager receives the data.
+
+The state files of the usage-metrics release are written atomically, only after the run's messages were
+recorded, and never by `--dry-run`. All can be deleted safely: a missing `perf_snapshot.json` (about 10–70 KB;
+PIDs and counters, no user names) means one run without averages; a missing `sessions_state.json` sends the
+full list next run; a missing `storage_health_state.json` sends a health message next run; a missing
+`storage_breakdown_state.json` makes the next disk run measure every folder without the breakdown.
+`tools/reset_system.py` moves `sessions_state.json` and `storage_health_state.json` into its backup folder
+(they describe what the Manager was last sent) and leaves the other two (they describe the host).
 
 The 5-minute metrics run and the multi-hour disk run can overlap, so every change to `queue.json` happens
 under an exclusive lock (`fcntl` on Linux/Synology, `msvcrt` on Windows) and is written atomically (temp file +
@@ -323,7 +494,40 @@ mid-write). Nothing in it was lost from the archive; once you've looked at it yo
 
 **Disk measurement slow / `_timed_out` folders:**
 Large folders (50 TB+) take time. Check logs for per-folder timing and raise `timeout_seconds` and/or
-`total_timeout_seconds` (and, on Windows, the Disk Collection task's time limit).
+`total_timeout_seconds` (and, on Windows, the Disk Collection task's time limit). If the disk run got slower
+after the upgrade, compare with `"storage_breakdown": {"enabled": false}` (see
+[docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md)).
+
+**No per-user metrics, WARNING about `hidepid`:**
+`/proc` is mounted with `hidepid=1` or `2` (`grep -w proc /proc/mounts`), so the collector account can't see
+other users' processes, or more than 20 % of `/proc/<pid>` entries were unreadable. Per-user data is then
+skipped rather than reported for the visible processes only. Run the collector as root, add its account to
+the group named by the mount's `gid=` option, or remount `/proc` with `hidepid=0`.
+
+**`proc_cpu_coverage_percent` stays low:**
+Much of the CPU went to processes that started and ended between two runs (build jobs, shell loops,
+short-lived workers), so their CPU can't be given to a user. On Linux and DSM keep
+`user_cpu_count_children: true`, which recovers the CPU of children their parents waited for. On Windows,
+with no child-time recovery, and where psutil can't read protected processes (AccessDenied), coverage is
+usually lower; the system-wide `cpu_percent` is still complete.
+
+**GPU users show `—` for VRAM on Windows:**
+The GPU runs under WDDM, which reports no per-process VRAM (see [GPU servers](#gpu-servers)). The held time,
+process counts and busy split are still reported. The TCC driver model, on GPUs that support it, gives
+per-process VRAM.
+
+**A GPU job is not attributed on Windows (WDDM):**
+`nvidia-smi` lists the job as "C+G": the collector counts such processes as graphics. A plain CUDA job shows
+as "C".
+
+**`smb not_permitted` in the Sessions log line:**
+SMB user names need `smbstatus`, which only root may run. SMB clients are still counted and listed by IP.
+On Windows `netsession not_permitted` means the task runs as a user without Administrators rights.
+
+**Storage health `unknown`, or `hwmon unavailable`:**
+`python collector.py --config local/config.json --mode health --dry-run` shows each source's status. hwmon
+needs the `drivetemp` kernel module for SATA disks (`nvme` sensors need nothing); without it there are no
+temperatures, which is not an error.
 
 ---
 
@@ -338,7 +542,7 @@ Installed by `install-collector-linux.sh` (Ubuntu 22.04 / 24.04, Debian 12; see
 | `/opt/lab-monitor/collector` | Code, owned by root (the service can't modify it) |
 | `/opt/lab-monitor/venv` | Python venv: `requirements.txt` (+ `requirements-gpu.txt` on [GPU servers](#gpu-servers)) |
 | `/etc/lab-monitor/collector.json` | Config, mode `0640 root:labmon` (it holds the token) |
-| `/var/lib/lab-monitor/<name>/` | `data_dir`: archive, queue, network snapshot |
+| `/var/lib/lab-monitor/<name>/` | `data_dir`: archive, queue, network snapshot, the state files |
 | `/var/log/lab-monitor/collector.log` | Log file (every line is in the journal too) |
 | `/etc/systemd/system/lab-monitor-*` | Units, copied from [`systemd/`](systemd/) |
 
@@ -400,9 +604,28 @@ reported, and a warning says so — one level deep in `/` would walk `/usr`, `/v
   entered (which mounts it) only when `/etc/fstab` says it holds a local filesystem — or a network one with
   `include_network_mounts`; any other automount point is skipped with a warning.
 
-**Metrics.** With psutil (in the venv) as on other platforms, per-user metrics included. Without it the
-`/proc` fallbacks provide CPU, RAM, uptime and network, and there are no per-user metrics (an INFO line
-says so).
+**Metrics.** With psutil (in the venv) as on other platforms. Without it the `/proc` readers provide CPU,
+RAM, uptime, network, disk I/O and per-user metrics (CPU-seconds, RAM, process counts). Only with
+`"perf_counters": false` and no psutil are there no per-user metrics (an INFO line says so).
+
+**What the usage-metrics features read here, and what needs root.** Everything runs in the existing two
+units, as `labmon`, with no new capability; neither unit was changed. The metrics unit reads `/proc/stat`,
+`/proc/uptime`, `/proc/diskstats`, `/proc/mounts`, `/proc/<pid>/stat` and `status` of every process,
+`/proc/sys/kernel/random/boot_id`, `/proc/net/tcp` and `tcp6`, `/proc/mdstat`, `/sys/block`,
+`/sys/class/hwmon`, `/run/utmp`, `/run/systemd/sessions`, `/etc/passwd` and `/etc/fstab`, and the NVIDIA
+devices. `ProtectSystem=strict`, `ProtectHome=yes` and `ProtectKernelTunables` leave all of these readable,
+and the unit has no `ProtectProc`, `ProcSubset`, `PrivateUsers` or `PrivateDevices`.
+`tests/collector/test_collector_linux.py` fails if the unit gains one of those blockers. The state files go
+in `/var/lib/lab-monitor/<name>/`. The disk unit keeps only `CAP_DAC_READ_SEARCH`: the storage breakdown
+uses the `lstat` the scan already makes, and owner names come through NSS (`/etc/passwd`, or
+sssd/nscd/winbind over `AF_UNIX`, which the unit allows).
+- **Not available without root, and not collected:** SMART data, and SMB user names (`smbstatus` refuses
+  non-root users; `_sources.smb` reads `not_permitted`, and SMB clients are still counted by IP). No root
+  helper is part of this release (see [Possible future options](#possible-future-options)).
+- A drop-in adding `ProtectProc=invisible`, `ProcSubset=pid` or `PrivateUsers=` would hide other users'
+  processes, and with them per-user metrics and per-user GPU attribution.
+- `/proc` mounted with `hidepid=1/2` hides other users' processes from `labmon` too; the collector then
+  skips per-user data with a WARNING.
 
 ```bash
 systemctl list-timers 'lab-monitor-*'                    # next and last runs
@@ -498,12 +721,84 @@ or two and power within a few watts. Utilization is a sample, so compare under a
 differ by the driver-reserved amount (a few hundred MiB), since NVML's memory queries and nvidia-smi
 account for reserved memory differently.
 
-Not reported yet on either platform, and possible later additions: per-user GPU memory (from NVML's
-per-process lists), fan speed, clocks, ECC errors and throttle reasons.
+**Per-user GPU** (usage-metrics release, Linux and Windows alike). NVML's compute, MPS and graphics process
+lists are merged per GPU, each process's owner is found (the counters' process walk, then
+`/proc/<pid>/status` on Linux, then psutil), and per GPU the collector sends `users` (VRAM, attributed busy %,
+process count per user, at most 20), and per user in `user_metrics` `gpu_vram_bytes`, `gpu_util_percent`,
+`gpu_busy_seconds`, `gpus_held`, `gpu_held_seconds` and `gpu_processes`. Fields and the busy-% split:
+[METRICS.md](../METRICS.md#user_metrics). As `labmon` on Linux this works for every user's processes:
+NVML lists them for non-root callers and `/proc` gives the owner.
+`tests/collector/test_collector_gpu_parity.py` proves the per-user GPU fields identical in keys, units and
+types between Linux and Windows TCC; Windows WDDM differs only in per-process VRAM (null).
+
+- **Windows TCC vs WDDM.** Under TCC (datacenter GPUs) everything is reported. Under WDDM (the desktop driver
+  model, also used by many workstation GPUs) NVML gives no per-process VRAM, so `vram_bytes` and
+  `gpu_vram_bytes` are null; held GPUs, process counts and the busy split still work. The Windows installer
+  prints each GPU's driver model (`nvidia-smi --query-gpu=index,name,driver_model.current`).
+- **The WDDM "C+G" rule.** Under WDDM desktop processes (explorer.exe, browsers) appear in both the compute
+  and the graphics list ("C+G" in `nvidia-smi`). A process in both lists counts as graphics: it adds VRAM but
+  doesn't hold the GPU or take a share of its busy %. A CUDA job that shows as compute-only ("C") still
+  holds it. An unknown driver model counts as WDDM (harmless under TCC, which has no graphics processes).
+- Drivers without `nvmlDeviceGetComputeRunningProcesses_v3` give `process_source: null` for that GPU and one
+  warning naming the driver. Windows drivers 500.00–525.99, which list every GPU's processes for each GPU,
+  turn per-process data off with a warning. MIG GPUs give null or `ambiguous` splits.
+- An INFO line is logged when a GPU's VRAM is over 50 % used but none of its processes are visible to the
+  collector.
+- `"gpu_per_user": "off"` keeps only the device stats.
+
+Not reported yet, and possible later additions: fan speed, clocks, ECC errors and throttle reasons.
+
+---
+
+## Possible future options
+
+Neither of these is part of this release, and nothing needs to be set up for them.
+
+**A privileged helper.** A small root-owned job (for example a DSM Task Scheduler task running as root)
+could write `smbstatus -b` and `smartctl` output into files the non-root collector reads. That would give SMB
+user names and SMART attributes (reallocated and pending sectors, power-on hours) on a NAS without running
+the collector itself as root. It is not implemented: the owner decided that the NAS units get nothing that
+needs root. The code marks where it would plug in (`lib/sessions.py` `_user_sources`, `lib/storage_health.py`),
+and the status values `stale` and `unsafe` are reserved for its files.
+
+**SNMP on DSM.** DSM's SNMP agent publishes disk status, temperature, remaining life and bad-sector counts,
+the RAID and SMART tables, and per-service user counts (AFP, NFS, FTP, SFTP, HTTP), all without root. Reading
+it from `127.0.0.1` would add these to storage health and sessions. It is not implemented in this release;
+the `snmp` source names are reserved.
 
 ---
 
 ## Upgrading
+
+### Upgrading to the usage-metrics release
+
+**Order.** Upgrade the Manager and the Dashboard first (the installer does both; the new Dashboard works with
+the old and the new Manager), then the collectors: one Linux GPU server, then one x86 Synology, then one
+armv7 Synology, then the Windows servers, then the rest, each after its checks in
+[docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md) have passed. **Never point a new collector at an OLD
+(`f086e7e`) Manager:** it works, but the OLD Manager backfills each new column with a full-table UPDATE (slow
+on a large `user_metrics` table, so a batch can time out and, without dedup, be stored twice). A CURRENT
+(`fb6498c`) Manager stores the new messages in wide tables, which a later NEW Manager migrates.
+
+What changes on a collector:
+
+- New local files `perf_snapshot.json` (+ `.lock`), `sessions_state.json`, `storage_health_state.json` and
+  `storage_breakdown_state.json` (see [Local Storage](#local-storage)). An older collector ignores them, so
+  rolling a collector back is just checking out the old code.
+- The first metrics run has no averages (`interval_s` null, `cpu_percent` the 1-s sample); from the second
+  run on `cpu_percent` is the average over the interval. The default run no longer sleeps 1 s.
+- The first disk run sends `storage_breakdown` with bytes and file counts only; the second has cold data
+  and owners (the time guard).
+- New messages per host: one `sessions` per run and about 24 `storage_health` a day, plus one
+  `storage_breakdown` per disk run.
+- Linux and DSM hosts without psutil (armv7 DSM) now send per-user metrics; on DSM only active users by
+  default (`user_metrics: "auto"`).
+- On Linux an account-less uid (a container's user) is now `uid:<n>` instead of psutil's bare number, so such
+  a user appears as a new row.
+- Existing configs keep working unchanged; every new key has a default. `config_tool.py check` lists
+  invalid values.
+
+### Upgrading from the previous collector (review-fix release)
 
 **Rollout order: Dashboard, then Manager, then collectors.** Upgrade a collector only once the Manager and the
 Dashboard run the new version. The new Manager accepts old collectors unchanged: they keep their token, and
@@ -530,7 +825,7 @@ When upgrading:
 ## Dependencies
 
 - `requests` — HTTP POST to Manager (required)
-- `psutil` — CPU, RAM, network measurements (optional; `/proc` fallbacks on Linux/Synology)
+- `psutil` — CPU, RAM, network measurements (optional; `/proc` readers on Linux/Synology). On Windows it is also what per-user metrics, disk I/O and the TCP session counts need
 - `nvidia-ml-py` — NVIDIA GPU stats (optional; `requirements-gpu.txt`; see [GPU servers](#gpu-servers))
 
 ```bash

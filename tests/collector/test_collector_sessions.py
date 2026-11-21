@@ -141,6 +141,40 @@ def test_utmp_host_name_vs_address(sessions):
     assert rows[0]['client'] == '10.0.0.40' and rows[0]['client_host'] == 'laptop.lab'
 
 
+def test_utmp_multiplexer_and_mosh_hosts_are_not_logins(sessions):
+    """libutempter rows (tmux, GNU screen, mosh) never send a process name or PID as client_host."""
+    data = (utmp('alice', 'pts/0', '10.0.0.40', '10.0.0.40')              # the real ssh login
+            + utmp('alice', 'pts/3', 'tmux(1357012).%0')                   # tmux panes
+            + utmp('alice', 'pts/4', 'tmux(1357012).%12')
+            + utmp('bob', 'pts/5', 'mosh [1357013]')                       # mosh-server, no client attached
+            + utmp('bob', 'pts/6', '10.0.0.41 via mosh [1357014]')         # mosh client attached
+            + utmp('bob', 'pts/7', 'fe80::2%eth0 via mosh [1357015]')
+            + utmp('carol', 'pts/8', ':pts/1:S.0')                         # screen started on a console
+            + utmp('carol', 'pts/9', 'laptop:S.2')                         # screen started over ssh
+            + utmp('dave', 'pts/10', 'not a host [42]')                    # any other free text
+            + utmp('erin', 'pts/11', 'laptop.lab'))
+    rows = sessions.parse_utmp(data, alive=lambda pid: True)
+    since = '2026-09-21T14:13:20Z'
+    assert rows == [
+        {'service': 'ssh', 'username': 'alice', 'source': 'utmp', 'client': '10.0.0.40', 'since': since},
+        {'service': 'ssh', 'username': 'bob', 'source': 'utmp', 'client': '10.0.0.41', 'since': since},
+        {'service': 'ssh', 'username': 'bob', 'source': 'utmp', 'client': 'fe80::2', 'since': since},
+        {'service': 'ssh', 'username': 'dave', 'source': 'utmp', 'since': since},
+        {'service': 'ssh', 'username': 'erin', 'source': 'utmp', 'client_host': 'laptop.lab', 'since': since},
+    ]
+    assert all('[' not in json.dumps(r) and 'tmux' not in json.dumps(r) for r in rows)
+
+
+def test_host_fields_keep_only_addresses_and_host_names(sessions):
+    assert sessions._host_fields('LAB-PC_2.lab.example', None) == {'client_host': 'LAB-PC_2.lab.example'}
+    assert sessions._host_fields('::ffff:10.0.0.5', None) == {'client': '10.0.0.5'}
+    for text in ('tmux(1).%0', 'mosh [7]', 'a b', '-dash', 'login screen', 'x' * 300 + ' y'):
+        assert sessions._host_fields(text, None) == {}, text
+    assert sessions._host_fields('x' * 300, '10.0.0.6') == {'client': '10.0.0.6', 'client_host': 'x' * 256}
+    assert sessions.parse_logind_session('USER=amy\nSERVICE=sshd\nREMOTE_HOST=tmux(5).%1\n') == {
+        'service': 'ssh', 'username': 'amy', 'source': 'logind'}
+
+
 def test_pid_alive(sessions):
     assert sessions._pid_alive(os.getpid()) and not sessions._pid_alive(0) and not sessions._pid_alive(-5)
     assert sessions._pid_alive(1)              # PermissionError (not ours) still means alive
@@ -368,6 +402,18 @@ def test_collect_full_then_unchanged_then_heartbeat(host):
     assert host()['_list_state'] == 'full'                 # hourly heartbeat
     host.clock['now'] += 60
     assert host(history='every_run')['_list_state'] == 'full'
+
+
+def test_collect_does_not_count_tmux_panes_as_ssh_users(host, sessions, tmp_path):
+    """A detached tmux server outlives the login: its panes are not a user, and adding one doesn't change the list."""
+    first = host()
+    (tmp_path / 'utmp').write_bytes(utmp('alice', 'pts/0', '10.0.0.40', '10.0.0.40')
+                                    + utmp('bob', 'pts/3', 'tmux(1357012).%0')
+                                    + utmp('bob', 'pts/4', 'tmux(1357012).%1'))
+    host.clock['now'] += 300
+    second = host()
+    assert second['_list_state'] == 'unchanged' and second['_list_hash'] == first['_list_hash']
+    assert second['ssh_users'] == 1 and second['users_total'] == 1
 
 
 def test_collect_counts_only_and_missing_state(host):

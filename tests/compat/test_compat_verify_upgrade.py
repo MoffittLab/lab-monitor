@@ -14,6 +14,7 @@ read path is reported.
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -491,6 +492,165 @@ def test_verify_passes_on_more_than_2000_hours_of_old_data(old_code, compat_dir)
     assert sum(p['count'] for p in h['data']) == LONG_HOURS + 11
 
 
+# --------------------------------------------------------------------------- #
+# Users who logged off (spec D17): hidden by the NEW Dashboard (N20)          #
+# --------------------------------------------------------------------------- #
+
+LOGOFF_START = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+
+def _logoff_messages():
+    """
+    LogoffNas: 6 h of 5-minute runs.  alice and carol report every run; bob
+    logs off after 2 h, so his snapshot row (the old Manager keeps it for
+    ever) is 4 h older than the system's latest system_metrics.  User rows
+    carry their own timestamps, a moment after the run's system_metrics.
+    """
+    msgs = []
+    for i in range(72):
+        t = LOGOFF_START + timedelta(minutes=5 * i, seconds=7)
+        h = {'device_name': 'LogoffNas', 'device_id': 'id-logoff', 'device_type': 'NAS',
+             'timestamp': t.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}
+        msgs.append({'header': h, 'data': {
+            'data_type': 'system_metrics', 'cpu_percent': 10.0 + i % 7, 'cpu_percent_unit': '%',
+            'ram_percent': 40.0, 'ram_percent_unit': '%', 'total_ram_bytes': 8 * 2 ** 30,
+            'uptime_seconds': 1000 + 300 * i, 'network_bytes_in': 10 ** 6 * i, 'network_bytes_out': 10 ** 5 * i,
+            'gpus': [], 'gpu_count': 0}})
+        uh = dict(h, timestamp=(t + timedelta(microseconds=50)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+        for u in ['alice', 'carol'] + (['bob'] if i < 24 else []):
+            msgs.append({'header': uh, 'data': {'data_type': 'user_metrics', 'username': u, 'cpu_percent': 1.5,
+                                                'ram_bytes': 2 ** 28, 'ram_formatted': '256.0 MB'}})
+    return [{'queue_id': 'LogoffNas-%05d' % n, 'name': 'LogoffNas', 'id': 'id-logoff', 'messages': msgs[i:i + 100]}
+            for n, i in enumerate(range(0, len(msgs), 100))]
+
+
+@pytest.fixture(scope='session')
+def logoff_data_dir(old_code, compat_dir):
+    """An OLD data_dir, written by the OLD Manager's own route, with a user who logged off 4 h earlier."""
+    data = compat_dir / 'fixture-logoff' / 'data'
+    data.mkdir(parents=True)
+    proc = subprocess.run([sys.executable, '-c', _OLD_INGEST, str(old_code / 'manager')],
+                          input=json.dumps({'data_dir': str(data), 'token': OLD_TOKEN,
+                                            'bodies': _logoff_messages()}),
+                          capture_output=True, text=True, timeout=600,
+                          env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return data
+
+
+def test_verify_passes_when_the_new_dashboard_hides_a_logged_off_user(logoff_data_dir, old_code, compat_dir):
+    """Without N20 this run FAILs: $.systems.LogoffNas.users.length old 3 new 2."""
+    conn = sqlite3.connect(str(logoff_data_dir / 'metrics.db'))
+    try:
+        snap = dict(conn.execute("SELECT username, timestamp FROM device_user_snapshot WHERE name = 'LogoffNas'"))
+        metrics_ts = conn.execute("SELECT metrics_timestamp FROM device_snapshot WHERE name = 'LogoffNas'").fetchone()[0]
+    finally:
+        conn.close()
+    import verify_upgrade as vu
+    assert (vu.parse_ts(metrics_ts) - vu.parse_ts(snap['bob'])).total_seconds() > 3 * 3600
+    before = snapshot(logoff_data_dir)
+    work = compat_dir / 'work-logoff'
+    work.mkdir()
+    report = compat_dir / 'verify-report-logoff.json'
+    rc, rep, text = run_verify('--data-dir', logoff_data_dir, '--old-code', old_code, '--work-dir', work,
+                               '--report', report, '--with-dashboard')
+    assert snapshot(logoff_data_dir) == before
+    assert rep is not None, text[-4000:]
+    assert rc == 0 and rep['result'] == 'PASS', _summary(text)
+    assert rep['checks']['dashboard']['status'] == 'PASS', rep['checks']['dashboard']
+    assert rep['intended_differences']['N20']['applied'] == 1          # bob, and only bob
+
+
+def test_a_hidden_user_who_is_still_logged_in_is_reported(logoff_data_dir, old_code, compat_dir):
+    """N20 accepts only stale rows: a NEW Dashboard that also drops a current user FAILs."""
+    new_code = compat_dir / 'broken-logoff-code'
+    ignore = shutil.ignore_patterns('__pycache__', '*.pyc', 'config.json', 'logs', 'data')
+    for part in ('manager', 'dashboard'):
+        shutil.copytree(str(REPO / part), str(new_code / part), ignore=ignore)
+    app_py = new_code / 'dashboard' / 'app.py'
+    src = app_py.read_text(encoding='utf-8')
+    main_guard = '\nif __name__ == "__main__":'
+    assert src.count(main_guard) == 1
+    app_py.write_text(src.replace(main_guard, '\n_vu_drop = _drop_stale_users\n\n\n'
+                                              'def _drop_stale_users(users, metrics_ts):    # alice is current\n'
+                                              "    return [u for u in _vu_drop(users, metrics_ts) if u.get('username') != 'alice']\n\n"
+                                  + main_guard), encoding='utf-8')
+    work = compat_dir / 'work-broken-logoff'
+    work.mkdir()
+    report = compat_dir / 'verify-report-broken-logoff.json'
+    rc, rep, text = run_verify('--data-dir', logoff_data_dir, '--old-code', old_code, '--new-code', new_code,
+                               '--work-dir', work, '--report', report, '--with-dashboard')
+    assert rep is not None, text[-4000:]
+    assert rc == 1 and rep['result'] == 'FAIL', _summary(text)
+    assert rep['checks']['dashboard']['status'] == 'FAIL'
+    diffs = [d for d in rep['differences'] if d['endpoint'] == 'dashboard /api/data']
+    assert any('LogoffNas.users' in d['what'] for d in diffs), _summary(text)
+    assert rep['intended_differences']['N20']['applied'] == 1          # bob is still accepted
+    for cid in ('storage', 'endpoints', 'backups'):
+        assert rep['checks'][cid]['status'] == 'PASS', (cid, rep['checks'][cid])
+
+
+# --------------------------------------------------------------------------- #
+# A newer collector that reported to the OLD Manager (N21)                    #
+# --------------------------------------------------------------------------- #
+
+def _new_collector_messages():
+    """NewNas: three runs of a usage-metrics collector (spec Appendix A payloads), the last 2 h ago."""
+    sys.path.insert(0, str(REPO / 'tests' / 'manager'))
+    sys.path.insert(0, str(REPO / 'manager'))
+    try:
+        from test_manager_new_types import APPENDIX_A
+    finally:
+        sys.path.remove(str(REPO / 'tests' / 'manager'))
+        sys.path.remove(str(REPO / 'manager'))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    msgs = []
+    for i in range(3):
+        t = now - timedelta(hours=4 - i)
+        h = {'device_name': 'NewNas', 'device_id': 'id-newnas', 'device_type': 'synology',
+             'timestamp': t.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}
+        for payload in APPENDIX_A:
+            data = json.loads(json.dumps(payload))
+            if data['data_type'] == 'system_metrics':
+                data.update(cpu_percent=20.0 + i, uptime_seconds=10 ** 6 + 3600 * i,
+                            network_bytes_in=10 ** 9 + i, network_bytes_out=10 ** 8 + i)
+            msgs.append({'header': dict(h, msg_id='%032x' % len(msgs)), 'data': data})
+    return [{'queue_id': 'NewNas-00001', 'name': 'NewNas', 'id': 'id-newnas', 'messages': msgs}]
+
+
+def test_verify_passes_on_data_a_newer_collector_sent_to_the_old_manager(old_code, compat_dir):
+    """
+    Without N21 this run FAILs: storage "table storage_breakdown is gone", the
+    item-11 keys in /api/metrics/* and the Dashboard, and the decoded
+    storage_breakdown rows in /api/data.
+    """
+    data = compat_dir / 'fixture-newcollector' / 'data'
+    data.mkdir(parents=True)
+    proc = subprocess.run([sys.executable, '-c', _OLD_INGEST, str(old_code / 'manager')],
+                          input=json.dumps({'data_dir': str(data), 'token': OLD_TOKEN,
+                                            'bodies': _new_collector_messages()}),
+                          capture_output=True, text=True, timeout=600,
+                          env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    conn = sqlite3.connect(str(data / 'newnas' / 'data.db'))
+    try:
+        assert conn.execute('SELECT COUNT(*) FROM storage_breakdown').fetchone()[0] == 3
+    finally:
+        conn.close()
+    before = snapshot(data)
+    work = compat_dir / 'work-newcollector'
+    work.mkdir()
+    report = compat_dir / 'verify-report-newcollector.json'
+    rc, rep, text = run_verify('--data-dir', data, '--old-code', old_code, '--work-dir', work,
+                               '--report', report, '--with-dashboard')
+    assert snapshot(data) == before
+    assert rep is not None, text[-4000:]
+    assert rc == 0 and rep['result'] == 'PASS', _summary(text)
+    assert rep['intended_differences']['N21']['applied'] > 10
+    assert 'storage_breakdown_legacy' in rep['checks']['storage']['summary']
+    assert 'rollup_backfill' in rep['timings_seconds']
+
+
 def test_refuses_a_work_dir_inside_the_data_dir(old_data_dir, compat_dir):
     data = compat_dir / 'fixture-copy' / 'data'
     shutil.copytree(str(old_data_dir), str(data))
@@ -579,3 +739,127 @@ def test_downsampled_chart_must_cover_the_whole_range():
     assert vu.rollup_point_seconds({'resolution': 'hour', 'bucket_seconds': 7200}) == 7200
     assert vu.rollup_point_seconds({'resolution': 'raw', 'bucket_seconds': 7200}) is None
     assert vu.rollup_point_seconds(None) is None
+
+
+def test_a_rollup_answer_cannot_widen_its_own_tolerance():
+    """N17: bucket_seconds is capped at what the planner can produce, so a chart cut short at the end is reported."""
+    import verify_upgrade as vu
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    old = [(vu.canon_ts((t0 + timedelta(minutes=5 * i)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')), 10.0 + i % 11)
+           for i in range(120 * 288)]                                   # 120 days of 5-minute points
+    st, mp = vu.series_stats_of(old), 2000
+
+    def answer(lost_days, hours=2):
+        end, t, pts = t0 + timedelta(days=120 - lost_days), t0, []
+        while t < end:
+            pts.append(((t + timedelta(hours=hours / 2)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'), 15.0))
+            t += timedelta(hours=hours)
+        return vu.sort_points(vu.norm_points([{'timestamp': a, 'value': b} for a, b in pts]))
+
+    def problem(pts, claimed):
+        return vu.downsampled_problem(pts, mp, st, vu.rollup_point_seconds(
+            {'resolution': 'hour', 'bucket_seconds': claimed}, st, mp))
+    # 120 days of hourly buckets at 2000 points: two hours a point
+    assert vu.rollup_point_seconds({'resolution': 'hour', 'bucket_seconds': 30 * 86400}, st, mp) == 7200
+    assert vu.rollup_point_seconds({'resolution': 'day', 'bucket_seconds': 86400}, st, mp) == 86400
+    assert problem(answer(0), 7200) is None
+    for lost, claimed in ((3, 7200), (3, 4 * 86400), (20, 30 * 86400)):
+        assert 'ends at' in problem(answer(lost), claimed), (lost, claimed)
+    # without the OLD series the answer's own width is all there is (as before)
+    assert vu.rollup_point_seconds({'resolution': 'hour', 'bucket_seconds': 30 * 86400}) == 30 * 86400
+
+
+class _FakeHttp:
+    def __init__(self, answers):
+        self.answers, self.calls = list(answers), 0
+
+    def get(self, path, params=None, token='default'):
+        assert path == '/api/rollups/status'
+        self.calls += 1
+        status, data = self.answers[min(self.calls, len(self.answers)) - 1]
+        return type('R', (), {'status': status, 'data': data})()
+
+
+def test_compare_waits_for_the_rollup_backfill(monkeypatch):
+    """The restart check must not see long windows switch from raw rows to rollups (backfill done in between)."""
+    import types
+    import verify_upgrade as vu
+    monkeypatch.setattr(vu.time, 'sleep', lambda s: None)
+    pending = {'atlantis': {'system_metrics': {'complete': True}, 'user_metrics': {'complete': False}}}
+    done = {'atlantis': {'system_metrics': {'complete': True}, 'user_metrics': {'complete': True}}}
+
+    def run(answers, timeout=60):
+        warnings = []
+        me = types.SimpleNamespace(new=_FakeHttp(answers), args=types.SimpleNamespace(rollup_timeout=timeout),
+                                   warn=warnings.append)
+        vu.Verifier.wait_for_rollups(me)
+        return me.new.calls, warnings
+    assert run([(200, pending), (200, pending), (200, done)]) == (3, [])
+    assert run([(200, {})]) == (1, [])                                  # rollups off, or no rolled-up table
+    assert run([(404, None)]) == (1, [])                                # a NEW Manager without rollups
+    calls, warnings = run([(200, pending)], timeout=0)
+    assert calls == 1 and 'not complete' in warnings[0] and '1 tables pending' in warnings[0]
+
+
+def test_n21_accepts_only_what_the_stored_message_holds():
+    import verify_upgrade as vu
+    raw = {'cpu_percent': 5.0, 'interval_s': 300.2, 'cpu_count': 16, 'disk_busy_max_name': 'sda',
+           'disk_await_ms': 1.5}
+    old = {'cpu_percent': 5.0}
+    new = {'cpu_percent': 5.0, 'interval_s': 300.2, 'cpu_count': 16.0, 'disk_busy_max_name': 'sda',
+           'disk_await_ms': 9.9, 'gpu_sample_seconds': 0.2, 'surprise': 1}
+    applied = vu.Applied()
+    vu.passthrough_added(old, new, raw, applied)
+    # equal to the message: accepted; a different value, a key the message lacks, an unknown key: not
+    assert old == {'cpu_percent': 5.0, 'interval_s': 300.2, 'cpu_count': 16.0, 'disk_busy_max_name': 'sda'}
+    assert applied.counts['N21'] == 3
+    # JSON text of the old wide storage_breakdown table, decoded only there and only to a list / object
+    assert vu.decode_json_text('[1, {"a": 2}]') == [1, {'a': 2}] and vu.decode_json_text('{}') == {}
+    for text in ('"x"', '12', '[broken', 'plain', None, 5):
+        assert vu.decode_json_text(text) is None
+    row = {'id': 1, 'timestamp': '2026-08-01T00:00:00Z', 'folders': '[{"path": "/v"}]', 'note': '[x'}
+    assert vu.norm_row(row, 'storage_breakdown')['folders'] == [{'path': '/v'}]
+    assert vu.norm_row(row, 'sessions')['folders'] == '[{"path": "/v"}]'
+    assert vu.norm_row(row, 'storage_breakdown')['note'] == '[x'
+
+
+def test_n21_passthrough_keys_are_the_managers():
+    import verify_upgrade as vu
+    sys.path.insert(0, str(REPO / 'manager'))
+    try:
+        import metrics
+    finally:
+        sys.path.remove(str(REPO / 'manager'))
+    assert vu.NEW_METRICS_PASSTHROUGH == tuple(metrics.SYSTEM_METRICS_EXTRA) + ('disk_busy_max_name',)
+
+
+def test_logged_off_users_are_only_the_stale_rows_missing_from_the_new_dashboard():
+    import verify_upgrade as vu
+    metrics = {'timestamp': '2026-08-01T06:00:07.000000Z'}
+
+    def payload(*users):
+        return {'systems': {'Nas': {'metrics': dict(metrics), 'users': [dict(u) for u in users]}}}
+
+    stale = {'username': 'bob', 'timestamp': '2026-08-01T02:00:07Z'}                  # 4 h older
+    edge = {'username': 'dan', 'timestamp': '2026-08-01T05:58:07.000000Z'}             # exactly 120 s: shown
+    recent = {'username': 'erin', 'timestamp': '2026-08-01T05:59:00Z'}                 # 67 s: shown
+    no_ts = {'username': 'fay'}
+    bad_ts = {'username': 'gus', 'timestamp': 'yesterday'}
+    old = payload(stale, edge, recent, no_ts, bad_ts, {'username': 'alice', 'timestamp': metrics['timestamp']})
+    assert vu.logged_off_users(old, payload()) == {'Nas': {('bob', stale['timestamp'])}}
+    # still listed by the NEW Dashboard: compared as usual, not accepted
+    assert vu.logged_off_users(old, payload(stale)) == {}
+    # no readable metrics timestamp: nothing is accepted
+    no_metrics = payload(stale)
+    no_metrics['systems']['Nas']['metrics'] = None
+    assert vu.logged_off_users(no_metrics, payload()) == {}
+    # a system the NEW Dashboard does not list at all is reported elsewhere, not here
+    assert vu.logged_off_users(old, {'systems': {}}) == {}
+    assert vu.logged_off_users(None, None) == {}
+
+
+def test_n20_uses_the_dashboard_stale_user_threshold():
+    import verify_upgrade as vu
+    src = (REPO / 'dashboard' / 'app.py').read_text(encoding='utf-8')
+    m = re.search(r'^STALE_USER_SECONDS\s*=\s*(\d+)\s*$', src, re.M)
+    assert m and int(m.group(1)) == vu.NEW_STALE_USER_SECONDS
