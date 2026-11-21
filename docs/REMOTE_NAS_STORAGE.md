@@ -17,7 +17,9 @@ the NAS to hold the live databases.
 **Manager and Collector have independent `data_dir` settings.**
 
 - **Collector's `data_dir`**: local archive (`YYYY-MM.jsonl`), queue (`queue.json` +
-  `queue.json.lock`) and `network_snapshot.json`
+  `queue.json.lock`), `network_snapshot.json` and, with the usage-metrics release, the small state
+  files `perf_snapshot.json` (+ `.lock`), `sessions_state.json`, `storage_health_state.json` and
+  `storage_breakdown_state.json`
 - **Manager's `data_dir`**: central database (`metrics.db`) and per-system history
   (`<system>\data.db`), plus the `*.pre-upgrade-*.bak` copies after an upgrade
 

@@ -12,6 +12,9 @@ live `data_dir`.
 
 Paths below are the installer defaults. Check yours: `data_dir` is in `manager\config.json`.
 
+> The later **usage-metrics release** goes on top of this one, once this procedure is complete. It has
+> its own short section at the end: [The usage-metrics release](#the-usage-metrics-release).
+
 | What | Default |
 |------|---------|
 | Repository (Manager, Dashboard, and on atlantis also the collector) | `E:\Users\lab-monitor\scripts\lab-monitor` |
@@ -858,3 +861,79 @@ go away.
    `.bak` per migrated database and that only one `manager.py` process runs.
 10. Clean up only what you created: the verification work folder (it holds full copies of the data)
     and, when the owner agrees, the `lab-monitor-new` worktree.
+
+---
+
+## The usage-metrics release
+
+The usage-metrics release (`feature/usage-metrics`: per-user CPU-seconds and GPU use, who is connected,
+storage health, storage owners and cold data, hourly and daily rollups) comes **after** the review-fix
+release this guide is about. Start it only once the procedure above is complete: the review-fix release
+verified against the real databases (Step 1) and running in production (Steps 3–5). Below, CURRENT means
+that deployed review-fix release (`fb6498c`) and OLD the code before it (`f086e7e`). The owner's rule is
+the same: nothing stored is rewritten or deleted, and every migration is backed up first.
+
+1. **Checks on atlantis** first: [FIELD_CHECKS.md](FIELD_CHECKS.md#atlantis-manager-and-dashboard-server),
+   checks 27–30 (SQLite version, `verify_upgrade.py` on OLD data, the first start on a copy of the CURRENT
+   data, ingest with rollups).
+2. **Back up** as in [Step 0](#step-0-back-up), into a new `$Backup` folder, and record the running commit
+   (`git -C $Repo rev-parse HEAD`): it is the CURRENT commit to go back to.
+3. **Manager and Dashboard together** with the installer, as in [Step 3](#step-3-upgrade-the-manager-and-dashboard).
+   The new Dashboard works with both Manager versions. The first start takes one
+   `metrics.db.pre-upgrade-*.bak` (new per-user columns and snapshot tables) and one `data.db.pre-upgrade-*.bak`
+   per system (before the rollup tables are added, and covering a wide `storage_breakdown` table's migration),
+   so it needs free space about the size of the `data_dir` and takes longer, as Step 3 did. It then starts the
+   rollup backfill in the background
+   (`python rollups.py --config config.json --status` in `manager\`, or `GET /api/rollups/status`).
+4. **Collectors**, in this order, each after its platform's checks in [FIELD_CHECKS.md](FIELD_CHECKS.md):
+   one Linux GPU server, then one x86 Synology, then one armv7 Synology, then the Windows servers, then
+   the rest. **Never point new collectors at an OLD (`f086e7e`) Manager.** On atlantis the collector runs
+   from the same checkout, so step 3 already upgrades it: run the Windows checks there first, or put the
+   new features' switches (e.g. `"storage_breakdown": {"enabled": false}`) into its collector config
+   before step 3 ([ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md)).
+5. The new defaults (storage breakdown, per-user GPU, sessions, storage health) count as trusted on a
+   platform only once its field checks have passed.
+
+Details: [manager/README.md](../manager/README.md#upgrading-to-the-usage-metrics-release),
+[collector/README.md](../collector/README.md#upgrading-to-the-usage-metrics-release),
+[dashboard/README.md](../dashboard/README.md#usage-metrics-release).
+
+### Going back from the usage-metrics release to CURRENT
+
+**Do not run `tools\rollback_upgrade.py` for this.** That tool restores the databases the OLD (`f086e7e`)
+code needs. After OLD → CURRENT → usage-metrics, those are the copies taken before CURRENT, so everything
+stored since (by CURRENT and by the usage-metrics release) would be moved aside to `*.post-upgrade-*`
+files: not lost, but no longer served.
+
+Just start the CURRENT code on the same `data_dir`:
+
+```powershell
+Stop-ScheduledTask -TaskName "Lab Monitor Manager"
+Stop-ScheduledTask -TaskName "Lab Monitor Dashboard"
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match 'manager\.py|app\.py' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+git -C $Repo checkout <the CURRENT commit recorded in step 2>
+Start-ScheduledTask -TaskName "Lab Monitor Manager"
+Start-ScheduledTask -TaskName "Lab Monitor Dashboard"
+Invoke-RestMethod http://localhost:5000/health
+```
+
+- CURRENT reserves the table prefixes `_` and `storage_breakdown_`, so it ignores the rollup tables and the
+  narrow storage-breakdown tables, takes no backup, and serves and stores everything as before, with one
+  exception: **storage-breakdown history is not shown while CURRENT runs.** The usage-metrics release keeps it
+  in those narrow tables, so CURRENT's `/api/data/<system>/storage_breakdown` lists only the runs CURRENT
+  stores itself (none until the collectors' next daily disk run), and a system without one has no
+  `storage_breakdown` data type. Nothing is lost: the runs are served again after the next upgrade. The
+  configs need no change (the new keys are optional and CURRENT ignores them).
+- Upgraded collectors can keep running: CURRENT stores their new messages in plain tables. Their
+  `storage_breakdown` runs go into a new wide table, which the next upgrade migrates after its own backup.
+  A run CURRENT stored a second time (a batch re-sent because the stop above killed the Manager before its
+  answer, or an archive replay) is copied once.
+- To return to the usage-metrics release, upgrade again (step 3): the rows CURRENT stored meanwhile are rolled
+  up in the background. CURRENT updated each user's latest CPU / RAM row without the per-user usage fields,
+  so the Cores and GPU columns of a user stay empty until a new collector reports that user again (the next
+  metrics run, if the collectors were not rolled back too); the per-user history keeps every value.
+- Never go back further than CURRENT this way: the OLD (`f086e7e`) code does not reserve those prefixes.
+  Going back to OLD is the [Rollback](#rollback) above, with its replay (whose window then starts at the
+  review-fix upgrade).

@@ -322,7 +322,10 @@ python3 reset_system.py --config /path/to/config.json --admin-token <ADMIN-TOKEN
    anything is moved. A refused token or an unreachable Manager stops the tool with exit code 1
    and nothing changed.
 2. Asks you to type the system name (skipped with `--force`)
-3. Moves `YYYY-MM.jsonl` and `queue.json` into `<data_dir>/<name>/backup_YYYYMMDD_HHMMSS/`
+3. Moves `YYYY-MM.jsonl` and `queue.json` into `<data_dir>/<name>/backup_YYYYMMDD_HHMMSS/`, and with them
+   `sessions_state.json` and `storage_health_state.json` when present (they record what the Manager was
+   last sent, so after the wipe the next run sends a full session list and a storage-health message).
+   `perf_snapshot.json` and `storage_breakdown_state.json` stay: they describe the host.
 4. Sends `DELETE /api/system/<name>` to the Manager (per-system history + central summary rows)
 5. Prints how to rebuild the system from the backup: pause the collector, run
    `replay_archives.py ... --include-legacy --source <backup>`, resume it and run it once in
@@ -429,12 +432,27 @@ python3 config_tool.py --config local/config.json list
 # JSON output for programmatic use
 python3 config_tool.py --config local/config.json get manager_url --json
 python3 config_tool.py --config local/config.json set active true --json
+
+# Nested keys of the usage-metrics settings, JSON values, and a check of every validated value
+python3 config_tool.py --config local/config.json set sessions.detail users
+python3 config_tool.py --config local/config.json set disk_io_exclude '["sdz"]'
+python3 config_tool.py --config local/config.json check
 ```
+
+- `get` and `set` take `block.key` for nested blocks (`sessions`, `storage_health`, `storage_breakdown`); a
+  missing or null block is created.
+- Values: `true` / `false`, numbers, and anything starting with `[`, `{`, `"` or `null` is parsed as JSON.
+- `set` of a value the collector would reject stores the default instead and prints `WARNING: Invalid ...`
+  (a `warning` field with `--json`); for `ports`, `extra_ports` and `exclude_clients` only the invalid
+  entries are dropped. An unknown key inside a block is stored with a warning.
+- `check` lists invalid values, non-object blocks and unknown block keys.
+- `--json` goes after the subcommand (`set field value --json`, `check --json`).
 
 **Exit codes:**
 - `0` — success
 - `1` — error (missing file, parse failure, etc.)
 - `2` — field not found (get only)
+- `3` — `check` found a problem: invalid values, a non-object block, or an unknown key inside a block
 
 **Used by:** `toggle_collectors.py` and `archive_all_collectors.py` call this remotely.
 
@@ -483,6 +501,7 @@ and logs never touch the installed copies.
 | `--dashboard-max-points N` | `max_points` of the "All Available" chart checks (default 2000, the Dashboard's `chart_max_points`); a series with more points is checked as a bucket-averaged chart |
 | `--old-history-windows` | also ask the OLD `/api/history` per field and window (slow on big data; by default the OLD answer is computed from the OLD Manager's rows of the same window, which is the same query) |
 | `--startup-timeout`, `--request-timeout` | seconds to wait for `/health` (300) and per request (1800) |
+| `--rollup-timeout` | seconds to wait, after the NEW Manager's first start, for its rollup backfill to finish before anything is compared (3600; `/api/rollups/status`). A long window is answered from raw rows while the backfill is pending and from hourly rollups afterwards, so comparing earlier could make the `restart` check report answers that only changed because the backfill finished. Past the timeout the run goes on with a warning. The wait is in the report as `timings_seconds.rollup_backfill`. |
 | `--no-hash`, `--no-quick-check` | faster: skip per-table content hashes / `PRAGMA quick_check` |
 
 **How it keeps the live data safe:**
@@ -505,7 +524,7 @@ and logs never touch the installed copies.
 | `source` | the live data_dir is unchanged |
 | `copies` | every database copied and passes `PRAGMA quick_check` |
 | `config` | the NEW Manager accepts your config (FAIL if it would refuse it: the upgraded Manager would not start) |
-| `storage` | in copy B after migration: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value |
+| `storage` | in copy B after migration: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value; a wide `storage_breakdown` table (a usage-metrics collector reported to the old Manager) is kept as `storage_breakdown_legacy` with identical content |
 | `endpoints` | every read endpoint the Dashboard and tools use, OLD vs NEW, for every system: `/api/devices`, `/api/systems`, `/api/metrics/all`, `/api/usage/all`, `/api/totals`, `/api/user_metrics/*`, `/api/data/*` (every row of every table over the full time range), `/api/usage/*`, `/api/history/*` for every field and the sampled folders (tail query, full range, and the Dashboard's own "All Available" query) |
 | `devices` | every old device is in the new `/api/devices`, `/api/metrics/all`, `/api/usage/all`, `/api/totals` |
 | `totals` | lifetime network totals (and disk totals) identical per device, via the API and in the database |
@@ -522,10 +541,20 @@ without a registry row (the old `DELETE /api/system/<name>` could leave one when
 file open), a registry row without a directory, and per-user rows of a deleted device are all
 compared too (listed under "Warnings").
 
+**Comparing against the review-fix release.** The tool was written for OLD-format originals. Run with
+`--old-ref fb6498c` on a `data_dir` that is already in the review-fix layout, the `backups`, `rollback` and
+`legacy-resend` checks and some record counts report failures that come from that assumption, not from
+lost data; use such a run for the timings and the other checks only
+([docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md#29-first-start-on-the-current-data)).
+
 Only a documented list of **intended** differences is normalized away (timestamps compared as
 instants, fields the new Manager adds such as `msg_id`, NaN as null, `1234.0` = `1234`,
 unmeasured folder keys of the old wide table, generic error bodies, endpoints the old Manager
-could not serve, ...). The full list with the reason for each is `INTENDED` at the top of
+could not serve, ...; N21: data a usage-metrics collector sent to the old Manager, accepted only where it
+equals what is stored). N17 (bucket-averaged "All Available" charts) allows one point of drift at
+either end; for an answer from rollups one point is its `bucket_seconds`, capped at what the
+Manager's planner can produce for the series' time span, so an answer that claims wider points
+can't hide a chart cut short. The full list with the reason for each is `INTENDED` at the top of
 `verify_upgrade.py` and in the report under `intended_differences`, with how often each was
 applied. Anything else is reported under "Unexpected differences", grouped by endpoint, with the
 request, the old and the new value, and a likely cause.
@@ -550,6 +579,12 @@ back (see `rollback_upgrade.py`), then delete them.
 **Purpose:** go back to the old Manager after the upgrade. The new Manager copied every database
 it migrated to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` first; this restores those copies so the
 OLD code serves exactly the data it had. Standard library only; nothing is deleted.
+
+**Not for going back from the usage-metrics release to the review-fix release (`fb6498c`).** That needs
+no rollback: start the review-fix code on the same `data_dir` ([docs/UPGRADE.md](../docs/UPGRADE.md#going-back-from-the-usage-metrics-release-to-current)).
+This tool restores the layout the OLD (`f086e7e`) code reads; after OLD → review-fix → usage-metrics that
+means the copies taken before the review-fix upgrade, and everything stored since would be moved aside to
+`*.post-upgrade-*` files.
 
 ```bat
 REM 1. stop the Manager (and Dashboard): Task Scheduler -> End "Lab Monitor Manager", "Lab Monitor Dashboard"

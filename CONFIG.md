@@ -10,7 +10,7 @@
 |-----------|---------------------------|--------------------|------------|
 | Manager | `manager/config.json` | `manager/config.example.json`, `manager/config.windows.json` | `install-manager-dashboard-taskscheduler.ps1` |
 | Dashboard | `dashboard/config.json` | `dashboard/config.example.json` | same installer |
-| Collector | `collector/local/config.json` | `collector/config.example.json`, `config.synology.example.json`, `config.windows.example.json` | `install-collector-synology.sh`, `install-collector-windows.ps1` |
+| Collector | `collector/local/config.json` (Linux: `/etc/lab-monitor/collector.json`) | `collector/config.example.json`, `config.synology.example.json`, `config.windows.example.json`, `config.linux.example.json` | `install-collector-synology.sh`, `install-collector-windows.ps1`, `install-collector-linux.sh` |
 
 The Manager installer writes its two configs with random tokens; the collector installers ask for
 the device's token. To create a config by hand, copy the template and replace **every** placeholder. The Manager refuses to start with the template's tokens
@@ -92,6 +92,9 @@ to roll back, because the previous Manager knows only that key.
   The Dashboard refuses to start with an incomplete `auth` block or a password that is not a hash,
   and warns at startup when it listens on a non-loopback address without `auth`.
 - The browser never sees the Manager token or URL.
+- Everyone who can open the Dashboard sees the per-user data (user names, client IPs, per-user CPU, GPU
+  and storage); `auth` is the access control. What is recorded and how to record less:
+  [docs/PRIVACY.md](docs/PRIVACY.md).
 
 **Collectors**
 - `config.json` holds the device's token. The Synology installer creates it with mode 600; the
@@ -116,7 +119,8 @@ to roll back, because the previous Manager knows only that key.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `backup_before_migration` | `true` | Before a database written by an older Manager is changed for the first time, it is copied to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` next to it (once per database; a copy with nothing written since is reused). If the copy fails, that database is not migrated: reads keep working, writes get `error` (collectors keep the messages), and the copy is retried on the next write after 300 s or at the next start. `false` migrates without a copy. Must be `true` or `false` |
-| `history_retention_days` | `null` | `null` keeps all history forever. A number N archives rows older than N days to `data/<system>/archive/<YYYY-MM>-<data_type>.jsonl` once a day, then deletes them from the database |
+| `history_retention_days` | `null` | `null` keeps all history forever. A number N archives rows older than N days to `data/<system>/archive/<YYYY-MM>-<data_type>.jsonl` once a day, then deletes them from the database. A rolled-up table is pruned only once its rollups are complete; the hourly and daily rollups themselves are kept forever ([manager/README.md](manager/README.md#retention)) |
+| `rollups` | `{"enabled": true, ...}` | Hourly and daily aggregates of the history. They only add tables; `"enabled": false` stops writing them ([manager/README.md](manager/README.md#rollups)) |
 | `retention_days` | — | Legacy. It only applied to the old `usage.jsonl` reports and has no effect now |
 
 ---

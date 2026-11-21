@@ -27,7 +27,9 @@ E:\Users\lab-monitor\data\
 │   ├── 2026-09.jsonl             ← Collector: archive
 │   ├── queue.json                ← Collector: messages not yet acknowledged
 │   ├── queue.json.lock           ← Collector: queue lock
-│   └── network_snapshot.json     ← Collector: previous network counters
+│   ├── network_snapshot.json     ← Collector: previous network counters
+│   └── perf_snapshot.json, sessions_state.json, storage_health_state.json,
+│       storage_breakdown_state.json  ← Collector: usage-metrics state (usage-metrics release)
 │
 ├── triton\                       ← another collector: only the Manager's files here
 │   └── data.db
@@ -163,6 +165,7 @@ Manager reads metrics.db (and data.db for history charts)
 |-----------|-------|----------|--------|
 | Collector | `YYYY-MM.jsonl` | `data\<name>\` | Append only |
 | Collector | `queue.json`, `queue.json.lock` | `data\<name>\` | Locked, atomic rewrite |
+| Collector | `perf_snapshot.json` (+ `.lock`), `sessions_state.json`, `storage_health_state.json`, `storage_breakdown_state.json` | `data\<name>\` | Atomic rewrite, after the run's messages are recorded (usage-metrics release) |
 | Manager | `data.db` (+ `-wal`, `-shm`) | `data\<normalized name>\` | SQLite, one locked connection per database |
 | Manager | `metrics.db` (+ `-wal`, `-shm`) | `data\` | SQLite, one locked connection |
 
@@ -184,7 +187,12 @@ Manager reads metrics.db (and data.db for history charts)
   Manager's databases. The data itself is not changed; the Manager tasks run elevated as an
   administrator and keep access.
 - Upgrading the checkout upgrades the collector together with the Manager: don't do it while
-  atlantis's 02:00 disk run is in progress.
+  atlantis's 02:00 disk run is in progress. For the usage-metrics release this makes atlantis's
+  collector the first Windows collector to get the new features, before the field checks of the other
+  Windows servers ([FIELD_CHECKS.md](FIELD_CHECKS.md#windows-server-2016-2019-2022)). Run those checks on
+  atlantis first, or put the new features' switches (for example `"storage_breakdown": {"enabled":
+  false}`, `"storage_health": {"enabled": false}`) into its collector config before the upgrade; the
+  older collector ignores keys it doesn't know.
 
 ---
 

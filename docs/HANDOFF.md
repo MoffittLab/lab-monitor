@@ -106,3 +106,32 @@ These are for the feature branch, not this one: per-user data is visible to ever
 access; the Synology NAS units get nothing that needs root (no SMART, no SNMP); Windows storage
 breakdown is cold data and file counts only; session lists are kept in history; days use UTC
 boundaries.
+
+## Feature release (feature/usage-metrics)
+
+A second release, built on top of `fix/review-findings` at `fb6498c`. It adds, without changing what the
+review-fix release stores:
+
+- **Collectors:** CPU %, iowait and disk I/O averaged over the whole interval from kernel counters;
+  per-user CPU-seconds (also on armv7 NAS units without psutil); per-user GPU memory, busy time and GPUs
+  held (Linux and Windows, TCC and WDDM); who is connected (`sessions`); RAID, disk and volume state
+  (`storage_health`, nothing that needs root on a NAS, no SMART, no SNMP); file counts, cold data and
+  storage per owner in the daily disk run (`storage_breakdown`; on Windows without owners).
+- **Manager:** hourly and daily rollups kept forever with a background backfill, the new snapshot tables
+  and per-user columns, eight new read endpoints, `resolution` / `entity` on `/api/history`.
+- **Dashboard:** Disk I/O, per-user cores and GPU, "Last 24 h" totals, Connected, storage health and
+  storage owners; min–max bands on long charts. It works with the OLD, CURRENT and new Managers.
+- **Docs:** [PROTOCOL.md](PROTOCOL.md), [PRIVACY.md](PRIVACY.md), [FIELD_CHECKS.md](FIELD_CHECKS.md), and
+  the "usage-metrics release" sections of [UPGRADE.md](UPGRADE.md#the-usage-metrics-release) and the
+  component READMEs.
+
+**It comes after the review-fix release:** only once this handoff's job is done (the review-fix release
+verified against the real databases and deployed) does it get its turn, with the owner's go-ahead. Going
+back from it to the review-fix release means starting the CURRENT code on the same `data_dir`, never
+`rollback_upgrade.py` (UPGRADE.md explains why).
+
+**[FIELD_CHECKS.md](FIELD_CHECKS.md) must be done on the real machines before the new defaults are
+trusted.** The feature code was tested only with fakes on the Linux development box (no Synology,
+Windows, PowerShell or GPU there), so each platform's checks gate that platform's collector upgrade; the
+atlantis checks (27–30) gate the Manager. Owner decisions for this release are in the section above.
+

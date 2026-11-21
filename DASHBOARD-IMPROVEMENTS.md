@@ -9,14 +9,15 @@ This file describes what the history charts do **now**. For configuration and op
 
 ## What Works
 
-- Click any metric tile (CPU, RAM, uptime, bandwidth, GPU, VRAM) or volume bar on a card to open its history chart.
+- Click any metric tile (CPU, RAM, uptime, bandwidth, GPU, VRAM, Disk I/O) or volume bar on a card to open its history chart. With a Manager of the usage-metrics release also: a user's CPU, Cores, RAM or GPU cell (that user's history, `entity=<user>`), a Connected service chip (`<svc>_clients`), a disk temperature chip (`storage_health`), and a storage owner (`storage_breakdown` `owner/<owner>/bytes`, opening on "All Available").
 - **Plotly.js 1.58.5**, loaded from the CDN at a pinned version with a Subresource Integrity hash. This is the same version the retired `plotly-latest` URL used to serve, so the chart API didn't change. Zoom, pan, autoscale and reset come from the Plotly mode bar.
-- **Time ranges:** "Last 24h", "Last 7d", "Last 30d", "All Available" and a custom From/To date range. The active range button is highlighted. A custom range with From after To is rejected with a message.
+- **Time ranges:** "Last 24h", "Last 7d", "Last 30d", "Last 90d", "Last 1y", "All Available" and a custom From/To date range. The active range button is highlighted. A custom range with From after To is rejected with a message.
   - Metric charts open on the last 24 hours. Volume charts open on "All Available", because disk scans are daily.
   - The range is sent to the Manager as `from`/`to` (ISO 8601, UTC). The Manager filters rows by timestamp.
 - **Bounded responses:** every history request carries `max_points` (config `chart_max_points`, default 2000) and a `limit`.
   - Managers that support it bucket-average long ranges server-side and set `downsampled`. They set `truncated` when the row `limit` cut the result.
   - If an older Manager returns more points than `max_points`, the dashboard server bucket-averages the response itself and adds `downsampled: true` and `downsampled_from: N`.
+  - A Manager of the usage-metrics release answers long ranges from its hourly or daily rollups (`resolution` in the answer). Aggregated points carry `min`, `max` and `count`: the chart shades the min–max band behind the average line (split where a point has no value), hover shows `avg (min–max)`, and the info line says e.g. "Hourly averages in 5-hour buckets · 1,752 points from 105,120 measurements · shaded = min–max".
   - The chart info line then says the data was averaged (or cut at the row limit) and suggests a shorter range for full detail.
 - **Exports:** PNG through Plotly's mode-bar camera button. CSV through the download button in the mode bar.
 
@@ -30,9 +31,9 @@ This file describes what the history charts do **now**. For configuration and op
 
   The file is named after the selection, for example `Triton_cpu_percent_24h_20260821T143000Z.csv` or `Triton_volume_volume1_all_...csv`.
 
-  The CSV contains exactly what is plotted. When the range was bucket-averaged (`downsampled`), the value column is named `value_avg` and the file name gets `_avg` (for example `Triton_cpu_percent_all_avg_...csv`). When the row limit cut the range (`truncated`), the file name gets `_truncated`. For raw readings over a long range, export several shorter ranges.
+  The CSV contains exactly what is plotted. When the range was bucket-averaged (`downsampled`), the value column is named `value_avg` and the file name gets `_avg` (for example `Triton_cpu_percent_all_avg_...csv`). When the points carry a band, the columns are `timestamp,value_avg,value_min,value_max,count`, and an answer from rollups adds `_hourly` or `_daily` to the file name (a per-user chart also the user name). When the row limit cut the range (`truncated`), the file name gets `_truncated`. For raw readings over a long range, export several shorter ranges.
 - **Hover modes:** two extra mode-bar buttons switch between "closest point" and "point + time" hover.
-- **Units:** the unit sent by the Manager (`%`, `s`, `Mbps`, `bytes`) picks the axis scaling, with a field-name fallback for older data. Byte values use binary units (GiB/TiB). Volume charts switch from GiB to TiB at 1 TiB. Unmeasured points (null) are plotted as gaps, never as 0.
+- **Units:** the unit sent by the Manager (`%`, `s`, `Mbps`, `bytes`, and `B/s` shown as MB/s, `ops/s` as IOPS, `ms`, `count`, `°C`, `h`, `cores`) picks the axis scaling, with a field-name fallback for older data. Byte values use binary units (GiB/TiB). Volume charts switch from GiB to TiB at 1 TiB. Unmeasured points (null) are plotted as gaps, never as 0.
 
 ## Request Handling
 
@@ -58,8 +59,7 @@ The pre-Plotly `dashboard-old.js` backup has been removed. It was not referenced
 ## Possible Next Steps
 
 - Reload the chart at full resolution when the user zooms into a downsampled range (`plotly_relayout` event).
-- Per-folder history charts. Only volumes are clickable today.
-- Per-user CPU/RAM history. The Manager already serves `/api/user_metrics/history/<device>/<user>`.
+- Per-folder history charts. Only volumes are clickable today (the Manager can already chart `storage_breakdown` `folder/<path>/bytes`).
 
 ## References
 
