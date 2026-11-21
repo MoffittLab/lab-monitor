@@ -50,3 +50,13 @@ logs/
 
 # Deployment credentials — never commit
 tools/collectors.csv
+
+# Runtime PID files written by manager.py / dashboard/app.py
+.pids/
+
+# SSH host keys trusted on first use by the fleet tools (tools/_ssh.py)
+tools/.known_hosts
+tools/.known_hosts.*.tmp
+
+# Tests are tracked (tests/, pytest.ini); only their caches are ignored
+.pytest_cache/
