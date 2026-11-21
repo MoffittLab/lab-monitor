@@ -2,27 +2,35 @@
 """
 Lab Monitor - Remote Collector Updater
 
-Reads a CSV of collector systems, SSHes into each one, runs
-'git pull origin main', then reinstalls requirements from the
-repo-root requirements.txt.
+Reads a CSV of collector systems, SSHes into each one and runs
+'git pull origin main' in the repo. With --upgrade-pip it then also
+upgrades pip and installs collector/requirements.txt (the same file the
+collector installers use) into the python_path environment. Without
+--upgrade-pip only the git pull runs.
 
 CSV format (one header row required):
-    ip,username,password,git_path,python_path
+    ip,username,password,git_path,python_path[,key_filename][,port]
     192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
     atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
 
 Fields:
     ip          Hostname or IP address
     username    SSH username
-    password    SSH password (leave blank to use key/agent auth)
+    password    SSH password (optional; tried after key/agent auth)
     git_path    Absolute path to the lab-monitor repo root on the remote system
     python_path Absolute path to the Python executable in the lab-monitor conda env
+                (only needed with --upgrade-pip)
+    key_filename  Optional private key file to offer first
+    port        Optional SSH port (default 22)
 
 Usage:
     python3 update_collectors.py --csv collectors.csv
     python3 update_collectors.py --csv collectors.csv --dry-run
     python3 update_collectors.py --csv collectors.csv --upgrade-pip
     python3 update_collectors.py --csv collectors.csv --upgrade-pip --timeout 60 --verbose
+    python3 update_collectors.py --csv collectors.csv --parallel 4
+    # A host that also runs the Manager/Dashboard from the same env:
+    python3 update_collectors.py --csv collectors.csv --upgrade-pip --requirements requirements.txt
 
 Requirements:
     pip install paramiko
@@ -30,18 +38,19 @@ Requirements:
 Security:
     Keep collectors.csv out of version control (.gitignore covers it).
     Prefer SSH key auth where possible (leave password blank).
+    SSH host keys are trusted on first use and pinned in tools/.known_hosts;
+    a changed host key is refused (see _ssh.py).
+
+Exit code: 0 all OK, 1 bad arguments/CSV, 2 one or more systems failed.
 """
 
 import argparse
-import csv
 import sys
 import time
 from pathlib import Path
 
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
+import _ssh
+from _ssh import is_windows_path
 
 
 # ---------------------------------------------------------------------------
@@ -56,53 +65,15 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# Platform detection
-# ---------------------------------------------------------------------------
-
-def is_windows_path(path: str) -> bool:
-    """Heuristic: Windows paths contain a drive letter or .exe extension."""
-    p = path.strip()
-    return (
-        p.lower().endswith('.exe') or
-        (len(p) >= 2 and p[1] == ':') or
-        '\\' in p
-    )
-
-
-# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
-
-def ssh_connect(ip: str, username: str, password: str, timeout: int):
-    """Open an SSH connection. Uses key/agent auth when password is blank."""
-    auth = 'password' if password else 'key/agent'
-    vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=ip, username=username, timeout=timeout)
-    if password:
-        kwargs['password'] = password
-    else:
-        kwargs['look_for_keys'] = True
-        kwargs['allow_agent']   = True
-    client.connect(**kwargs)
-    vprint(f"Connected to {ip}")
-    return client
-
-
-# SSH daemon warning lines that are cosmetic and should not be treated as errors.
-# Common on Synology NAS when User Home Service is disabled.
-_SSHD_NOISE = (
-    'could not chdir to home directory',
-    'no such file or directory',
-    'permission denied',  # only suppress if it comes from sshd preamble
-)
 
 def _filter_sshd_preamble(stderr_text: str) -> str:
     """
     Remove known sshd preamble warnings from stderr so they are not
-    mistaken for command errors.  Lines are matched case-insensitively
-    against a known-noise prefix list.
+    mistaken for command errors (e.g. "Could not chdir to home directory",
+    common on Synology NAS when User Home Service is disabled). Lines are
+    matched case-insensitively by prefix.
     """
     filtered = []
     for line in stderr_text.splitlines():
@@ -114,32 +85,32 @@ def _filter_sshd_preamble(stderr_text: str) -> str:
     return '\n'.join(filtered).strip()
 
 
-def run_remote(client, command: str, timeout: int) -> tuple:
+def run_remote(client, command: str, timeout: float) -> tuple:
     """Run a remote command. Returns (stdout, stderr, exit_code)."""
-    vprint(f"→ {command}")
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    exit_code = stdout.channel.recv_exit_status()
-    out = stdout.read().decode(errors='replace').strip()
-    err = _filter_sshd_preamble(stderr.read().decode(errors='replace').strip())
-    vprint(f"← exit {exit_code}")
-    if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
-    if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
-    return out, err, exit_code
+    out, err, exit_code = _ssh.exec_command(client, command, timeout=timeout, log=vprint)
+    return out, _filter_sshd_preamble(err), exit_code
 
 
 # ---------------------------------------------------------------------------
 # Update logic
 # ---------------------------------------------------------------------------
 
-def build_commands(row: dict, skip_pip: bool) -> list[tuple[str, str]]:
+# Requirements file (relative to git_path) installed by --upgrade-pip; the
+# collector installers install the same file.
+DEFAULT_REQUIREMENTS = 'collector/requirements.txt'
+
+
+def build_commands(row: dict, skip_pip: bool,
+                   requirements: str = DEFAULT_REQUIREMENTS) -> list[tuple[str, str]]:
     """
     Return a list of (label, shell_command) pairs for this system.
 
     Uses 'git -C <path>' and absolute paths throughout so no 'cd' is
-    needed and each command is fully self-contained.
+    needed and each command is fully self-contained. requirements is the
+    requirements file relative to the repo root (used unless skip_pip).
     """
-    git_path    = row['git_path'].strip()
-    python_path = row.get('python_path', '').strip()
+    git_path    = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path')
     windows     = is_windows_path(git_path) or is_windows_path(python_path)
 
     if windows:
@@ -149,7 +120,8 @@ def build_commands(row: dict, skip_pip: bool) -> list[tuple[str, str]]:
         gp = git_path
         pp = python_path
 
-    req_path = f'{gp}/requirements.txt'
+    req_rel  = requirements.replace('\\', '/').lstrip('/')
+    req_path = f'{gp}/{req_rel}'
 
     # git -C runs in the repo directory without needing a cd
     git_cmd = f'git -C "{gp}" pull origin main'
@@ -166,11 +138,16 @@ def build_commands(row: dict, skip_pip: bool) -> list[tuple[str, str]]:
     return commands
 
 
-def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int) -> dict:
-    """SSH into one system, run git pull + pip install. Returns result dict."""
-    ip       = row['ip'].strip()
-    username = row['username'].strip()
-    password = row.get('password', '').strip()
+def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int,
+                  command_timeout: float = None,
+                  requirements: str = DEFAULT_REQUIREMENTS) -> dict:
+    """
+    SSH into one system, run git pull (+ pip install). Returns result dict.
+
+    timeout bounds the SSH connect; command_timeout (None/0 = no limit)
+    bounds each remote step.
+    """
+    ip = _ssh.row_value(row, 'ip')
 
     result = {
         'ip':      ip,
@@ -179,7 +156,7 @@ def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int) -> dic
         'elapsed': 0.0,
     }
 
-    commands = build_commands(row, skip_pip)
+    commands = build_commands(row, skip_pip, requirements)
 
     if dry_run:
         result['status'] = 'dry-run'
@@ -189,15 +166,20 @@ def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int) -> dic
 
     start = time.time()
     try:
-        client = ssh_connect(ip, username, password, timeout)
+        client = _ssh.connect_row(row, timeout=timeout, log=vprint)
         try:
             for label, cmd in commands:
-                out, err, code = run_remote(client, cmd, timeout)
+                try:
+                    out, err, code = run_remote(client, cmd, command_timeout)
+                except _ssh.RemoteCommandTimeout as e:
+                    out, err, code = e.stdout, f'{e} (see --command-timeout)', -1
                 step = {'label': label, 'output': out, 'error': err}
                 if code == 0:
                     step['status'] = 'ok'
                 else:
                     step['status'] = 'error'
+                    if not step['error']:
+                        step['error'] = f'exit code {code}'
                 result['steps'].append(step)
                 if code != 0:
                     break   # stop on first failure
@@ -212,7 +194,7 @@ def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int) -> dic
         result['elapsed'] = time.time() - start
         result['status']  = 'failed'
         result['steps'].append({'label': 'connect', 'status': 'failed',
-                                'output': '', 'error': str(e)})
+                                'output': '', 'error': str(e) or type(e).__name__})
 
     return result
 
@@ -262,21 +244,27 @@ def print_result(result: dict, index: int, total: int):
 # ---------------------------------------------------------------------------
 
 def main():
-    if paramiko is None:
-        print("ERROR: paramiko is required.")
-        print("       Install with: pip install paramiko")
-        sys.exit(1)
+    _ssh.require_paramiko()
 
     parser = argparse.ArgumentParser(
-        description='Update lab-monitor collectors via SSH: git pull + pip install')
+        description='Update lab-monitor collectors via SSH: git pull '
+                    '(+ pip install with --upgrade-pip)')
     parser.add_argument('--csv',      required=True, metavar='PATH',
                         help='Path to collectors CSV inventory file')
     parser.add_argument('--dry-run',  action='store_true',
                         help='Print commands without running them')
     parser.add_argument('--upgrade-pip', action='store_true',
-                        help='Also upgrade pip and install requirements (default: git pull only)')
+                        help='Also upgrade pip and install the requirements file '
+                             '(default: git pull only)')
+    parser.add_argument('--requirements', default=DEFAULT_REQUIREMENTS, metavar='RELPATH',
+                        help='Requirements file relative to git_path, used with --upgrade-pip '
+                             f'(default: {DEFAULT_REQUIREMENTS})')
     parser.add_argument('--timeout',  type=int, default=60,
-                        help='SSH + command timeout in seconds (default 60)')
+                        help='SSH connect timeout in seconds (default 60)')
+    parser.add_argument('--command-timeout', type=int, default=600, metavar='SECONDS',
+                        help='Limit for each remote step (git pull, pip); 0 = no limit (default 600)')
+    parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
+                        help='Update up to N systems at once (default: 1 = one at a time)')
     parser.add_argument('--verbose',  action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -289,10 +277,8 @@ def main():
         print(f"ERROR: CSV file not found: {csv_path}")
         sys.exit(1)
 
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        rows   = list(reader)
-        fields = set(reader.fieldnames or [])
+    rows, fieldnames = _ssh.read_inventory(csv_path)
+    fields = set(fieldnames)
 
     if not rows:
         print("ERROR: CSV is empty or has no data rows")
@@ -310,22 +296,26 @@ def main():
         print()
         sys.exit(1)
 
-    steps_desc = 'git pull' + (' + pip install' if args.upgrade_pip else '')
+    steps_desc = 'git pull' + (f' + pip install -r {args.requirements}' if args.upgrade_pip else '')
     print("=" * 62)
     print("Lab Monitor — Remote Update")
     print(f"Systems : {len(rows)}")
     print(f"Steps   : {steps_desc}")
-    print(f"Timeout : {args.timeout}s")
+    print(f"Timeout : {args.timeout}s connect, "
+          f"{f'{args.command_timeout}s' if args.command_timeout else 'no limit'} per step")
+    print(f"Parallel: {args.parallel}")
     print(f"Dry-run : {args.dry_run}")
     print("=" * 62)
     print()
 
-    results = []
-    for i, row in enumerate(rows, 1):
-        result = update_system(row, dry_run=args.dry_run,
-                               skip_pip=(not args.upgrade_pip), timeout=args.timeout)
-        results.append(result)
-        print_result(result, i, len(rows))
+    def worker(row):
+        return update_system(row, dry_run=args.dry_run,
+                             skip_pip=(not args.upgrade_pip), timeout=args.timeout,
+                             command_timeout=args.command_timeout,
+                             requirements=args.requirements)
+
+    results = _ssh.run_hosts(rows, worker, parallel=args.parallel,
+                             on_done=lambda i, row, r: print_result(r, i, len(rows)))
 
     # Summary
     ok_n     = sum(1 for r in results if r['status'] == 'ok')
@@ -348,6 +338,8 @@ def main():
                     err = next((s['error'] for s in r['steps'] if s['status'] != 'ok'), '')
                     print(f"    {r['ip']} — {err[:120]}")
     print()
+
+    sys.exit(2 if fail_n else 0)
 
 
 if __name__ == '__main__':

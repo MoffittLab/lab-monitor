@@ -8,16 +8,16 @@ uses config_tool.py to manage the 'active' field, and displays
 before/after config state for audit/verification.
 
 CSV format (one header row required):
-    ip,username,password,git_path,python_path
+    ip,username,password,git_path,python_path[,key_filename][,port]
     192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
     atlantis.med.harvard.edu,admin,secret789,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
 
 Usage:
-    python3 toggle_collectors.py --mode off                    # pause all
-    python3 toggle_collectors.py --mode on                     # resume all
-    python3 toggle_collectors.py --mode off --csv /path/to.csv # custom CSV
-    python3 toggle_collectors.py --mode off --dry-run          # preview
-    python3 toggle_collectors.py --mode off --timeout 30       # SSH timeout
+    python3 toggle_collectors.py --csv collectors.csv --mode off              # pause all
+    python3 toggle_collectors.py --csv collectors.csv --mode on               # resume all
+    python3 toggle_collectors.py --csv collectors.csv --mode off --dry-run    # preview
+    python3 toggle_collectors.py --csv collectors.csv --mode off --timeout 30 # SSH connect timeout
+    python3 toggle_collectors.py --csv collectors.csv --mode on --parallel 4  # 4 systems at once
 
 Requirements:
     pip install paramiko
@@ -26,19 +26,19 @@ Note:
     - If 'active' field doesn't exist, it will be created
     - Full config (with tokens masked) is shown before and after each change
     - Keep collectors.csv out of version control
+    - SSH host keys are trusted on first use and pinned in tools/.known_hosts
+      (see _ssh.py); a changed host key is refused
+    - Exit code: 0 all OK, 1 bad arguments/CSV, 2 one or more systems failed
 """
 
 import argparse
-import csv
 import json
 import sys
 import time
 from pathlib import Path
 
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
+import _ssh
+from _ssh import is_windows_path
 
 
 # ---------------------------------------------------------------------------
@@ -54,51 +54,12 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# Platform detection
-# ---------------------------------------------------------------------------
-
-def is_windows_path(path: str) -> bool:
-    """Heuristic: Windows paths contain a drive letter or .exe extension."""
-    p = path.strip()
-    return (
-        p.lower().endswith('.exe') or
-        (len(p) >= 2 and p[1] == ':') or
-        '\\' in p
-    )
-
-
-# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
-def ssh_connect(ip: str, username: str, password: str, timeout: int):
-    """Open an SSH connection. Uses key auth if password is blank."""
-    auth = 'password' if password else 'key/agent'
-    vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=ip, username=username, timeout=timeout)
-    if password:
-        kwargs['password'] = password
-    else:
-        kwargs['look_for_keys'] = True
-        kwargs['allow_agent']   = True
-    client.connect(**kwargs)
-    vprint(f"Connected to {ip}")
-    return client
-
-
-def run_remote(client, command: str, timeout: int) -> tuple:
-    """Run a command remotely. Returns (stdout, stderr, exit_code)."""
-    vprint(f"→ {command}")
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    exit_code = stdout.channel.recv_exit_status()
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
-    vprint(f"← exit {exit_code}")
-    if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
-    if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
-    return out, err, exit_code
+def run_remote(client, command: str, timeout: float) -> tuple:
+    """Run a command remotely (timeout: seconds, None/0 = no limit). Returns (stdout, stderr, exit_code)."""
+    return _ssh.exec_command(client, command, timeout=timeout, log=vprint)
 
 
 # ---------------------------------------------------------------------------
@@ -170,16 +131,17 @@ def set_active(client, git_path: str, python_path: str, value: bool, timeout: in
 # Toggle logic
 # ---------------------------------------------------------------------------
 
-def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
+def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int,
+                  command_timeout: float = 120) -> dict:
     """
     SSH into one collector and toggle the 'active' field.
     Returns result dict with before/after config and status.
+
+    timeout bounds the SSH connect; command_timeout each config_tool.py call.
     """
-    ip         = row['ip'].strip()
-    username   = row['username'].strip()
-    password   = row.get('password', '').strip()
-    git_path   = row['git_path'].strip()
-    python_path = row['python_path'].strip()
+    ip          = _ssh.row_value(row, 'ip')
+    git_path    = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path')
 
     result = {
         'ip': ip,
@@ -201,10 +163,10 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     start = time.time()
     try:
         vprint(f"--- {ip} ---")
-        client = ssh_connect(ip, username, password, timeout)
+        client = _ssh.connect_row(row, timeout=timeout, log=vprint)
         try:
             # Get before-state
-            config_before, err = get_config(client, git_path, python_path, timeout)
+            config_before, err = get_config(client, git_path, python_path, command_timeout)
             if config_before is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config before change: {err}'
@@ -214,7 +176,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
             result['config_before'] = config_before
 
             # Set active field
-            ok, err = set_active(client, git_path, python_path, target_value, timeout)
+            ok, err = set_active(client, git_path, python_path, target_value, command_timeout)
             if not ok:
                 result['status'] = 'failed'
                 result['error'] = f'Could not set active field: {err}'
@@ -222,7 +184,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
                 return result
 
             # Get after-state
-            config_after, err = get_config(client, git_path, python_path, timeout)
+            config_after, err = get_config(client, git_path, python_path, command_timeout)
             if config_after is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config after change: {err}'
@@ -239,7 +201,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     except Exception as e:
         result['elapsed'] = time.time() - start
         result['status'] = 'failed'
-        result['error'] = str(e)
+        result['error'] = str(e) or type(e).__name__
 
     return result
 
@@ -264,10 +226,28 @@ def display_config(config: dict, title: str, indent: int = 4):
 # Main
 # ---------------------------------------------------------------------------
 
+def print_result(result: dict):
+    """Print one system's outcome (the '[i/n] ip ... ' prefix is already printed)."""
+    if result['status'] == 'ok':
+        print(f"[OK] ({result['elapsed']:.1f}s)")
+        print()
+        display_config(result['config_before'], "Before:")
+        print()
+        display_config(result['config_after'], "After:")
+        print()
+    elif result['status'] == 'dry-run':
+        print(f"[DRY-RUN] {result['error']}")
+        print()
+    else:
+        print(f"[FAILED] {result['error']}")
+        if result['config_before']:
+            print()
+            display_config(result['config_before'], "Config (before attempt):")
+        print()
+
+
 def main():
-    if paramiko is None:
-        print("ERROR: paramiko is required. Install with: pip install paramiko")
-        sys.exit(1)
+    _ssh.require_paramiko()
 
     parser = argparse.ArgumentParser(
         description='Toggle active flag on all remote collectors',
@@ -281,7 +261,11 @@ def main():
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview without making changes')
     parser.add_argument('--timeout', type=int, default=30,
-                        help='SSH timeout in seconds (default: 30)')
+                        help='SSH connect timeout in seconds (default: 30)')
+    parser.add_argument('--command-timeout', type=int, default=120, metavar='SECONDS',
+                        help='Limit for each remote config_tool.py call; 0 = no limit (default: 120)')
+    parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
+                        help='Toggle up to N systems at once (default: 1 = one at a time)')
     parser.add_argument('--verbose', action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -295,50 +279,35 @@ def main():
         sys.exit(1)
 
     # Read CSV
-    with open(csv_path, newline='') as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    rows, fieldnames = _ssh.read_inventory(csv_path)
 
     if not rows:
         print("ERROR: CSV file is empty or has no data rows")
         sys.exit(1)
 
     required = {'ip', 'username', 'git_path', 'python_path'}
-    missing = required - set(reader.fieldnames or [])
+    missing = required - set(fieldnames)
     if missing:
-        print(f"ERROR: CSV missing required columns: {', '.join(missing)}")
+        print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
     mode_display = 'ON' if args.mode == 'on' else 'OFF'
     print("=" * 70)
     print(f"Lab Monitor - Toggle Collectors {mode_display}")
-    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Dry-run: {args.dry_run}")
+    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Parallel: {args.parallel}  |  "
+          f"Dry-run: {args.dry_run}")
     print("=" * 70)
     print()
 
-    results = []
-    for i, row in enumerate(rows, 1):
-        ip = row['ip'].strip()
-        print(f"[{i}/{len(rows)}] {ip} ... ", end='', flush=True)
-        result = toggle_system(row, mode=args.mode, dry_run=args.dry_run, timeout=args.timeout)
-        results.append(result)
+    def worker(row):
+        return toggle_system(row, mode=args.mode, dry_run=args.dry_run, timeout=args.timeout,
+                             command_timeout=args.command_timeout)
 
-        if result['status'] == 'ok':
-            print(f"[OK] ({result['elapsed']:.1f}s)")
-            print()
-            display_config(result['config_before'], "Before:")
-            print()
-            display_config(result['config_after'], "After:")
-            print()
-        elif result['status'] == 'dry-run':
-            print(f"[DRY-RUN] {result['error']}")
-            print()
-        else:
-            print(f"[FAILED] {result['error']}")
-            if result['config_before']:
-                print()
-                display_config(result['config_before'], "Config (before attempt):")
-            print()
+    def on_start(i, row):
+        print(f"[{i}/{len(rows)}] {_ssh.row_value(row, 'ip')} ... ", end='', flush=True)
+
+    results = _ssh.run_hosts(rows, worker, parallel=args.parallel,
+                             on_start=on_start, on_done=lambda i, row, r: print_result(r))
 
     # Summary
     ok = [r for r in results if r['status'] == 'ok']
@@ -359,6 +328,8 @@ def main():
             for r in failed:
                 print(f"    {r['ip']} — {r['error']}")
     print()
+
+    sys.exit(2 if failed else 0)
 
 
 if __name__ == '__main__':
