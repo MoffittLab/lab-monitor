@@ -14,6 +14,7 @@
   "max_request_bytes": 33554432,
   "max_messages_per_request": 10000,
   "history_retention_days": null,
+  "backup_before_migration": true,
   "threads": 8,
 
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",

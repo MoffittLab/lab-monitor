@@ -32,10 +32,9 @@ import re
 from metrics import MetricsDB
 from data_store import (
     TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE,
-    is_valid_data_type, table_for_data_type,
 )
 from storage_util import (
-    canonical_timestamp, format_timestamp, is_transient_db_error,
+    InstanceLock, InstanceLockError, canonical_timestamp, format_timestamp, is_transient_db_error,
     is_valid_device_name, normalize_device_name, utc_now,
 )
 
@@ -109,10 +108,25 @@ def setup_logging(log_file: str = None, log_level: str = "INFO",
     console._lab_monitor = True
     root.addHandler(console)
 
+    notes = []
     if log_file:
         log_dir = os.path.dirname(log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
+        try:
+            kept = _set_aside_unrotated_log(log_file, max_bytes)
+            if kept:
+                notes.append((logging.WARNING,
+                              f"The previous {log_file} ({os.path.getsize(kept) / 1048576:.1f} MiB, "
+                              f"written without rotation by an older Manager) was moved to {kept} "
+                              f"and is kept there: rotation never deletes it"))
+        except OSError as e:
+            # e.g. still open in another process on Windows: don't rotate it
+            # away (rotation would delete it after backup_count more files)
+            max_bytes = 0
+            notes.append((logging.WARNING,
+                          f"{log_file} is larger than log_max_bytes but could not be moved aside "
+                          f"({e}); it is appended to WITHOUT rotation until the next start"))
         file_handler = logging.handlers.RotatingFileHandler(
             log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8'
         )
@@ -121,7 +135,35 @@ def setup_logging(log_file: str = None, log_level: str = "INFO",
         file_handler._lab_monitor = True
         root.addHandler(file_handler)
 
-    return logging.getLogger('manager')
+    logger = logging.getLogger('manager')
+    for lvl, note in notes:
+        logger.log(lvl, note)
+    return logger
+
+
+def _set_aside_unrotated_log(log_file: str, max_bytes: int):
+    """
+    A log file larger than max_bytes was not written by the rotating handler
+    (an older Manager logged to one ever-growing file).  Rotating it would
+    rename it to <log>.1 and delete it backup_count rotations later, so it
+    is renamed to <log>.pre-rotation-<UTC stamp> instead, outside the
+    rotation set.  Returns the new name, None if nothing was moved; raises
+    OSError if the rename fails.
+    """
+    try:
+        size = os.path.getsize(log_file)
+    except OSError:
+        return None
+    if max_bytes <= 0 or size <= max_bytes:
+        return None
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    dest = f"{log_file}.pre-rotation-{stamp}"
+    n = 1
+    while os.path.exists(dest):
+        dest = f"{log_file}.pre-rotation-{stamp}-{n}"
+        n += 1
+    os.rename(log_file, dest)
+    return dest
 
 
 # Load config
@@ -151,6 +193,8 @@ _data_store = None
 _user_metrics = None   # initialised in init_app()
 _auth = None
 _cors_enabled = False
+# Grandfathered device names already logged once by this process
+_grandfather_warned = set()
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +264,11 @@ def build_auth(config: dict, logger: logging.Logger) -> _AuthConfig:
         collector_tokens = {}
     for device, token in collector_tokens.items():
         if device != '*' and not is_valid_device_name(device):
-            problems.append(f"collector_tokens: invalid device name {device!r}")
+            problems.append(
+                f"collector_tokens: invalid device name {device!r} (allowed: letters, digits, "
+                f"'_', '.', '-'; for a collector registered under an older name such as "
+                f"'Lab PC', use the same name with '_' for the other characters, e.g. "
+                f"'Lab_PC': names are matched after normalization)")
             continue
         tb = _check_token(token, f"collector_tokens[{device!r}]", problems)
         if tb:
@@ -333,6 +381,8 @@ def validate_config(config: dict, logger: logging.Logger) -> _AuthConfig:
         value = config.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ConfigError(f"{key} must be a positive integer")
+    if not isinstance(config.get('backup_before_migration', True), bool):
+        raise ConfigError("backup_before_migration must be true or false")
     return auth
 
 
@@ -347,20 +397,38 @@ def init_app(config: dict, logger: logging.Logger = None):
     _config = config
     _logger = logger
     _auth = auth
+    _grandfather_warned.clear()
 
     app.config['MAX_CONTENT_LENGTH'] = int(config.get('max_request_bytes', DEFAULT_MAX_REQUEST_BYTES))
 
     data_dir = config.get("data_dir", "data")
     os.makedirs(data_dir, exist_ok=True)
 
+    # Databases written by an older Manager are migrated once when opened;
+    # by default each is first copied to <db>.pre-upgrade-<stamp>.bak.
+    backup = config.get("backup_before_migration", True)
+    if not backup:
+        logger.warning("backup_before_migration is false: databases written by an older "
+                       "Manager are migrated WITHOUT a backup copy")
+
     # Central summary DB (latest state per system — dashboard layer)
     db_path = os.path.join(data_dir, "metrics.db")
-    _metrics_db = MetricsDB(db_path, data_dir=data_dir)
+    _metrics_db = MetricsDB(db_path, data_dir=data_dir, backup_before_migration=backup)
     logger.info(f"Central metrics DB: {db_path}")
 
-    # Per-system typed data store (full history)
-    _data_store = TypedDataStore(data_dir=data_dir)
+    # Per-system typed data store (full history); existing databases are
+    # opened (and upgraded where needed) now rather than on first request
+    _data_store = TypedDataStore(data_dir=data_dir, backup_before_migration=backup)
+    blocked = _data_store.prepare_existing()
     logger.info(f"TypedDataStore root: {data_dir}")
+    if _metrics_db.upgrade_blocked or blocked:
+        held = (['metrics.db (so every system)'] if _metrics_db.upgrade_blocked else []) + \
+               ([f'{blocked} per-system database(s)'] if blocked else [])
+        logger.error(
+            f"Database migration held back for {' and '.join(held)} because the pre-upgrade "
+            f"backup failed (see the errors above). The data stays readable; new messages get "
+            f"'error' and stay queued on the collectors until the backup succeeds."
+        )
 
     # User metrics store (per-user CPU/RAM snapshots and history)
     _user_metrics = _metrics_db.users
@@ -369,8 +437,11 @@ def init_app(config: dict, logger: logging.Logger = None):
     for name in _metrics_db.get_all_systems():
         if not is_valid_device_name(name):
             logger.warning(
-                f"Registered device '{name}' has a name ingest now rejects "
-                f"(allowed: letters, digits, '_', '.', '-', max 64): rename that collector"
+                f"Registered device '{name}' has a name outside the allowed pattern "
+                f"(letters, digits, '_', '.', '-', max 64). It was registered by an older "
+                f"Manager, so it is still accepted (grandfathered); new devices with such "
+                f"names are refused. Renaming that collector would start a new device with "
+                f"an empty history."
             )
 
     # CORS is off unless origins are configured: the Dashboard calls the
@@ -385,14 +456,45 @@ def init_app(config: dict, logger: logging.Logger = None):
         logger.info("CORS disabled (no cors_origins configured)")
 
 
+def _name_accepted(name) -> bool:
+    """
+    A device name ingest and the read endpoints accept: ^[A-Za-z0-9_.-]{1,64}$,
+    or exactly a name an older Manager already registered (it accepted any
+    name; refusing it now would lock that collector out).  Grandfathered
+    names are logged once per process.  Storage paths are always derived
+    through normalize_device_name, so no name can escape data_dir.
+    """
+    if is_valid_device_name(name):
+        return True
+    if not isinstance(name, str) or _metrics_db is None or not _metrics_db.is_registered(name):
+        return False
+    if name not in _grandfather_warned:
+        _grandfather_warned.add(name)
+        _logger.warning(
+            f"Accepting device name {name!r}: it is outside the allowed pattern but was "
+            f"registered by an older Manager (grandfathered). Renaming that collector would "
+            f"start a new device with an empty history."
+        )
+    return True
+
+
 def validate_nas_name(nas_name: str) -> bool:
-    """Validate a system name: ^[A-Za-z0-9_.-]{1,64}$ (same rule as ingest)."""
-    return is_valid_device_name(nas_name)
+    """Validate a system name: ^[A-Za-z0-9_.-]{1,64}$ (same rule as ingest), or grandfathered."""
+    return _name_accepted(nas_name)
 
 
 def _system_known(name: str) -> bool:
     """A system is known if it has a history DB or a central registry row."""
     return _data_store.has_system(name) or _metrics_db.is_known(name)
+
+
+def _user_device_known(name: str) -> bool:
+    """
+    For the per-user endpoints: a known system, or a name that still has
+    per-user rows (the old DELETE /api/system/<name> left those behind, and
+    the old Manager kept serving them).
+    """
+    return _system_known(name) or _user_metrics.has_device(name)
 
 
 class _BadArg(Exception):
@@ -502,7 +604,10 @@ def ingest_queue():
      "counts": {"stored": a, "duplicate": b, "rejected": c, "error": d},
      "results": [{"msg_id": "...", "status": "stored|duplicate|rejected|error", "error": "..."}]}
     where H = a + b + c (durably handled), so old collectors that delete their
-    queue only when stored == sent keep draining.
+    queue only when stored == sent keep draining.  After the first 'error'
+    (a storage failure) the remaining messages are not attempted and are
+    answered 'error' as well, so a locked database costs one busy timeout
+    per request instead of one per message.
     """
     data = request.get_json(silent=True)   # 413 propagates to the handler
     if not isinstance(data, dict):
@@ -516,7 +621,7 @@ def ingest_queue():
         return _error(400, "Missing required fields: queue_id, name, id")
     if not isinstance(queue_id, str) or len(queue_id) > 256 or isinstance(system_id, (dict, list)):
         return _error(400, "Invalid queue_id or id")
-    if not is_valid_device_name(name):
+    if not _name_accepted(name):
         return _error(400, "Invalid device name")
     if not g.rights.may_write(name):
         _logger.warning(f"Token not allowed to write for device '{name}' (queue {queue_id})")
@@ -553,7 +658,22 @@ def ingest_queue():
             f"(over max_messages_per_request {max_messages}); accepted from an old collector"
         )
 
-    results = [_process_message(name, system_id, msg) for msg in messages]
+    results = []
+    for i, msg in enumerate(messages):
+        result = _process_message(name, system_id, msg)
+        results.append(result)
+        if result["status"] == "error" and i + 1 < len(messages):
+            # Storage failure (database locked, I/O, held-back migration):
+            # the rest would fail the same way, each after its own busy
+            # timeout, tying up this thread for minutes.  They are answered
+            # 'error' without being attempted; the collector keeps them.
+            rest = messages[i + 1:]
+            _logger.warning(
+                f"Queue {queue_id} from {name}: storage failure; the remaining {len(rest)} "
+                f"message(s) were not attempted (kept by the collector for retry)"
+            )
+            results.extend(_not_attempted(name, m) for m in rest)
+            break
     counts = {"stored": 0, "duplicate": 0, "rejected": 0, "error": 0}
     for r in results:
         counts[r["status"]] += 1
@@ -581,6 +701,18 @@ def _header_msg_id(msg):
     if isinstance(msg, dict) and isinstance(msg.get("header"), dict):
         return msg["header"].get("msg_id")
     return None
+
+
+def _not_attempted(batch_name: str, msg) -> dict:
+    """'error' result for a message skipped after a storage failure, under the id it would get."""
+    msg_id = _header_msg_id(msg)
+    if msg_id is None and isinstance(msg, dict):
+        header, payload = msg.get("header") or {}, msg.get("data") or {}
+        if isinstance(header, dict) and isinstance(payload, dict):
+            msg_id = _legacy_id(batch_name, header, payload)
+    elif not (isinstance(msg_id, str) and _MSG_ID_RE.fullmatch(msg_id)):
+        msg_id = None
+    return {"msg_id": msg_id, "status": "error", "error": "storage failure; retry later"}
 
 
 def _legacy_id(batch_name: str, header: dict, payload: dict) -> str:
@@ -656,7 +788,7 @@ def _process_message(batch_name: str, system_id, msg) -> dict:
             msg_id = _legacy_id(batch_name, header, payload)
 
         dev_name = header.get("device_name", batch_name)
-        if not is_valid_device_name(dev_name):
+        if not _name_accepted(dev_name):
             raise RejectedMessage("invalid device_name")
         if normalize_device_name(dev_name) != normalize_device_name(batch_name):
             raise RejectedMessage("device_name does not match the queue's name")
@@ -674,19 +806,23 @@ def _process_message(batch_name: str, system_id, msg) -> dict:
         if not isinstance(dev_type, str) or isinstance(dev_id, (dict, list)):
             raise RejectedMessage("invalid device_type or device_id")
 
-        table = table_for_data_type(data_type)
+        table = _data_store.ingest_table(dev_name, data_type)
         _validate_known_fields(table, payload)
 
-        central_name = _metrics_db.resolve_name(dev_name)
+        central_name = _metrics_db.resolve_name(dev_name, dev_id)
 
         def side_effects():
             _metrics_db.apply_side_effects(
-                central_name, dev_id, dev_type, timestamp, table, payload, msg_id)
+                central_name, dev_id, dev_type, timestamp, table, payload, msg_id,
+                raw_timestamp=raw_ts)
 
         # Full history in the per-system typed table; central updates run
         # inside the same per-system transaction so a failure rolls back both.
+        # raw_ts: an old Manager stored the header timestamp as sent; messages
+        # it may already hold are matched against its rows in both forms.
         status = _data_store.store_message(
-            dev_name, msg_id, timestamp, dev_type, data_type, payload, on_new=side_effects)
+            dev_name, msg_id, timestamp, dev_type, data_type, payload, on_new=side_effects,
+            raw_timestamp=raw_ts)
         if status == "stored":
             _logger.debug(f"Stored {table} message {msg_id} from {dev_name}")
         return {"msg_id": msg_id, "status": status}
@@ -862,26 +998,26 @@ def get_all_user_metrics():
 @require_scope('read')
 def get_device_user_metrics(device_name: str):
     """Latest per-user CPU/RAM snapshot for one device."""
-    if not validate_nas_name(device_name):
+    if not (validate_nas_name(device_name) or _user_metrics.has_device(device_name)):
         return _error(400, "Invalid device name")
-    if not _system_known(device_name):
+    if not _user_device_known(device_name):
         return _error(404, "System not found")
-    return jsonify(_user_metrics.get_snapshot(_metrics_db.resolve_name(device_name))), 200
+    return jsonify(_user_metrics.get_snapshot(_metrics_db.resolve_read_name(device_name))), 200
 
 
 @app.route('/api/user_metrics/history/<device_name>/<path:username>', methods=['GET'])
 @require_scope('read')
 def get_user_metrics_history(device_name: str, username: str):
     """Time-series CPU/RAM for one user on one device."""
-    if not validate_nas_name(device_name):
+    if not (validate_nas_name(device_name) or _user_metrics.has_device(device_name)):
         return _error(400, "Invalid device name")
     try:
         limit = _int_arg('limit', 200)
     except _BadArg as e:
         return _error(400, str(e))
-    if not _system_known(device_name):
+    if not _user_device_known(device_name):
         return _error(404, "System not found")
-    return jsonify(_user_metrics.get_history(_metrics_db.resolve_name(device_name), username, limit)), 200
+    return jsonify(_user_metrics.get_history(_metrics_db.resolve_read_name(device_name), username, limit)), 200
 
 
 # ---------------------------------------------------------------------------
@@ -923,7 +1059,7 @@ def get_typed_data(system_name, data_type):
     """
     if not validate_nas_name(system_name):
         return _error(400, "Invalid system name")
-    if not is_valid_data_type(data_type):
+    if not _data_store.is_readable_data_type(system_name, data_type):
         return _error(400, "Invalid data type")
     try:
         start = _ts_arg('start')
@@ -1029,7 +1165,7 @@ def get_metric_history(system_name: str, data_type: str, field: str):
     """
     if not validate_nas_name(system_name):
         return _error(400, "Invalid system name")
-    if not is_valid_data_type(data_type):
+    if not _data_store.is_readable_data_type(system_name, data_type):
         return _error(400, "Invalid data type")
     try:
         from_param = _ts_arg('from')
@@ -1124,32 +1260,51 @@ def delete_system(name: str):
     Permanently delete all data for a system (admin token required).
 
     Removes:
-      - Per-system history DB:  data/<name>/data.db
+      - Per-system history DB:  data/<normalized name>/data.db
       - Central summary rows:   devices, device_snapshot, device_totals,
                                 device_user_snapshot, user_metrics_history
+                                of this one device (see MetricsDB.delete_system)
+
+    An older Manager could register two spellings that normalize alike
+    ('lab-a' and 'lab_a', or a name from before a rename).  They share one
+    history directory, so while another such spelling stays registered its
+    data.db is kept ("per_system_db_kept_for"); only the central rows of the
+    named device go.  Deleting the last spelling removes the data.db too.
 
     This is irreversible. The collector's local JSONL archives are the
     source of truth and can be used to rebuild the manager if needed.
 
     Returns:
-        {"status": "ok", "deleted": "<name>"}
+        {"status": "ok", "deleted": "<name>", "per_system_db_deleted": bool,
+         "central_db_rows_cleared": bool[, "per_system_db_kept_for": [names]]}
     """
     if not validate_nas_name(name):
         return _error(400, "Invalid system name")
 
     _logger.warning(f"DELETE /api/system/{name} — permanently deleting all data for '{name}'")
 
-    db_deleted   = _data_store.delete_system(name)
+    target = _metrics_db.resolve_read_name(name)
+    sharing = [n for n in _metrics_db.spellings(name) if n not in (name, target)]
     rows_deleted = _metrics_db.delete_system(name)
+    if sharing:
+        db_deleted = False
+        _logger.warning(
+            f"Kept the history database of '{name}': it is shared with the other registered "
+            f"device name(s) {', '.join(sharing)} (same normalized name); delete those too to remove it")
+    else:
+        db_deleted = _data_store.delete_system(name)
 
     _logger.info(f"System '{name}' wiped: db_deleted={db_deleted}, central_rows_cleared={rows_deleted}")
 
-    return jsonify({
+    body = {
         "status":  "ok",
         "deleted": name,
         "per_system_db_deleted": db_deleted,
         "central_db_rows_cleared": rows_deleted,
-    }), 200
+    }
+    if sharing:
+        body["per_system_db_kept_for"] = sharing
+    return jsonify(body), 200
 
 
 # ---------------------------------------------------------------------------
@@ -1196,9 +1351,11 @@ def main():
     # Load config
     config = load_config(args.config)
 
-    # Setup logging
+    # Setup logging.  --check-config logs to the console only: it never
+    # touches the log file (the installer runs it while the old Manager may
+    # still have that file open) or any database.
     logger = setup_logging(
-        config.get("log_file"),
+        None if args.check_config else config.get("log_file"),
         config.get("log_level", "INFO"),
         console_level=config.get("console_log_level"),
         max_bytes=int(config.get("log_max_bytes", 10 * 1024 * 1024)),
@@ -1206,16 +1363,32 @@ def main():
     )
 
     # Initialize app (refuses unsafe tokens). Exit code 2 = config refused;
-    # the Task Scheduler launcher does not restart on 2.
+    # the Task Scheduler launcher does not restart on 2.  Exit code 3 =
+    # another Manager holds this data_dir (the launcher retries later).
+    instance_lock = None
     try:
         if args.check_config:
             validate_config(config, logger)
             print("Config OK")
             return
+        # One Manager per data_dir, decided BEFORE any database is opened
+        # (the first start after an upgrade backs up and migrates them); the
+        # PID file then names this process for the whole startup.  The lock
+        # stays referenced (held) until main() returns or the process ends.
+        instance_lock = InstanceLock(config.get("data_dir", "data")).acquire()
+        pid_file = write_pid_file()
+        if pid_file:
+            logger.info(f"PID: {os.getpid()} (written to {pid_file})")
         init_app(config, logger)
     except ConfigError as e:
         logger.critical(str(e))
         sys.exit(2)
+    except InstanceLockError as e:
+        logger.critical(
+            f"Another Manager is already running on data_dir {config.get('data_dir', 'data')!r} "
+            f"({e.holder or 'holder unknown'}; lock file {e.path}). Two Managers must never use "
+            f"one data_dir: not starting. If no Manager should be running, end that process.")
+        sys.exit(3)
     except (OSError, sqlite3.Error) as e:
         # Exit 1: the launcher retries (e.g. a share that isn't reachable yet at boot)
         logger.critical(
@@ -1230,11 +1403,6 @@ def main():
     logger.info("Lab Monitor Manager starting")
     logger.info(f"Data directory: {config.get('data_dir')}")
     logger.info("=" * 60)
-
-    # Write PID file for process management
-    pid_file = write_pid_file()
-    if pid_file:
-        logger.info(f"PID: {os.getpid()} (written to {pid_file})")
 
     start_retention_thread(config, logger)
 

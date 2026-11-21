@@ -117,6 +117,11 @@ def run_history_retention(data_store: TypedDataStore, metrics_db, data_dir: str,
 
     # ---- per-system history tables -------------------------------------- #
     for system_key in data_store.list_systems():
+        pending = data_store.upgrade_pending(system_key)
+        if pending:
+            logger.warning(f"  {system_key}: skipped - its database migration is held back "
+                           f"(pre-upgrade backup failed: {pending})")
+            continue
         for data_type in data_store.list_data_types(system_key):
             total = 0
             while True:
@@ -138,7 +143,10 @@ def run_history_retention(data_store: TypedDataStore, metrics_db, data_dir: str,
                 logger.info(f"  {system_key}/{data_type}: {'would archive' if dry_run else 'archived'} {total} rows")
 
     # ---- central per-user history ---------------------------------------- #
-    if metrics_db is not None:
+    if metrics_db is not None and metrics_db.upgrade_blocked:
+        logger.warning("  user_metrics_history: skipped - the metrics.db migration is held back "
+                       f"(pre-upgrade backup failed: {metrics_db.upgrade_blocked})")
+    elif metrics_db is not None:
         total = 0
         while True:
             rows = metrics_db.users.history_older_than(cutoff, limit=BATCH)
@@ -215,9 +223,11 @@ def main():
         sys.exit(1)
 
     try:
-        data_store = TypedDataStore(data_dir)
+        backup = config.get('backup_before_migration', True)
+        data_store = TypedDataStore(data_dir, backup_before_migration=backup)
         db_path = os.path.join(data_dir, 'metrics.db')
-        metrics_db = MetricsDB(db_path, data_dir=data_dir) if os.path.exists(db_path) else None
+        metrics_db = MetricsDB(db_path, data_dir=data_dir, backup_before_migration=backup) \
+            if os.path.exists(db_path) else None
 
         run_history_retention(data_store, metrics_db, data_dir, days, logger, dry_run=args.dry_run)
 

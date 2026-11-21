@@ -1,4 +1,6 @@
 """Network running totals (contract 6): null, replay/out-of-order, reboot."""
+import pytest
+
 from manager_helpers import COLL_TRITON, READ, auth, make_msg, metrics_payload, post_queue
 
 
@@ -93,3 +95,48 @@ def test_nonfinite_counters_are_unmeasured(client):
     _send(client, '2026-08-04T07:10:00Z', 1600, 700)
     t = _totals(client)
     assert (t['total_bytes_in'], t['total_bytes_out']) == (1600, 700)
+
+
+def _send_up(client, ts, bytes_in, bytes_out, uptime='omit'):
+    payload = metrics_payload(bytes_in, bytes_out)
+    if uptime == 'omit':
+        del payload['uptime_seconds']
+    else:
+        payload['uptime_seconds'] = uptime
+    ack = post_queue(client, [make_msg('system_metrics', payload, ts=ts)]).get_json()
+    assert ack['counts']['stored'] == 1, ack
+
+
+def test_counter_decrease_without_reboot_is_not_counted(client, caplog):
+    # Up for days, yet the counters dropped (e.g. a collector that stopped
+    # counting loopback): nothing is added, and the counter is re-baselined.
+    _send_up(client, '2026-08-04T07:00:00Z', 10_000, 5_000, uptime=900_000)
+    _send_up(client, '2026-08-04T07:05:00Z', 12_000, 6_000, uptime=900_300)
+    _send_up(client, '2026-08-04T07:10:00Z', 4_000, 6_500, uptime=900_600)
+    t = _totals(client)
+    assert (t['total_bytes_in'], t['total_bytes_out']) == (12_000, 6_500)
+    assert (t['last_bytes_in'], t['last_bytes_out']) == (4_000, 6_500)
+    assert any('not a reboot' in r.getMessage() for r in caplog.records)
+    _send_up(client, '2026-08-04T07:15:00Z', 4_500, 6_600, uptime=900_900)   # counts from the new baseline
+    t = _totals(client)
+    assert (t['total_bytes_in'], t['total_bytes_out']) == (12_500, 6_600)
+
+
+@pytest.mark.parametrize('uptime', [120, 299 + 300, None, 'omit'])
+def test_counter_decrease_after_reboot_counts_traffic_since_boot(client, uptime):
+    # uptime shorter than the 300 s since the previous reading (+ slack), or
+    # unknown: a reboot, so the current counter is the traffic since boot
+    _send_up(client, '2026-08-04T07:00:00Z', 10_000, 5_000, uptime=900_000)
+    _send_up(client, '2026-08-04T07:05:00Z', 300, 200, uptime=uptime)
+    t = _totals(client)
+    assert (t['total_bytes_in'], t['total_bytes_out']) == (10_300, 5_200)
+
+
+def test_reboot_check_uses_time_since_last_counter_reading(client):
+    # A later folder_usage message moves last_updated but not the network
+    # reading time; the check measures uptime against the network reading.
+    _send_up(client, '2026-08-04T07:00:00Z', 10_000, 5_000, uptime=900_000)
+    post_queue(client, [make_msg('folder_usage', {'/volume1': 5, 'total_usage': 5}, ts='2026-08-04T09:00:00Z')])
+    _send_up(client, '2026-08-04T09:05:00Z', 300, 200, uptime=3_600)       # booted at 08:05: a reboot
+    t = _totals(client)
+    assert (t['total_bytes_in'], t['total_bytes_out']) == (10_300, 5_200)

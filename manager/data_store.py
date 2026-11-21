@@ -33,10 +33,37 @@ column, meaning "not measured" (distinct from a measured zero).
     device_type, msg_id) are stored as "payload_<key>"; they can never set
     the primary key.
 
+data_type labels: letter first, then letters/digits/_/-; "sqlite_*" and
+"folder_usage_*" are refused.  The old Manager took any label (it only
+sanitized it into a table name), so a table it made from a label refused
+now ("1wire_sensors") stays readable, and keeps receiving that label's
+messages, in the database that has it; no new table is ever made from such
+a label.  The storage internals (folder_usage_msgs / _items / _legacy,
+sqlite_*) are never listed or read as a data_type.
+
 Dedup: every history table has a msg_id column with a UNIQUE index.  Rows
 stored before dedup existed have msg_id NULL (UNIQUE allows many NULLs).
 store_message() returns 'duplicate' without side effects if the msg_id is
-already present.
+already present.  A message whose msg_id is not stored yet is ALSO a
+duplicate when the table already holds a pre-upgrade row (msg_id NULL) with
+the same natural key: its timestamp (raw header string or canonical form),
+plus the username for user_metrics.  That holds for every form of id: none
+(an old collector, an archive replay of old messages), "legacy-..." (an old
+queue entry re-sent by an upgraded collector) and a collector's random id
+(a collector upgraded before the Manager: the old Manager stored its
+messages but dropped the id, and the same message can come again from the
+queue after a lost ACK or from an archive replay).  This Manager always
+writes a msg_id, so a msg_id NULL row is always from before the upgrade;
+collector timestamps carry microseconds, so a different reading never has
+the same natural key.  The lookups use the timestamp indexes.
+
+Upgrading a database written by an older Manager (a wide folder_usage
+table, history tables without msg_id) happens once, when it is first
+opened: by default a consistent copy is taken first
+(storage_util.backup_database, "data.db.pre-upgrade-<stamp>.bak").  If that
+copy fails, the database is not migrated: reads keep working on the old
+layout and writes fail as transient 'error' (the collector keeps the
+message) until a retry of the backup succeeds.
 
 Reads never create directories, databases or tables.
 """
@@ -48,11 +75,13 @@ import re
 import sqlite3
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from storage_util import (
-    LockedConnection, canonical_timestamp, format_timestamp, normalize_device_name,
+    UPGRADE_RETRY_SECONDS, LockedConnection, MigrationBlockedError, backup_database,
+    canonical_timestamp, format_timestamp, normalize_device_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +102,8 @@ _FU_LEGACY = 'folder_usage_legacy'
 _DATA_TYPE_RE = re.compile(r'[A-Za-z][A-Za-z0-9_-]{0,63}')
 # Table-name prefixes reserved for SQLite and for the folder_usage layout
 _RESERVED_PREFIXES = ('sqlite_', 'folder_usage_')
+# The tables that really are internal (never listed or read as a data_type)
+_INTERNAL_TABLE_RE = re.compile(r'sqlite_.*|folder_usage_(?:msgs|items|legacy(?:_\d+)?)')
 
 # SQLite's default SQLITE_MAX_COLUMN is 2000; leave headroom.
 _MAX_COLUMNS = 1900
@@ -107,6 +138,30 @@ def _sanitize_table(name: str) -> str:
     and truncates to 64 characters.
     """
     return re.sub(r'[^a-z0-9_]', '_', name.lower())[:64]
+
+
+def _is_internal_table(name: str) -> bool:
+    return _INTERNAL_TABLE_RE.fullmatch(name) is not None
+
+
+def _readable_table(data_type, tables) -> Optional[str]:
+    """
+    Table a read for data_type uses, or None.  A label the current rules
+    accept maps as on ingest; otherwise an EXISTING table an older Manager
+    created from a label the current rules refuse (it accepted any text:
+    "1wire_sensors", "folder_usage_v2") stays readable under the same
+    sanitized name the old Manager used.  Internal tables never are.
+    """
+    try:
+        return table_for_data_type(data_type)
+    except RejectedMessage:
+        pass
+    if not isinstance(data_type, str) or not data_type:
+        return None
+    table = _sanitize_table(data_type)
+    if table in tables and not _is_internal_table(table):
+        return table
+    return None
 
 
 def is_valid_data_type(data_type) -> bool:
@@ -269,6 +324,45 @@ def _numeric_filter(expr: str) -> str:
     )
 
 
+def _meta_number(meta_json, key):
+    """
+    SQL function lm_meta_number(meta_json, key): the numeric value of one
+    folder_usage metadata key (e.g. "_scan_seconds"), else NULL.  Follows the
+    old /api/history value rules: numbers and numeric text count, NaN/±inf
+    and anything else don't.
+    """
+    try:
+        meta = json.loads(meta_json) if meta_json else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, int):
+        return value if _INT64_MIN <= value <= _INT64_MAX else None
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _register_functions(conn: sqlite3.Connection):
+    try:
+        conn.create_function('lm_meta_number', 2, _meta_number, deterministic=True)
+    except (TypeError, sqlite3.NotSupportedError):     # Python < 3.8 / SQLite < 3.8.3
+        conn.create_function('lm_meta_number', 2, _meta_number)
+
+
+def _sql_literal(text: str) -> str:
+    return "'" + str(text).replace("'", "''") + "'"
+
+
 def _jd_to_timestamp(jd: float) -> str:
     dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=jd - _JD_UNIX_EPOCH)
     return format_timestamp(dt)
@@ -289,8 +383,9 @@ class TypedDataStore:
     Tables are created on first write; columns are added as new keys arrive.
     """
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, backup_before_migration: bool = True):
         self.data_dir = data_dir
+        self.backup_before_migration = backup_before_migration
         self._dbs: Dict[str, LockedConnection] = {}
         self._cache_lock = threading.Lock()
 
@@ -326,19 +421,184 @@ class TypedDataStore:
                     return None
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             db = LockedConnection(path)
+            _register_functions(db.conn)
             db.folder_migrated = False
+            db.folder_error = None        # why the wide -> narrow folder_usage copy failed
+            db.folder_attempted = 0.0
+            db.upgrade_blocked = None     # reason while a needed migration is held back
+            db.upgrade_attempted = 0.0
+            try:
+                self._upgrade_db(db)
+            except BaseException:
+                db.close()                # e.g. a damaged file: retried on the next access
+                raise
+            self._dbs[key] = db
+            return db
+
+    def prepare_existing(self) -> int:
+        """
+        Open (and, where needed, back up and migrate) every existing per-system
+        database, so the one-time upgrade happens at startup rather than
+        inside the first request for each system.  Returns how many are
+        held back because their backup failed.
+        """
+        blocked = 0
+        for key in self.list_systems():
+            try:
+                db = self._get_db(key)
+            except Exception as e:
+                logger.error(f"[data_store] could not open {self._db_path(key)}: {e}")
+                continue
+            if db is not None and db.upgrade_blocked:
+                blocked += 1
+        return blocked
+
+    # ------------------------------------------------------------------ #
+    # One-time upgrade of databases written by an older Manager            #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _upgrade_reasons(cls, conn) -> List[str]:
+        """What an existing database still needs migrated ([] = current schema)."""
+        reasons = []
+        tables = cls._list_tables(conn)
+        if FOLDER_USAGE in tables:
+            reasons.append('wide folder_usage table')
+        old = sorted(
+            t for t in tables
+            if not _is_internal_table(t) and t != FOLDER_USAGE
+            and 'msg_id' not in {c.lower() for c in cls._get_columns(conn, t)}
+        )
+        if old:
+            reasons.append('no msg_id column in ' + ', '.join(old))
+        return reasons
+
+    @classmethod
+    def _has_original_layout(cls, conn) -> bool:
+        """
+        True while a database still has the layout an older Manager wrote:
+        no folder_usage_msgs / _items / _legacy table and no msg_id column.
+        False once any migration step of this Manager has been applied.
+        """
+        for table in cls._list_tables(conn):
+            if table.startswith('sqlite_'):
+                continue
+            if _is_internal_table(table):
+                return False
+            if 'msg_id' in {c.lower() for c in cls._get_columns(conn, table)}:
+                return False
+        return True
+
+    def _upgrade_db(self, db: LockedConnection) -> bool:
+        """
+        Bring a database written by an older Manager to the current schema,
+        after taking a pre-upgrade backup (unless backup_before_migration is
+        off).  If the backup fails nothing is changed: db.upgrade_blocked is
+        set, reads keep working on the old layout and writes raise
+        MigrationBlockedError.  Returns True if the schema is current.
+        """
+        with db.lock:
+            db.upgrade_attempted = time.monotonic()
+            reasons = self._upgrade_reasons(db.conn)
+            if not reasons:
+                db.folder_migrated = True
+                db.upgrade_blocked = None
+                return True
+            reason = '; '.join(reasons)
+            if self.backup_before_migration:
+                try:
+                    # An older Manager only appended rows / added columns here
+                    backup_database(db.conn, db.path, reason,
+                                    original_layout=self._has_original_layout, append_only=True)
+                except Exception as e:
+                    db.upgrade_blocked = reason
+                    logger.error(
+                        f"[data_store] NOT migrating {db.path}: the pre-upgrade backup failed "
+                        f"({type(e).__name__}: {e}). It is still readable in its old layout; new "
+                        f"messages for it get 'error' and stay queued on the collector. Free disk "
+                        f"space / fix permissions (retried every {UPGRADE_RETRY_SECONDS}s on the "
+                        f"next write), or set \"backup_before_migration\": false to migrate without "
+                        f"a backup."
+                    )
+                    return False
+            else:
+                logger.warning(
+                    f"[data_store] migrating {db.path} WITHOUT a backup "
+                    f"(backup_before_migration is false): {reason}"
+                )
+            db.upgrade_blocked = None
+
+            self._try_folder_migration(db)
+            try:
+                with db.transaction() as conn:
+                    for table in sorted(self._list_tables(conn)):
+                        if not _is_internal_table(table) and table != FOLDER_USAGE:
+                            self._ensure_table(conn, table)
+            except Exception as e:
+                # Retried table by table on the next write (store_message)
+                logger.error(f"[data_store] adding msg_id columns failed for {db.path}: {e}",
+                             exc_info=True)
+            return True
+
+    def _try_folder_migration(self, db: LockedConnection) -> bool:
+        """
+        Run the wide -> narrow folder_usage copy; True when done (or not needed).
+        On failure (database locked by another program, disk full, ...) the
+        wide table stays in place and keeps serving the old folder history;
+        db.folder_error is set and new folder_usage messages for this system
+        get 'error' (the collectors keep them) until a retry succeeds, so the
+        narrow tables are never started next to an unmigrated wide table.
+        """
+        with db.lock:
+            db.folder_attempted = time.monotonic()
             try:
                 self._migrate_wide_folder_usage(db)
             except Exception as e:
-                # Leave the wide table in place; new folder_usage rows still go
-                # to the narrow tables and the copy is retried on next start.
+                db.folder_error = f'{type(e).__name__}: {e}'
                 logger.error(
-                    f"[data_store] folder_usage migration failed for {path}: {e} "
-                    f"— old rows stay in the wide table until the next restart",
+                    f"[data_store] folder_usage migration failed for {db.path}: {e}. The old "
+                    f"folder history stays in the wide table and is still served; new folder_usage "
+                    f"messages for this system get 'error' (kept queued by the collector) until the "
+                    f"migration succeeds. Retried on the next folder_usage message after "
+                    f"{UPGRADE_RETRY_SECONDS}s and at every start.",
                     exc_info=True,
                 )
-            self._dbs[key] = db
-            return db
+                return False
+            if db.folder_error:
+                logger.warning(f"[data_store] folder_usage migration of {db.path} succeeded on retry")
+            db.folder_error = None
+            return True
+
+    def _check_folder_writable(self, db: LockedConnection):
+        """Raise MigrationBlockedError while the wide folder_usage table is not migrated yet."""
+        if db.folder_migrated:
+            return
+        with db.lock:
+            if not db.folder_migrated and \
+                    time.monotonic() - db.folder_attempted >= UPGRADE_RETRY_SECONDS:
+                self._try_folder_migration(db)
+            if not db.folder_migrated:
+                raise MigrationBlockedError(
+                    f"{db.path}: the folder_usage migration is not done yet "
+                    f"({db.folder_error or 'pending'}); retried every {UPGRADE_RETRY_SECONDS}s")
+
+    def upgrade_pending(self, system_name: str) -> Optional[str]:
+        """Why this system's database migration is held back, or None."""
+        db = self._get_db(system_name)
+        return db.upgrade_blocked if db is not None else None
+
+    def _check_writable(self, db: LockedConnection):
+        """Raise MigrationBlockedError while a held-back migration is pending."""
+        if not db.upgrade_blocked:
+            return
+        with db.lock:
+            if db.upgrade_blocked and \
+                    time.monotonic() - db.upgrade_attempted >= UPGRADE_RETRY_SECONDS:
+                self._upgrade_db(db)
+            if db.upgrade_blocked:
+                raise MigrationBlockedError(
+                    f"{db.path} needs a migration that is held back until its "
+                    f"pre-upgrade backup succeeds")
 
     # ------------------------------------------------------------------ #
     # Schema helpers                                                       #
@@ -517,7 +777,8 @@ class TypedDataStore:
                       device_type: str,
                       data_type:   Optional[str],
                       data:        Dict[str, Any],
-                      on_new:      Optional[Callable[[], None]] = None) -> str:
+                      on_new:      Optional[Callable[[], None]] = None,
+                      raw_timestamp: Optional[str] = None) -> str:
         """
         Store one message's payload in its typed table, in one transaction.
 
@@ -525,7 +786,15 @@ class TypedDataStore:
         written and on_new is not called).  on_new runs inside the transaction
         after the row is inserted; if it raises, the insert is rolled back so
         a retry re-applies both.  Raises RejectedMessage for permanently bad
-        messages and sqlite3/OS errors for storage failures.
+        messages and sqlite3/OS errors for storage failures
+        (MigrationBlockedError while a held-back migration is pending).
+
+        A message whose msg_id is not stored yet (whatever its form: none,
+        derived "legacy-...", or a collector's random id that an older
+        Manager dropped) is also a duplicate if a pre-upgrade row (msg_id
+        NULL) has the same timestamp (raw_timestamp, the header string as the
+        old Manager stored it, or the canonical timestamp) and, for
+        user_metrics, the same username.
 
         Args:
             system_name:  e.g. "Triton"
@@ -536,22 +805,37 @@ class TypedDataStore:
             data:         The full data dict from the message (the 'data_type'
                           key is stripped so it doesn't become a column)
         """
-        table = table_for_data_type(data_type)
+        table = self.ingest_table(system_name, data_type)
         payload = {k: v for k, v in data.items() if k != 'data_type'}
         db = self._get_db(system_name, create=True)
+        self._check_writable(db)
+        if table == FOLDER_USAGE:
+            self._check_folder_writable(db)
+
+        natural_ts = tuple(dict.fromkeys(t for t in (raw_timestamp, timestamp) if isinstance(t, str)))
 
         try:
             with db.transaction() as conn:
                 if table == FOLDER_USAGE:
+                    if FOLDER_USAGE in self._list_tables(conn):
+                        # Never start the narrow tables next to an unmigrated
+                        # wide table (reads would stop serving the wide one)
+                        db.folder_migrated = False
+                        raise MigrationBlockedError(
+                            f"{db.path}: the wide folder_usage table is not migrated yet")
                     self._ensure_folder_tables(conn)
                     if msg_id and conn.execute(
                             f'SELECT 1 FROM {_FU_MSGS} WHERE msg_id = ?', (msg_id,)).fetchone():
+                        raise _Duplicate()
+                    if self._has_pre_upgrade_row(conn, table, natural_ts, payload):
                         raise _Duplicate()
                     self._insert_folder_usage(conn, msg_id, timestamp, device_type, payload)
                 else:
                     self._ensure_table(conn, table)
                     if msg_id and conn.execute(
                             f'SELECT 1 FROM "{table}" WHERE msg_id = ?', (msg_id,)).fetchone():
+                        raise _Duplicate()
+                    if self._has_pre_upgrade_row(conn, table, natural_ts, payload):
                         raise _Duplicate()
                     self._insert_wide(conn, table, msg_id, timestamp, device_type, payload)
                 if on_new is not None:
@@ -582,6 +866,42 @@ class TypedDataStore:
         except Exception as e:
             logger.error(f"[data_store] store failed for {system_name}/{data_type}: {e}", exc_info=True)
             return False
+
+    @classmethod
+    def _has_pre_upgrade_row(cls, conn, table: str, timestamps: Sequence[str],
+                             payload: Dict[str, Any]) -> bool:
+        """
+        True if `table` holds a row stored before dedup existed (msg_id NULL)
+        with this natural key: one of `timestamps` (the raw header string the
+        old Manager stored, and the canonical form migrated rows have), plus
+        the username for user_metrics.  Index-backed (timestamp indexes).
+        """
+        if not timestamps:
+            return False
+        ph = ', '.join(['?'] * len(timestamps))
+        params = list(timestamps)
+        if table == FOLDER_USAGE:
+            if conn.execute(f'SELECT 1 FROM {_FU_MSGS} INDEXED BY idx_{_FU_MSGS}_ts '
+                            f'WHERE timestamp IN ({ph}) AND msg_id IS NULL LIMIT 1',
+                            params).fetchone():
+                return True
+            # A wide table whose migration failed (still being retried) holds
+            # pre-upgrade rows too; it never has msg_ids.
+            if FOLDER_USAGE in cls._list_tables(conn):
+                return conn.execute(f'SELECT 1 FROM "{FOLDER_USAGE}" WHERE timestamp IN ({ph}) LIMIT 1',
+                                    params).fetchone() is not None
+            return False
+
+        cond = f'timestamp IN ({ph}) AND msg_id IS NULL'
+        if table == 'user_metrics':
+            by_lower = {c.lower(): c for c in cls._get_columns(conn, table)}
+            username = payload.get('username')
+            if 'username' not in by_lower or not isinstance(username, str):
+                return False
+            cond += f' AND "{_quote_col(by_lower["username"])}" = ?'
+            params.append(username)
+        return conn.execute(f'SELECT 1 FROM "{table}" INDEXED BY "idx_{table}_ts" WHERE {cond} LIMIT 1',
+                            params).fetchone() is not None
 
     def _insert_wide(self, conn, table, msg_id, timestamp, device_type, payload):
         existing = self._get_columns(conn, table)
@@ -628,9 +948,9 @@ class TypedDataStore:
         db = self._get_db(system_name)
         if db is None:
             return [], False
-        try:
-            table = table_for_data_type(data_type)
-        except RejectedMessage:
+        with db.lock:
+            table = _readable_table(data_type, self._list_tables(db.conn))
+        if table is None:
             return [], False
 
         conds, params = [], []
@@ -646,7 +966,15 @@ class TypedDataStore:
 
         with db.lock:
             tables = self._list_tables(db.conn)
-            if table == FOLDER_USAGE:
+            if table == FOLDER_USAGE and _FU_MSGS not in tables and FOLDER_USAGE in tables:
+                # Not migrated yet (held back): serve the old wide table
+                cursor = db.conn.execute(
+                    f'SELECT * FROM "{FOLDER_USAGE}" {where} ORDER BY timestamp {order}, id {order} LIMIT ?',
+                    params + [limit + 1],
+                )
+                cols = [d[0] for d in cursor.description]
+                rows = [self._wide_folder_row(dict(zip(cols, row))) for row in cursor.fetchall()]
+            elif table == FOLDER_USAGE:
                 if _FU_MSGS not in tables:
                     return [], False
                 rows = self._folder_rows(db, where, params, order, limit + 1)
@@ -662,6 +990,20 @@ class TypedDataStore:
 
         truncated = len(rows) > limit
         return rows[:limit], truncated
+
+    @staticmethod
+    def _wide_folder_row(row: dict) -> dict:
+        """A row of an unmigrated wide folder_usage table in the narrow read shape."""
+        out = {'id': row.get('id'), 'msg_id': None,
+               'timestamp': row.get('timestamp'), 'device_type': row.get('device_type')}
+        for col, value in row.items():
+            if col.lower() in _INTERNAL_LOWER or value is None or value == '' \
+                    or isinstance(value, bytes):
+                continue   # NULL / '' = the old backfill for "not measured"
+            # Values as stored (lists/dicts stay JSON text), exactly what the
+            # old Manager returned and what the migration copies into meta_json.
+            out[col] = value
+        return out
 
     def _folder_rows(self, db: LockedConnection, where: str, params: list,
                      order: str, limit: int) -> List[dict]:
@@ -745,7 +1087,9 @@ class TypedDataStore:
         omitted); `limit` then only bounds a tail query.
 
         `field` is resolved as given, then with a leading '/' (volume paths
-        lose it in URL routing).
+        lose it in URL routing).  A folder_usage field that is not a folder /
+        volume key but a numeric metadata key (e.g. "_scan_seconds", which the
+        old wide table kept as a column) is read from the runs' metadata.
 
         Returns None if the system/table has no rows at all, else
         {"field", "unit", "points": [(timestamp, float)], "truncated", "downsampled"}.
@@ -753,25 +1097,35 @@ class TypedDataStore:
         db = self._get_db(system_name)
         if db is None:
             return None
-        try:
-            table = table_for_data_type(data_type)
-        except RejectedMessage:
-            return None
 
         with db.lock:
             conn = db.conn
             tables = self._list_tables(conn)
-            if table == FOLDER_USAGE:
+            table = _readable_table(data_type, tables)
+            if table is None:
+                return None
+            # A folder_usage table not migrated yet (held back) is read as a wide table
+            wide_folder = table == FOLDER_USAGE and _FU_MSGS not in tables and FOLDER_USAGE in tables
+            if table == FOLDER_USAGE and not wide_folder:
                 if _FU_MSGS not in tables or conn.execute(f'SELECT 1 FROM {_FU_MSGS} LIMIT 1').fetchone() is None:
                     return None
-                resolved = field
+                resolved, meta_key = field, None
                 if conn.execute(f'SELECT 1 FROM {_FU_ITEMS} WHERE key = ? LIMIT 1', (field,)).fetchone() is None:
                     if conn.execute(f'SELECT 1 FROM {_FU_ITEMS} WHERE key = ? LIMIT 1', ('/' + field,)).fetchone():
                         logger.info(f"Field resolved with leading slash: '{field}' -> '/{field}'")
                         resolved = '/' + field
-                src = f'{_FU_ITEMS} i JOIN {_FU_MSGS} m ON m.id = i.msg_row_id'
-                ts_expr, val_expr = 'm.timestamp', 'i.value'
-                where, params = [f'i.key = ?', _numeric_filter(val_expr)], [resolved]
+                    else:
+                        meta_key = self._folder_meta_key(conn, field)
+                if meta_key is not None:
+                    resolved = meta_key
+                    src = f'{_FU_MSGS} m'
+                    ts_expr = 'm.timestamp'
+                    val_expr = f'lm_meta_number(m.meta_json, {_sql_literal(meta_key)})'
+                    where, params = [_numeric_filter(val_expr)], []
+                else:
+                    src = f'{_FU_ITEMS} i JOIN {_FU_MSGS} m ON m.id = i.msg_row_id'
+                    ts_expr, val_expr = 'm.timestamp', 'i.value'
+                    where, params = [f'i.key = ?', _numeric_filter(val_expr)], [resolved]
                 unit = self._folder_unit(conn, resolved)
             else:
                 if table not in tables or conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
@@ -877,6 +1231,15 @@ class TypedDataStore:
         return next((v for v in row if v), None)
 
     @staticmethod
+    def _folder_meta_key(conn, field) -> Optional[str]:
+        """field (or '/' + field) if some run stores it as metadata, else None."""
+        for key in (field, '/' + field):
+            if conn.execute(f'SELECT 1 FROM {_FU_MSGS} WHERE instr(meta_json, ?) > 0 LIMIT 1',
+                            (json.dumps(key) + ':',)).fetchone():
+                return key
+        return None
+
+    @staticmethod
     def _folder_unit(conn, field) -> Optional[str]:
         row = conn.execute(f'SELECT meta_json FROM {_FU_MSGS} ORDER BY timestamp DESC LIMIT 1').fetchone()
         try:
@@ -886,6 +1249,34 @@ class TypedDataStore:
         if not isinstance(meta, dict):
             return None
         return meta.get(f'{field}_unit') or meta.get('_unit')
+
+    def ingest_table(self, system_name: str, data_type) -> str:
+        """
+        Table a new message with this data_type goes to; raises RejectedMessage.
+        A label the current rules refuse is still accepted when this system's
+        database already has the table an older Manager made from it (that
+        stream of data keeps working); no new table is ever made from one.
+        """
+        try:
+            return table_for_data_type(data_type)
+        except RejectedMessage:
+            db = self._get_db(system_name)
+            if db is not None:
+                with db.lock:
+                    table = _readable_table(data_type, self._list_tables(db.conn))
+                if table is not None:
+                    return table
+            raise
+
+    def is_readable_data_type(self, system_name: str, data_type) -> bool:
+        """True if reads may ask for this data_type (valid label, or an old table of this system)."""
+        if is_valid_data_type(data_type):
+            return True
+        db = self._get_db(system_name)
+        if db is None:
+            return False
+        with db.lock:
+            return _readable_table(data_type, self._list_tables(db.conn)) is not None
 
     def list_data_types(self, system_name: str) -> List[str]:
         """Return the data_types present for a system ([] if unknown)."""
@@ -897,7 +1288,7 @@ class TypedDataStore:
                 tables = self._list_tables(db.conn)
         except Exception:
             return []
-        types = {t for t in tables if not t.startswith(_RESERVED_PREFIXES)}
+        types = {t for t in tables if not _is_internal_table(t)}
         if _FU_MSGS in tables:
             types.add(FOLDER_USAGE)
         return sorted(types)
@@ -927,7 +1318,14 @@ class TypedDataStore:
         db = self._get_db(system_name)
         if db is None or not ids:
             return 0
-        table = table_for_data_type(data_type)
+        self._check_writable(db)
+        with db.lock:
+            table = _readable_table(data_type, self._list_tables(db.conn))
+        if table is None:
+            return 0
+        if table == FOLDER_USAGE:
+            # ids of rows read from an unmigrated wide table are not narrow ids
+            self._check_folder_writable(db)
         deleted = 0
         with db.transaction() as conn:
             for i in range(0, len(ids), 500):

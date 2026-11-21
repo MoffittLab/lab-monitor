@@ -27,6 +27,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
   "max_request_bytes": 33554432,
   "max_messages_per_request": 10000,
   "history_retention_days": null,
+  "backup_before_migration": true,
   "threads": 8,
 
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
@@ -46,12 +47,15 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `max_messages_per_request` | 10000 | More messages in one POST get `413`, but only when the messages carry `header.msg_id` (new collectors, which send at most `max_batch_messages`, default 100, per request). Requests from old collectors (no `msg_id`) are exempt because they can't split their queue; `max_request_bytes` still applies to them. |
 | `history_retention_days` | `null` | `null` keeps history forever. A number N makes the Manager archive rows older than N days to JSONL once a day and then delete them (see [Retention](#retention)). |
 | `retention_days` | — | Legacy. It only applied to the old `usage.jsonl` reports, which the Manager no longer writes, so it has no effect. It does **not** affect the history databases. |
+| `backup_before_migration` | `true` | Before the Manager changes a database written by an older version for the first time, it copies it to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` next to it. If the copy fails, that database is not migrated. `false` migrates without a copy. See [Upgrading](#upgrading-from-the-previous-manager). |
 | `threads` | 8 | waitress worker threads. |
-| `log_file` | none | Rotating log file (10 MiB × 5; `log_max_bytes`, `log_backup_count`). Every module logs here. |
+| `log_file` | none | Rotating log file (10 MiB × 5; `log_max_bytes`, `log_backup_count`). Every module logs here. An existing file larger than `log_max_bytes` (the previous Manager's unrotated log) is renamed to `<log_file>.pre-rotation-<stamp>` at startup, outside the rotation set, so rotation never deletes it. `--check-config` never opens the log file. |
 | `data_dir` | `data` | Where `metrics.db` and the per-system databases live. A UNC path (`\\server\share\...`) works, but see [Running from Task Scheduler](#running-from-task-scheduler). Mapped drive letters don't work for scheduled tasks. |
 | `log_level` | `INFO` | Level for the log file. The console gets `WARNING` and above when a log file is set (`console_log_level` to change). |
 
-**The Manager refuses to start** (exit code 2) if any configured token is a placeholder (contains `CHANGE-ME`, `YOUR-`, `GENERATE-RANDOM`, `PLACEHOLDER`, …) or is shorter than 16 characters, or if no tokens are configured at all. `python manager.py --config config.json --check-config` validates the config and exits without starting.
+**The Manager refuses to start** (exit code 2) if any configured token is a placeholder (contains `CHANGE-ME`, `YOUR-`, `GENERATE-RANDOM`, `PLACEHOLDER`, …) or is shorter than 16 characters, or if no tokens are configured at all. `python manager.py --config config.json --check-config` validates the config and exits without starting (it touches no database and no log file).
+
+**One Manager per `data_dir`.** Before it opens any database the Manager takes an exclusive lock on `<data_dir>/manager.lock` (held until the process ends, however it ends; the file names the holder's PID) and writes its PID file. A second Manager on the same `data_dir` exits with code 3 and logs "Another Manager is already running on data_dir … (pid=…)"; the Task Scheduler launcher retries every 60 s, so it takes over once the other one exits. A Manager older than this version takes no lock, so after an upgrade also check that no old `manager.py` is left running.
 
 Generate a token: `python -c "import secrets; print(secrets.token_hex(32))"`.
 
@@ -78,16 +82,16 @@ data/
     └── archive/                 ← only if history retention is enabled
 ```
 
-**folder_usage** is stored narrow (one row per folder) so shares with thousands of folders don't hit SQLite's 2000-column limit. The read API reassembles each run into the same flat dict as before. On first open, an existing wide `folder_usage` table is copied into the narrow tables in one transaction and renamed to `folder_usage_legacy`. It is never dropped, so you can delete it by hand once you have checked the migration.
+**folder_usage** is stored narrow (one row per folder) so shares with thousands of folders don't hit SQLite's 2000-column limit. The read API reassembles each run into the same flat dict as before. On first open (after the [pre-upgrade backup](#upgrading-from-the-previous-manager)), an existing wide `folder_usage` table is copied into the narrow tables in one transaction and renamed to `folder_usage_legacy`. It is never dropped, so you can delete it by hand once you have checked the migration.
 
 **Other data types** get one column per payload key. When a message has a key the table hasn't seen, the column is added. Earlier rows read back `NULL` for it, meaning "not measured", which is different from a measured zero.
 - SQLite column names are case-insensitive. A key that differs only in case from an existing column is stored in that column. A payload with two keys that differ only in case is rejected.
 - Payload keys that collide with internal columns (`id`, `timestamp`, `device_type`, `msg_id`) are stored as `payload_<key>`.
 - `data_type` must match `[A-Za-z][A-Za-z0-9_-]{0,63}` and must not start with `sqlite_` or `folder_usage_`.
 
-Every history table has a `msg_id` column with a UNIQUE index. Rows stored before the upgrade have `msg_id = NULL`.
+Every history table has a `msg_id` column with a UNIQUE index. Rows stored before the upgrade have `msg_id = NULL`. A message whose `msg_id` isn't stored yet also counts as a `duplicate` when the table already holds such a pre-upgrade row with the same timestamp (as sent, or in the canonical form) and, for `user_metrics`, the same `username`. This applies whatever id the message carries: none (an old collector, an archive replay of old messages), a derived `legacy-…` id (an old queue entry re-sent by an upgraded collector), or a collector's random id (a collector upgraded before the Manager: the previous Manager stored its messages but dropped the id). The new Manager always writes a `msg_id`, so a row without one is always from before the upgrade. The lookup uses the timestamp index. Messages the previous Manager stored are therefore never stored twice.
 
-Timestamps are stored as fixed-width UTC, e.g. `2026-08-04T07:00:00.000000Z`, so they sort correctly as strings. Incoming timestamps with offsets are converted to UTC. Timestamps without an offset are taken as UTC.
+Timestamps are stored as fixed-width UTC, e.g. `2026-08-04T07:00:00.000000Z`, so they sort correctly as strings. Incoming timestamps with offsets are converted to UTC. Timestamps without an offset are taken as UTC. Rows written by the previous Manager keep the timestamp string exactly as the collector sent it (usually the same form, without the fraction when it was `.000000`); only `folder_usage` runs get the canonical form when they are copied to the narrow layout.
 
 ### Central summary: `metrics.db`
 
@@ -101,7 +105,13 @@ Timestamps are stored as fixed-width UTC, e.g. `2026-08-04T07:00:00.000000Z`, so
 
 The snapshot tables and `devices.last_seen` follow the **newest** message, not the last one stored: an older message stored later (a gap-fill with `tools/replay_archives.py`, or a retry of an `error` result) adds history rows but does not roll the snapshot, `last_seen` or the disk total back. It can move `first_seen` earlier.
 
-Network totals: a message adds `current − last` for each counter. If a counter went down (reboot or reset), it adds `current`, the traffic since boot. Nothing is added when either counter is `null` or missing, or when the message is not newer than the last network update (replay or out-of-order).
+Network totals: a message adds `current − last` for each counter. Nothing is added when either counter is `null` or missing, or when the message is not newer than the last network update (replay or out-of-order). If a counter went down:
+- it is a reboot or counter reset, and `current` (the traffic since boot) is added, when the message's `uptime_seconds` is shorter than the time since the previous counter reading plus 300 s, or when `uptime_seconds` is `null` or missing;
+- otherwise the machine has been up since the previous reading (an interface went away, or the collector stopped counting loopback), so nothing is added for that counter and it is re-baselined. A warning is logged. This keeps the traffic since boot from being counted a second time.
+
+Device names in the central tables are never renamed. The previous Manager keyed them by the raw name, so a `metrics.db` can hold two spellings that normalize alike: `Triton` and `triton` after a collector was renamed, or two machines `lab-a` and `lab_a`. Both rows are kept unchanged, with their own snapshot and lifetime totals; both appear in `/api/devices` and `/api/totals`, and each is counted once in the global totals. Reads by exact name return that row. Data sent under a registered spelling goes to that row, as the previous Manager filed it; data under a spelling not registered yet (a collector renamed only in case or punctuation) goes to the alike spelling with the same device id (`header.device_id`, the collector's config `id`), else to the one seen most recently, whose counters are current. A new spelling whose device id differs from every alike registered row is another machine and gets its own row. The Manager logs a warning at startup for each such group. Both share one `data/<normalized name>/data.db`, so `DELETE /api/system/<name>` removes the central rows of that one spelling and keeps the shared `data.db` while another spelling is registered (the response lists it in `per_system_db_kept_for`); deleting the last spelling removes the `data.db` too.
+
+Clock checks: a message stamped more than 1 hour (`FUTURE_SLACK_SECONDS`) ahead of this server's clock, from a collector with a wrong clock, is stored in the history but does not move the device's `last_seen`, snapshot, per-user snapshot or network totals; a warning (`ahead of this server's clock`) is logged at most once an hour per device. A stored state timestamp that far ahead (the previous Manager kept whatever arrived) never holds back a current message, and the network totals then add `current − last` as usual.
 
 Unmeasured values are `null` everywhere, never `0`. Non-finite numbers (`NaN`, `Infinity`) are treated as unmeasured too.
 
@@ -119,7 +129,7 @@ All endpoints except `/health` require `Authorization: Bearer <token>`. Errors a
 | 404 | Unknown system (read endpoints never create directories or databases) |
 | 413 | Body larger than `max_request_bytes`, or more than `max_messages_per_request` messages that carry `msg_id` |
 
-Device names everywhere must match `^[A-Za-z0-9_.-]{1,64}$`.
+Device names everywhere must match `^[A-Za-z0-9_.-]{1,64}$`. One exception: a name that the previous Manager already registered (it accepted any name, such as `Lab PC`) is still accepted, exactly as registered, for ingest and reads, until the device is deleted with `DELETE /api/system/<name>`. A warning is logged once per Manager start. New devices with such names get `400`. A `collector_tokens` key must follow the pattern; for such a device, use the same name with `_` for the other characters (`Lab_PC`), since names are matched after normalization.
 
 ### Ingest
 
@@ -168,7 +178,7 @@ Device names everywhere must match `^[A-Za-z0-9_.-]{1,64}$`.
 }
 ```
 
-- `header.msg_id` identifies a message across retries. Messages without one (old collectors) get `legacy-` + sha1 of `name|data_type|timestamp|username`.
+- `header.msg_id` identifies a message across retries. Messages without one (old collectors) get `legacy-` + sha1 of `name|data_type|timestamp|username`. Every message whose `msg_id` isn't stored yet is also matched against rows the previous Manager stored (see [Storage](#per-system-history-datanamedatadb)).
 - `header.device_name` must match `name` (after normalization). The token must be allowed to write for `name`.
 - A message without a header `timestamp` is rejected.
 - Keys starting with `_` in `folder_usage` are metadata, not folders. A folder key that can't be stored (empty, or longer than 4096 characters) is dropped and listed, shortened, in that run's `_errors`; the rest of the scan is stored.
@@ -201,7 +211,7 @@ Device names everywhere must match `^[A-Za-z0-9_.-]{1,64}$`.
 
 The top-level `stored` is `stored + duplicate + rejected`, the number of messages durably handled. Old collectors delete their queue only when `stored` equals the number sent, so they keep draining. New collectors remove exactly the `msg_id`s with a final status.
 
-Each message is stored in its own transaction. One bad message never fails the batch.
+Each message is stored in its own transaction. One bad message never fails the batch. After the first `error` (a storage failure) the rest of the request is not attempted and is answered `error` too, so the collector keeps it and a locked database costs one wait per request, not one per message.
 
 ### Device Registry
 
@@ -284,7 +294,7 @@ Time series of one numeric field, oldest first. A volume path that lost its lead
 | Endpoint | Meaning |
 |----------|---------|
 | `GET /api/dead_letter?limit=100` | Most recent rejected messages with the reason and raw message |
-| `DELETE /api/system/<name>` | Permanently deletes the system's `data.db` and its central rows (registry, snapshot, totals, per-user rows). Any spelling of the name works. |
+| `DELETE /api/system/<name>` | Permanently deletes the system's central rows (registry, snapshot, totals, per-user rows) and its `data.db`. Any spelling of the name works: the row of exactly that spelling if one is registered, else the one it resolves to. If another registered spelling shares the `data.db` (see [Central summary](#central-summary-metricsdb)), only the named one's central rows go and the `data.db` is kept (`per_system_db_kept_for`). |
 
 ### Health
 
@@ -308,8 +318,25 @@ python archive_metrics.py --config config.json --days 365
 
 ## Upgrading from the previous Manager
 
+- **Rollout order: Dashboard, then Manager, then collectors.** The installer updates the Manager and the Dashboard together (one checkout), which is fine. Upgrade collectors only after the Manager:
+  - The new Manager accepts old collectors unchanged. They keep their `auth_tokens` token, and whatever they re-send that the previous Manager already stored comes back as `duplicate`.
+  - The previous Manager reads a new collector's `null` (unmeasured) network counter as 0. That resets its running total, so the next reading adds the whole counter again.
+  - A new collector set up with a `collector_tokens` token gets `401` from the previous Manager.
+  - The previous Dashboard shows the new `_scan_seconds` folder_usage key as a volume.
+  - The new Dashboard works with the previous Manager. The previous Dashboard works with the new Manager: its "All Available" chart sends no `max_points`, and the new Manager bucket-averages such window queries instead of cutting them off.
 - **Tokens:** placeholder or short tokens now stop the Manager from starting (exit code 2). Existing `auth_tokens` keep working. Move to scoped tokens when convenient: `collector_tokens` per device, `read_tokens` for the Dashboard, and `admin_tokens` for tools that delete systems.
-- **First start migrates databases in place:** each wide `folder_usage` table is copied to the narrow layout (old table kept as `folder_usage_legacy`), and `msg_id` columns are added to the existing tables. Back up `data_dir` first. On a large share the first open of each system takes a little longer.
+- **First start migrates databases in place, after taking a backup.**
+  - **What changes:** each wide `folder_usage` table is copied to the narrow layout and the old table is kept as `folder_usage_legacy`. `msg_id` columns are added to the existing history tables. `metrics.db` gains `dead_letter`, `device_totals.network_last_updated` (seeded from the time of the last counter reading, `device_snapshot.metrics_timestamp`, else `last_updated`) and `user_metrics_history.msg_id`. Existing rows are never rewritten or deleted.
+  - **Before the first change:** each database is copied with SQLite's online backup API to `data.db.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` or `metrics.db.pre-upgrade-<…>.bak` next to it, and the copy is logged. A copy is taken once per database: a database that already has the new schema gets none, and none is taken for new databases. A database that an earlier start already partly migrated gets no further copy (its first copy has the pre-upgrade layout), and neither does one whose data is unchanged since its last copy. Each copy is the size of its database, so check free space first. Delete the copies once you have checked the upgrade.
+  - **When it happens:** at startup, for every existing database, before the Manager starts listening. On a large or networked `data_dir` the first start takes longer.
+  - **If a copy fails** (disk full, permissions), that database is **not** migrated, and an error says why. Its data stays readable on the Dashboard and through the API. New messages for it get `error`, so collectors keep them queued. On the next write after 5 minutes the backup is tried again and, if it works, the migration runs. To migrate without a copy, set `"backup_before_migration": false`.
+  - **If the folder_usage copy fails** (another program holds the database open for writing, disk full), it is rolled back: the wide table stays and keeps serving the old folder history. New folder_usage messages for that system get `error` (collectors keep them) until the copy succeeds, on the next one after 5 minutes or at the next start; the narrow tables are never started next to an unmigrated wide table. Other data types are stored normally.
+- **Messages the previous Manager stored aren't stored twice when they are re-sent after the upgrade.** This covers old collectors' queues, upgraded collectors re-sending entries an old collector queued, messages a collector upgraded before the Manager delivered to the previous Manager (re-sent after a lost ACK, or by `tools/replay_archives.py`), and `tools/replay_archives.py --include-legacy`. They are matched to the previous Manager's rows by timestamp (and user name).
+- **Device names:** names the previous Manager registered keep working even if they fall outside the new pattern (see [API Endpoints](#api-endpoints)). If `metrics.db` holds two spellings of one device, both rows are kept with their own totals (see [Central summary](#central-summary-metricsdb)).
+- **Leftovers the previous Manager could produce stay readable:** per-user rows of a device removed with the old `DELETE /api/system/<name>` (it never removed them) are served by `/api/user_metrics/<name>` and `/api/user_metrics/history/<name>/<user>`; a `data/<name>/data.db` without a registry row is served under that name; a registry row without a directory still shows its card. A table the previous Manager made from a `data_type` the new rules refuse (e.g. `1wire_sensors`, starting with a digit) stays readable under that name and keeps receiving that label's messages in that database; no new table is ever made from such a label.
+- **Numeric folder_usage metadata** such as `_scan_seconds` (sent by an upgraded collector) is still charted through `/api/history/<system>/folder_usage/_scan_seconds`, for rows the previous Manager stored and new ones.
+- **Check before, roll back after:** `tools/verify_upgrade.py` compares the old and new Manager on copies of the real `data_dir` (nothing in it is written), and `tools/rollback_upgrade.py` restores the pre-upgrade backups (see `tools/README.md`).
+- **Network totals:** counters that drop while `uptime_seconds` shows no reboot no longer add the traffic since boot again (see [Central summary](#central-summary-metricsdb)).
 - **ACK:** responses gain `received`, `counts` and `results`. The top-level `stored` now also counts duplicates and rejected messages, which lets old collectors with stuck queues drain. Rejected messages are kept in `dead_letter`.
 - **CORS is off unless `cors_origins` is set.** Existing configs that list origins keep them.
 - **Large backlogs from old collectors:** an old collector posts its whole `queue.json` in one request and keeps all of it on any non-200 reply. If its queue grows past `max_request_bytes` (32 MiB by default, typically a few weeks of backlog; for example while the new Manager refused to start over a placeholder token), every run gets `413` and nothing from that device arrives. The Manager logs a warning with this remedy each time. Fix: raise `max_request_bytes` until the queue drains (it can take a few runs; a very large batch may outlast the collector's 30 s timeout, but it is stored anyway and the next run comes back as duplicates), or upgrade the collector, which sends batches of 100. The message-count cap never applies to old collectors.
@@ -325,15 +352,16 @@ python archive_metrics.py --config config.json --days 365
 
 - **Local `data_dir` (the default, `E:\Users\lab-monitor\data`):** the tasks run as the installing user through S4U, so no password is stored.
 - **`data_dir` or a `log_file` on a UNC path (`\\server\share\...`):** an S4U task has no network access and couldn't open the share. The installer detects this, asks for the account's password (or takes `-TaskCredential (Get-Credential)`), and registers the tasks with that stored password. The account needs access to the share. Re-run the installer after that password changes, or the tasks stop starting.
-- **Mapped drive letters (`Z:\...`):** scheduled tasks can't see drive mappings. The installer stops before changing anything and asks you to use the UNC path.
-- **Re-running the installer** keeps both config files. `-ForceNewConfig` regenerates only the tokens (the old files are backed up). `data_dir`, the log paths, retention, ports and the Dashboard login are kept.
+- **Mapped drive letters (`Z:\...`):** scheduled tasks can't see drive mappings. The installer stops before it installs packages, writes a config or touches a service, and asks you to use the UNC path.
+- **A config the new Manager refuses** stops the installer before it stops the running services or writes a config (`-IgnoreConfigCheck` overrides that).
+- **Re-running the installer** keeps both config files. `-ForceNewConfig` regenerates only the tokens (the old files are backed up). `data_dir`, the log paths, retention, ports and the Dashboard login are kept, but every existing token goes, `auth_tokens` and `collector_tokens` included: collectors get `401` until they have new ones.
 
 ---
 
 ## Troubleshooting
 
 **Manager exits immediately / Task Scheduler launcher stops:**
-Check `logs\manager-console.log`. Exit code 2 means the config was refused, usually a placeholder or short token. Run `python manager.py --config config.json --check-config`. If it keeps restarting with "unable to open database file" or a permission error on a `\\server\share` `data_dir`, the task has no network access; re-run the installer, which then asks for a password (see [Running from Task Scheduler](#running-from-task-scheduler)).
+Check `logs\manager-console.log`. Exit code 2 means the config was refused, usually a placeholder or short token. Run `python manager.py --config config.json --check-config`. Exit code 3 means another Manager already runs on this `data_dir` (the launcher retries every 60 s). If it keeps restarting with "unable to open database file" or a permission error on a `\\server\share` `data_dir`, the task has no network access; re-run the installer, which then asks for a password (see [Running from Task Scheduler](#running-from-task-scheduler)).
 
 **Collector keeps getting 413:**
 An old collector's queue has outgrown `max_request_bytes`. Raise it temporarily or upgrade the collector (see [Upgrading](#upgrading-from-the-previous-manager)).
@@ -351,7 +379,11 @@ The token belongs to a different device in `collector_tokens`, or it is a read t
 Check that the Manager is running, that the firewall allows port 5000, and that the Dashboard config has the correct `manager_url` and a read token.
 
 **"Database locked" errors:**
-Writers wait up to 10 s for each other. If you see persistent `error` statuses, make sure only one Manager instance is running.
+Writers wait up to 10 s for another process's lock. If a write still finds the database locked, later writes to that database wait only 0.1 s for the next 60 s (any successful write ends this early), so a database held locked for minutes doesn't tie up the Manager's threads; the messages come back `error` and stay in the collectors' queues. If you see persistent `error` statuses, make sure only one Manager instance is running and that no other program (for example a DB browser with unsaved changes) holds `data.db` or `metrics.db` open for writing.
 
 **Every message from one system comes back `error`:**
 The log says "Storage failure ... (kept for retry)". If the error is `DatabaseError: database disk image is malformed` or `file is not a database`, that system's `data/<name>/data.db` is damaged. Collectors keep their messages until it is fixed. Stop the Manager, move the file aside (or restore a backup, or try `sqlite3 data.db ".recover"`), and start it again. The queued messages are then stored.
+
+If the error says the database "needs a migration that is held back", its pre-upgrade backup failed. If it is `metrics.db`, every system is affected. The startup log says why (for example "No space left on device"). Free the space or fix the permissions; the backup is retried on the next write after 5 minutes, or at the next start. You can also set `"backup_before_migration": false`.
+
+**Restoring a pre-upgrade backup:** stop the Manager and run `python tools\rollback_upgrade.py --manager-config manager\config.json` (shows the plan), then again with `--apply`. For every database with a backup it renames the current file (and its `-wal` / `-shm`) to `<db>.post-upgrade-<stamp>` and puts the newest `.bak` in its place; nothing is deleted. By hand: move `data.db` and its `-wal` / `-shm` aside and copy the newest `data.db.pre-upgrade-<…>.bak` to `data.db`; the same for `metrics.db` (restore all databases together, they belong to one point in time). Run the old code on them, or start the new Manager again, which migrates the restored files again. Messages stored since the backup are in the moved-aside files and in the collectors' archives (`tools/replay_archives.py`).

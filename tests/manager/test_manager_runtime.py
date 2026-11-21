@@ -10,6 +10,8 @@ import time
 import urllib.error
 import urllib.request
 
+import pytest
+
 import manager as mgr
 from manager_helpers import (
     COLL_ATLAS, COLL_TRITON, READ, auth, base_config, make_msg, metrics_payload, post_queue,
@@ -158,3 +160,90 @@ def test_unreachable_data_dir_exits_1_with_hint(scratch):
     assert r.returncode == 1
     assert 'Cannot open data_dir' in r.stderr and 'network share' in r.stderr
     assert 'Traceback' not in r.stderr
+
+
+def _drop_our_handlers():
+    root = logging.getLogger()
+    for h in [h for h in root.handlers if getattr(h, '_lab_monitor', False)]:
+        root.removeHandler(h)
+        h.close()
+
+
+def test_second_manager_on_the_same_data_dir_refuses_to_start(scratch, data_dir):
+    """Two Managers must never share a data_dir: the second exits 3 (the launcher retries
+    later) before it opens, backs up or migrates any database."""
+    from storage_util import InstanceLock
+    holder = InstanceLock(data_dir).acquire()
+    try:
+        cfg_path = os.path.join(scratch, 'config.json')
+        with open(cfg_path, 'w') as f:
+            json.dump(base_config(data_dir, port=_free_port()), f)
+        script = os.path.join(os.path.dirname(mgr.__file__), 'manager.py')
+        r = subprocess.run([sys.executable, script, '--config', cfg_path],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 3, r.stderr
+        assert 'Another Manager is already running' in r.stderr
+        assert f'pid={os.getpid()}' in r.stderr              # names the holder
+        assert not os.path.exists(os.path.join(data_dir, 'metrics.db'))
+    finally:
+        holder.release()
+    # released (as when the holder exits): the next one gets it
+    InstanceLock(data_dir).acquire().release()
+
+
+def test_pid_file_is_written_before_the_databases_are_opened(scratch, data_dir, monkeypatch):
+    """The first start after an upgrade migrates before it listens: the PID file must already
+    name this process then (the installer and the restart tool find the Manager through it)."""
+    order = []
+    monkeypatch.setattr(mgr, 'write_pid_file', lambda: order.append('pid') or None)
+
+    def fake_init(config, logger=None):
+        order.append('init')
+        raise mgr.ConfigError('stop here')
+    monkeypatch.setattr(mgr, 'init_app', fake_init)
+    cfg_path = os.path.join(scratch, 'config.json')
+    with open(cfg_path, 'w') as f:
+        json.dump(base_config(data_dir), f)
+    monkeypatch.setattr(sys, 'argv', ['manager.py', '--config', cfg_path])
+    try:
+        with pytest.raises(SystemExit) as e:
+            mgr.main()
+    finally:
+        _drop_our_handlers()
+    assert e.value.code == 2 and order == ['pid', 'init']
+
+
+def test_unrotated_old_log_is_moved_out_of_the_rotation(scratch):
+    """The old Manager logged to one ever-growing manager.log. Rotating it would delete it after
+    log_backup_count more rotations, so it is set aside under a name rotation never touches."""
+    log_file = os.path.join(scratch, 'logs', 'manager.log')
+    os.makedirs(os.path.dirname(log_file))
+    old_text = 'old manager line\n' * 200                  # 3400 bytes > max_bytes below
+    with open(log_file, 'w') as f:
+        f.write(old_text)
+
+    # --check-config never touches the log file
+    cfg_path = os.path.join(scratch, 'config.json')
+    with open(cfg_path, 'w') as f:
+        json.dump(base_config(os.path.join(scratch, 'data'), log_file=log_file, log_max_bytes=1024), f)
+    script = os.path.join(os.path.dirname(mgr.__file__), 'manager.py')
+    r = subprocess.run([sys.executable, script, '--config', cfg_path, '--check-config'],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert os.listdir(os.path.dirname(log_file)) == ['manager.log']
+    with open(log_file) as f:
+        assert f.read() == old_text
+
+    # the first real start moves it aside, outside manager.log.1 .. .N
+    try:
+        mgr.setup_logging(log_file, 'INFO', max_bytes=1024, backup_count=2)
+        for i in range(100):
+            logging.getLogger('manager').info('new line %d %s', i, 'x' * 50)
+    finally:
+        _drop_our_handlers()
+    kept = [n for n in os.listdir(os.path.dirname(log_file)) if '.pre-rotation-' in n]
+    assert len(kept) == 1
+    with open(os.path.join(os.path.dirname(log_file), kept[0])) as f:
+        assert f.read() == old_text
+    with open(log_file + '.2') as f:                        # rotation ran, and left it alone
+        assert 'new line' in f.read()
