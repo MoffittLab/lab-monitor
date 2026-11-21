@@ -1,7 +1,7 @@
 {
   "host": "0.0.0.0",
   "port": 5000,
-  "data_dir": "E:\\Users\\lab-monitor\\data",
+  "data_dir": "E:\\Users\\lab-monitor\\manager-data",
 
   "admin_tokens": ["GENERATE-RANDOM-ADMIN-TOKEN"],
   "read_tokens": ["GENERATE-RANDOM-READ-TOKEN-FOR-DASHBOARD"],

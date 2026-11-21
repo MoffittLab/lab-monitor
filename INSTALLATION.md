@@ -271,8 +271,10 @@ Get-Content E:\Users\lab-monitor\logs\collector.log -Tail 20 -Wait
 **Edit the config later** (as Administrator):
 `notepad E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`
 
-On the Manager server itself (atlantis), the collector uses the same checkout and, by default, the
-same `data` folder as the Manager; see [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md).
+On the Manager server itself (atlantis), the collector uses the same checkout but its own data
+folder: the collector writes to `E:\Users\lab-monitor\data`, the Manager keeps its databases in
+`E:\Users\lab-monitor\manager-data` and snapshots them to the NAS each night (installer option
+`-SnapshotDir \\server\share\...`); see [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md).
 
 ---
 

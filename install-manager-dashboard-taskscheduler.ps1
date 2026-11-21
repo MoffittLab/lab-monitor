@@ -21,6 +21,15 @@
 #     are backed up next to them. auth_tokens and collector_tokens are REMOVED
 #     (it asks first): every collector gets HTTP 401 until it has a new token
 #     (-CollectorNames generates them).
+#
+# Data layout (one machine running the Manager and a collector):
+#   E:\Users\lab-monitor\manager-data   Manager databases (local disk, never a share)
+#   E:\Users\lab-monitor\data           the local collector's archive and queue
+#   -SnapshotDir \\server\share\...     nightly snapshot of manager-data (new configs;
+#                                       an existing config keeps its own settings)
+#   An existing config keeps its data_dir. If it is on a share or shared with the
+#   collector, the script prints how to move it (manager/README.md, "Moving data_dir").
+#
 #   - -AdminToken / -ReadToken let you supply your own tokens (>= 16 characters,
 #     not a placeholder). -ManagerToken (deprecated) is stored as a shared
 #     collector token allowed to write for ANY device ("*").
@@ -77,6 +86,7 @@ param(
     [string]$ManagerPort = "5000",
     [string]$DashboardPort = "5001",
     [System.Management.Automation.PSCredential]$TaskCredential,
+    [string]$SnapshotDir = "",
     [switch]$ForceNewConfig,
     [switch]$SkipGitPull,
     [switch]$IgnoreConfigCheck
@@ -108,7 +118,10 @@ Write-Host ""
 
 # Configuration
 $RootDir = "E:\Users\lab-monitor"
-$DataDir = "$RootDir\data"
+# The Manager's databases get their own local folder; "$RootDir\data" belongs
+# to a collector running on this machine (its archive and queue).
+$DataDir = "$RootDir\manager-data"
+$CollectorDataDir = "$RootDir\data"
 $LogsDir = "$RootDir\logs"
 $ScriptsDir = "$RootDir\scripts"
 $RepoDir = "$ScriptsDir\lab-monitor"
@@ -461,6 +474,13 @@ if ($ExistingManager -and -not $ForceNewConfig) {
             max_messages_per_request = 10000
             history_retention_days = $null
             backup_before_migration = $true
+            snapshot = [ordered]@{
+                enabled = [bool]$SnapshotDir
+                dest_dir = $(if ($SnapshotDir) { $SnapshotDir } else { $null })
+                time = "03:30"
+                keep_daily = 14
+                keep_monthly = 12
+            }
             log_file = "$LogsDir\manager.log"
             log_level = "INFO"
             debug = $false
@@ -468,6 +488,35 @@ if ($ExistingManager -and -not $ForceNewConfig) {
         $PendingManager = $ManagerConfig
         $CreatedManagerConfig = $true
         Write-Success "A new Manager config will be created (random admin + read tokens; written in step 10)"
+        if ($SnapshotDir) {
+            Write-Host "  Nightly snapshots at 03:30 to $SnapshotDir"
+        } else {
+            Write-Host "  Snapshots are off: the databases have no copy off this machine. Pass -SnapshotDir \\server\share\..." -ForegroundColor Yellow
+            Write-Host "  (or set snapshot.enabled / snapshot.dest_dir in manager\config.json)." -ForegroundColor Yellow
+        }
+    }
+}
+# Recommended layout: the Manager's data_dir on a local disk, in its own folder
+# (not on a share, not the local collector's folder). Existing configs are kept
+# as they are; this only says how to move.
+$EffectiveManager = $PendingManager
+if (-not $EffectiveManager) { $EffectiveManager = $ExistingManager }
+if ($EffectiveManager) {
+    $CurrentDataDir = [string]$EffectiveManager.data_dir
+    $Advice = @()
+    if ((Get-PathKind $CurrentDataDir) -ne "local") {
+        $Advice += "data_dir is on a network share ($CurrentDataDir). SQLite is not reliable there."
+    }
+    if ($CurrentDataDir.TrimEnd('\', '/') -ieq $CollectorDataDir) {
+        $Advice += "data_dir is the local collector's folder ($CollectorDataDir)."
+    }
+    if ($SnapshotDir -and $ExistingManager -and -not $CreatedManagerConfig) {
+        $Advice += "-SnapshotDir applies to new configs only; set snapshot.enabled / snapshot.dest_dir in manager\config.json."
+    }
+    if ($Advice.Count -gt 0) {
+        $Advice | ForEach-Object { Write-Host "  [NOTE] $_" -ForegroundColor Yellow }
+        Write-Host "  Recommended: data_dir = $DataDir (local) with nightly snapshots to the NAS." -ForegroundColor Yellow
+        Write-Host "  Kept as it is now; see manager\README.md, 'Moving data_dir off the NAS'." -ForegroundColor Yellow
     }
 }
 Write-Host ""

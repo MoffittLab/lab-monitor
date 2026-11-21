@@ -14,7 +14,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 {
   "host": "0.0.0.0",
   "port": 5000,
-  "data_dir": "E:\\Users\\lab-monitor\\data",
+  "data_dir": "E:\\Users\\lab-monitor\\manager-data",
 
   "admin_tokens": ["<random admin token>"],
   "read_tokens": ["<random read token for the Dashboard>"],
@@ -361,11 +361,23 @@ python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapsh
 3. Copy all databases from one snapshot folder into `data_dir`. They belong to one point in time, so copy them together.
 4. Start the Manager. Collectors still hold anything not yet acknowledged; messages acknowledged after the snapshot are in the collectors' JSONL archives (`tools/replay_archives.py`).
 
+### Recommended layout
+
+| Folder | What | Where |
+|---|---|---|
+| `E:\Users\lab-monitor\manager-data` | The Manager's `data_dir`: databases only | Local disk |
+| `E:\Users\lab-monitor\data` | A collector on the same machine (archive, queue) | Local disk |
+| `snapshot.dest_dir` | Nightly snapshots of `manager-data` | NAS share |
+
+The installer creates this for a new config (`-SnapshotDir \\server\share\...` turns snapshots on). At startup the Manager logs a `WARNING` for each way the config differs: `data_dir` on a network share, `data_dir` holding a collector's files, snapshots off, or `snapshot.dest_dir` on a local disk. Each warning says what to change. Nothing is moved automatically: an existing config keeps working as it is.
+
 ### Moving `data_dir` off the NAS
 
 1. Stop the Manager task and check that no `manager.py` is left running.
 2. Copy the whole old `data_dir` (with `-wal` / `-shm` files, while the Manager is stopped) to a local folder, e.g. `E:\Users\lab-monitor\manager-data`:
    `robocopy \\nas\share\old-data-dir E:\Users\lab-monitor\manager-data /E /COPY:DAT /R:1 /W:1`. Exit codes below 8 are success.
+   If the old `data_dir` is the local collector's shared `E:\Users\lab-monitor\data`, copy only the Manager's files (`metrics.db*`, `<system>\data.db*` including `.bak`, `<system>\archive\`) and leave the collector's `YYYY-MM.jsonl`, `queue.json*` and `network_snapshot.json` where they are:
+   `robocopy E:\Users\lab-monitor\data E:\Users\lab-monitor\manager-data metrics.db* data.db* /S /COPY:DAT /R:1 /W:1` (plus `archive\` folders if `history_retention_days` was used).
 3. In `manager\config.json` set `data_dir` to the local folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a `snapshots` folder next to the old data).
 4. Re-run the installer. It sees the UNC `dest_dir` and registers the tasks with a stored password, because an S4U task can't reach a share.
 5. Start the Manager. Check `/health` and the Dashboard, then `POST /api/snapshot` and `GET /api/snapshot` until `last_success` is set, and `snapshot.py verify` the new folder.
@@ -405,7 +417,7 @@ python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapsh
 
 `install-manager-dashboard-taskscheduler.ps1` registers the tasks "Lab Monitor Manager" and "Lab Monitor Dashboard". They start at boot, whether or not anyone is logged on, and restart on failure.
 
-- **Local `data_dir` (the default, `E:\Users\lab-monitor\data`):** the tasks run as the installing user through S4U, so no password is stored.
+- **Local `data_dir` (the default, `E:\Users\lab-monitor\manager-data`):** the tasks run as the installing user through S4U, so no password is stored.
 - **`data_dir`, a `log_file` or an enabled `snapshot.dest_dir` on a UNC path (`\\server\share\...`):** an S4U task has no network access and couldn't open the share. The installer detects this, asks for the account's password (or takes `-TaskCredential (Get-Credential)`), and registers the tasks with that stored password. The account needs access to the share. Re-run the installer after that password changes, or the tasks stop starting.
 - **Mapped drive letters (`Z:\...`):** scheduled tasks can't see drive mappings. The installer stops before it installs packages, writes a config or touches a service, and asks you to use the UNC path.
 - **A config the new Manager refuses** stops the installer before it stops the running services or writes a config (`-IgnoreConfigCheck` overrides that).
