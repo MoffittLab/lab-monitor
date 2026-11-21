@@ -11,6 +11,12 @@ DASHBOARD = restart.SERVICES[1]
 PY = 'C:\\ProgramData\\Miniconda3\\envs\\lab-monitor\\python.exe'
 
 
+@pytest.fixture(autouse=True)
+def _no_other_python(monkeypatch):
+    """By default the server runs no python besides the PID files' processes (tests override it)."""
+    monkeypatch.setattr(restart, 'python_processes', lambda client: [])
+
+
 @pytest.mark.parametrize('git_path', [
     'E:/Users/lab-monitor/scripts/lab-monitor',
     'E:\\Users\\lab-monitor\\scripts\\lab-monitor',
@@ -184,3 +190,26 @@ def test_http_answering_rules():
     assert restart.http_answering(DASHBOARD, 401)       # Basic auth enabled: still up
     assert not restart.http_answering(DASHBOARD, 502)
     assert not restart.http_answering(DASHBOARD, None)
+
+
+def test_kill_refuses_start_while_a_stray_manager_runs(monkeypatch, caplog):
+    """A manager.py the PID file does not name (e.g. still migrating after its task was ended,
+    or an OLD Manager) must stop the restart: two Managers must never share a data_dir."""
+    statuses = {
+        'Manager': _status(pid=100),
+        'Dashboard': _status(pid=200, cmd=f'"{PY}" app.py', script='app.py'),
+    }
+    monkeypatch.setattr(restart, 'get_status', lambda client, gp, svc: statuses[svc['label']])
+    monkeypatch.setattr(restart, 'run_powershell', lambda client, script, desc: ('RESULT: KILLED', '', 0))
+    stray = {'pid': 4242, 'name': 'python.exe', 'command_line': f'"{PY}" manager.py --config config.json'}
+    monkeypatch.setattr(restart, 'python_processes', lambda client: [stray])
+    ok, stopped = restart.kill_processes(None, 'E:/repo')
+    assert ok is False                                 # main() then does not start the tasks
+    assert stopped == {'Manager': 100, 'Dashboard': 200}
+    assert any('4242' in r.getMessage() and 'still runs manager.py' in r.getMessage() for r in caplog.records)
+
+    # an unrelated python process is no reason to refuse
+    other = {'pid': 7, 'name': 'python.exe', 'command_line': f'"{PY}" collector.py --mode metrics'}
+    monkeypatch.setattr(restart, 'python_processes', lambda client: [other])
+    ok, _stopped = restart.kill_processes(None, 'E:/repo')
+    assert ok is True

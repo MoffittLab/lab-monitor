@@ -9,7 +9,7 @@ The local JSONL archives are the source of truth: the backup can be sent
 back to the Manager at any time with tools/replay_archives.py (the Manager
 de-duplicates messages, so replaying is safe to repeat). Pass
 --include-legacy so the messages from before the collector's de-duplication
-upgrade are sent too — safe here because the system was wiped.
+upgrade are sent too (the Manager recognizes any it already holds).
 
 The Manager's DELETE /api/system/<name> endpoint needs an ADMIN token
 (manager config "admin_tokens"; a legacy "auth_tokens" token also works).
@@ -25,10 +25,17 @@ Usage:
 
 What it does:
     0. Check that the Manager is reachable and accepts the token for DELETE
-    1. Create a timestamped backup folder next to the existing archives
-    2. Move all YYYY-MM.jsonl archive files into the backup folder
-    3. Move queue.json (if present) into the backup folder
-    4. Send DELETE /api/system/<name> to the Manager
+    1. Take the collector's queue lock (queue.json.lock: flock on Linux/Synology,
+       the msvcrt byte lock on Windows - the locks the collector itself takes),
+       waiting up to 2 minutes for a running collector to release it. A
+       collector too old to have a queue.json.lock doesn't lock; the reset then
+       goes ahead with a warning (pause it first).
+    2. Create a timestamped backup folder next to the existing archives
+    3. Move all YYYY-MM.jsonl archive files into the backup folder
+    4. Move queue.json and any queue.corrupt-*.json (queues the collector set
+       aside as unreadable) into the backup folder; queue.json.lock is left in
+       place (it holds no data)
+    5. Send DELETE /api/system/<name> to the Manager
        - Deletes per-system history DB on the Manager
        - Clears this system from the central summary DB
 
@@ -39,14 +46,26 @@ What it does NOT touch:
 """
 
 import argparse
+import errno
 import json
 import os
 import shutil
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+
+try:
+    import fcntl          # POSIX
+except ImportError:       # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt         # Windows
+except ImportError:
+    msvcrt = None
 
 try:
     import requests
@@ -76,30 +95,129 @@ def find_queue(data_dir: str, name: str) -> Optional[str]:
     return queue_path if os.path.exists(queue_path) else None
 
 
+def find_corrupt_queues(data_dir: str, name: str) -> list:
+    """queue.corrupt-*.json files: queues (or entries) the collector set aside as unreadable."""
+    system_dir = os.path.join(data_dir, name)
+    if not os.path.isdir(system_dir):
+        return []
+    return sorted(str(p) for p in Path(system_dir).glob('queue.corrupt-*.json') if p.is_file())
+
+
+# How long to wait for a running collector to release queue.json.lock (it
+# holds it only for a read + write of queue.json, never during a send)
+QUEUE_LOCK_TIMEOUT_SECONDS = 120.0
+
+# Same errno sets as collector/lib/local_queue.py
+_LOCK_CONTENTION = frozenset(getattr(errno, n) for n in
+                             ('EAGAIN', 'EWOULDBLOCK', 'EACCES', 'EDEADLK', 'EDEADLOCK') if hasattr(errno, n))
+_LOCK_UNSUPPORTED = frozenset(getattr(errno, n) for n in
+                              ('ENOLCK', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS') if hasattr(errno, n))
+
+
+class QueueLockTimeout(Exception):
+    """A running collector kept queue.json.lock for longer than the timeout."""
+
+
+def _try_lock(fh):
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock(fh):
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass   # closing the file releases it anyway
+
+
+@contextmanager
+def queue_lock(system_dir: str, timeout: Optional[float] = None):
+    """
+    Hold the collector's queue lock while queue files are moved: an exclusive
+    lock on queue.json.lock, taken the way collector/lib/local_queue.py takes
+    it (flock on POSIX, msvcrt.locking on byte 0 on Windows), so a collector
+    run can't rewrite queue.json in the middle of the move.
+
+    Yields a status: 'held', or why the move goes ahead without the lock
+    (no queue.json.lock = a collector that predates queue locking; a
+    filesystem without lock support).  Raises QueueLockTimeout if a
+    collector keeps the lock for longer than `timeout` seconds.
+    """
+    if timeout is None:
+        timeout = QUEUE_LOCK_TIMEOUT_SECONDS
+    lock_path = os.path.join(system_dir, 'queue.json.lock')
+    if not os.path.exists(lock_path):
+        yield 'none (no queue.json.lock: the collector predates queue locking)'
+        return
+    if fcntl is None and msvcrt is None:   # pragma: no cover - no known platform
+        yield 'unavailable (no file locking on this platform)'
+        return
+    try:
+        fh = open(lock_path, 'a+b')
+    except PermissionError:
+        fh = open(lock_path, 'rb')   # flock / msvcrt.locking work on a read-only handle too
+    try:
+        deadline = time.monotonic() + timeout
+        status = 'held'
+        while True:
+            try:
+                _try_lock(fh)
+                break
+            except OSError as e:
+                if e.errno in _LOCK_UNSUPPORTED:
+                    status = f'unavailable (this filesystem has no file locking: {e})'
+                    break
+                if e.errno not in _LOCK_CONTENTION:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise QueueLockTimeout(
+                        f"{lock_path} is held by a running collector (waited {timeout:.0f}s)")
+                time.sleep(0.2)
+        try:
+            yield status
+        finally:
+            if status == 'held':
+                _unlock(fh)
+    finally:
+        fh.close()
+
+
 def backup_and_clear(data_dir: str, name: str) -> str:
     """
-    Move archives and queue into a timestamped backup folder.
-    Returns the backup folder path.
+    Move archives, queue.json and queue.corrupt-*.json into a timestamped
+    backup folder while holding the collector's queue lock (queue_lock).
+    queue.json.lock is left in place.  Returns the backup folder path.
+    Raises QueueLockTimeout (before anything is moved) if a collector keeps
+    the lock.
     """
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_dir = os.path.join(data_dir, name, f'backup_{timestamp}')
-    os.makedirs(backup_dir, exist_ok=True)
+    system_dir = os.path.join(data_dir, name)
+    with queue_lock(system_dir) as lock_status:
+        if lock_status != 'held':
+            print(f"  WARNING: moving the queue without the collector's queue lock: {lock_status}.")
+            print("           Make sure the collector is not running.")
 
-    archives = find_archives(data_dir, name)
-    queue    = find_queue(data_dir, name)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_dir = os.path.join(system_dir, f'backup_{timestamp}')
+        os.makedirs(backup_dir, exist_ok=True)
 
-    moved = []
-    for src in archives:
-        dst = os.path.join(backup_dir, os.path.basename(src))
-        shutil.move(src, dst)
-        moved.append(os.path.basename(src))
-        print(f"  Archived: {os.path.basename(src)} → backup_{timestamp}/")
+        moved = []
+        for src in find_archives(data_dir, name):
+            shutil.move(src, os.path.join(backup_dir, os.path.basename(src)))
+            moved.append(os.path.basename(src))
+            print(f"  Archived: {os.path.basename(src)} → backup_{timestamp}/")
 
-    if queue:
-        dst = os.path.join(backup_dir, 'queue.json')
-        shutil.move(queue, dst)
-        moved.append('queue.json')
-        print(f"  Archived: queue.json → backup_{timestamp}/")
+        queue = find_queue(data_dir, name)
+        for src in ([queue] if queue else []) + find_corrupt_queues(data_dir, name):
+            shutil.move(src, os.path.join(backup_dir, os.path.basename(src)))
+            moved.append(os.path.basename(src))
+            print(f"  Archived: {os.path.basename(src)} → backup_{timestamp}/")
 
     if not moved:
         print("  (no archive files or queue found)")
@@ -202,6 +320,7 @@ def main():
     # Inventory what will be affected
     archives = find_archives(data_dir, name)
     queue    = find_queue(data_dir, name)
+    corrupt  = find_corrupt_queues(data_dir, name)
     system_dir = os.path.join(data_dir, name)
 
     print()
@@ -218,6 +337,8 @@ def main():
             print(f"       - {os.path.basename(a)}")
     if queue:
         print(f"       - queue.json")
+    for c in corrupt:
+        print(f"       - {os.path.basename(c)}")
     print()
     print(f"  2. DELETE /api/system/{name} on Manager ({manager_url})")
     print(f"     - Deletes per-system history database")
@@ -256,7 +377,13 @@ def main():
 
     print()
     print("Step 1: Archiving local data...")
-    backup_dir = backup_and_clear(data_dir, name)
+    try:
+        backup_dir = backup_and_clear(data_dir, name)
+    except QueueLockTimeout as e:
+        print(f"ERROR: {e}.")
+        print("Nothing was changed. Retry when the collector run has finished, or pause it")
+        print(f"(\"active\": false in {args.config}) first.")
+        sys.exit(1)
     print(f"  Backup saved to: {backup_dir}")
     print()
 
@@ -276,9 +403,9 @@ def main():
         print(f"         or tools/toggle_collectors.py --mode off)")
         print(f"      2. python3 tools/replay_archives.py --config {args.config} --include-legacy \\")
         print(f"             --source {backup_dir}")
-        print(f"      3. Resume it (\"active\": true / --mode on) and run it once in metrics and")
-        print(f"         disk mode, so the dashboard card shows current values again (the")
-        print(f"         Manager shows the last message it stored, even an older replayed one)")
+        print(f"      3. Resume it (\"active\": true / --mode on). Pausing it during the replay")
+        print(f"         lets the lifetime network totals be rebuilt in order: the Manager adds")
+        print(f"         nothing for messages older than the newest network reading it has.")
     else:
         print(f"[PARTIAL] Local archives moved to backup, but Manager wipe failed.")
         print("  Check Manager logs and retry, or delete manually with an ADMIN token via:")

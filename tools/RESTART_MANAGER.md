@@ -88,7 +88,11 @@ python restart_manager_dashboard.py --csv collectors.csv --task "Lab Monitor Man
 6. **Stops verified processes** still running — right before `taskkill /PID N /F` the command line
    is checked again; then the tool waits for the process to exit. A process that went away when
    its task ended counts as stopped. If a verified process cannot be stopped, the tool does not
-   start new copies and exits with code 2.
+   start new copies and exits with code 2. Then it lists the python processes once more: if any
+   still runs `manager.py` (one the PID file did not name), it does not start the services either
+   and exits with code 2, because two Managers must never use one `data_dir` (`--start-only`
+   refuses the same way). The Manager writes its PID file before it opens any database, so a
+   Manager that is still migrating is found through it.
 7. **Starts the services** via Task Scheduler (`schtasks /run`) — the same tasks.
 8. **Verifies** — polls until, for both services, the PID file names a live python
    `manager.py` / `app.py` process (a different PID than the one just stopped) **and** the HTTP
@@ -144,14 +148,23 @@ the task names on the server and pass `--task`:
 schtasks /query | findstr "Lab Monitor"
 ```
 
-**"not verified" after restart** — Services can take a few seconds to start; raise
-`--verify-timeout` or check again with `--list-processes`. If the PID is alive but there is no HTTP
+**"not verified" after restart** — Services can take a few seconds to start; check again with
+`--list-processes`, and raise `--verify-timeout` next time. On the first start after an upgrade the
+Manager backs up and migrates its databases before it listens (it can take many minutes): don't
+run the tool again then, it would stop the Manager mid-migration (which then starts over); wait
+for `/health` instead. If the PID is alive but there is no HTTP
 response, check `E:\Users\lab-monitor\logs\manager.log` / `dashboard.log`; startup errors and
 tracebacks are in `manager-console.log` / `dashboard-console.log` (written by the launchers). The
 Manager launcher stops retrying when the Manager refuses its config (exit code 2, e.g. a
-placeholder token) — fix `manager\config.json` and run `--start-only`. If a leftover process
-still holds the port, the new one exits immediately — the "not in the PID file" warning from the
-stop step names it.
+placeholder token) — fix `manager\config.json` and run `--start-only`. It retries every 60 s on
+exit code 3: another Manager already holds the `data_dir` (`manager-console.log` names its PID).
+
+**"still runs manager.py after the stop" / "Not starting"** — a `manager.py` process that the PID
+file does not name is running (a Manager left running when its task ended, or an old Manager from
+before the upgrade, which takes no `data_dir` lock; on Windows a second server can share the port
+without an error). The tool refuses to start the services so that two Managers never use one
+`data_dir`. If it is a leftover Lab Monitor Manager, let it finish (a migration) or stop it
+(`taskkill /PID <pid> /F`), then run the tool again.
 
 **"command line unavailable"** — Windows hides other users' process command lines from
 non-elevated sessions. SSH in as a user in the Administrators group.

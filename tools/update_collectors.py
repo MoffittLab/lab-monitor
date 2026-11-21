@@ -8,6 +8,14 @@ upgrades pip and installs collector/requirements.txt (the same file the
 collector installers use) into the python_path environment. Without
 --upgrade-pip only the git pull runs.
 
+On Synology/Linux hosts the collector requirements are installed the way
+install-collector-synology.sh installs them: every package except psutil
+strictly (a failure fails the step), then psutil best-effort. psutil has no
+wheel for Synology armv7l and can't be compiled there; the collector then
+uses its /proc fallbacks, so a failed psutil install is only a warning.
+Windows hosts, and a --requirements file other than the default, are
+installed strictly with pip install -r.
+
 CSV format (one header row required):
     ip,username,password,git_path,python_path[,key_filename][,port]
     192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
@@ -45,6 +53,7 @@ Exit code: 0 all OK, 1 bad arguments/CSV, 2 one or more systems failed.
 """
 
 import argparse
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -131,11 +140,44 @@ def build_commands(row: dict, skip_pip: bool,
     if not skip_pip and python_path:
         # Upgrade pip, then install from the absolute requirements.txt path
         pip_upgrade = f'"{pp}" -m pip install --upgrade pip -q'
-        pip_install = f'"{pp}" -m pip install -r "{req_path}" -q'
+        if windows or req_rel != DEFAULT_REQUIREMENTS:
+            pip_install = f'"{pp}" -m pip install -r "{req_path}" -q'
+        else:
+            pip_install = _posix_collector_pip_install(pp, req_path)
         commands.append(('pip upgrade', pip_upgrade))
         commands.append(('pip install', pip_install))
 
     return commands
+
+
+# Packages the collector can run without (see collector/requirements.txt);
+# on POSIX hosts they are installed best-effort, like the Synology installer does
+BEST_EFFORT_PACKAGES = ('psutil',)
+
+
+def _posix_collector_pip_install(python_path: str, req_path: str) -> str:
+    """
+    POSIX sh command: install every requirement in req_path except the
+    BEST_EFFORT_PACKAGES strictly (exit 1 if that fails), then each
+    best-effort package on its own; a failure there prints a WARNING and
+    the step still succeeds.  Specs are read from the remote file (comments
+    and blank lines skipped), so the pins stay in collector/requirements.txt.
+    """
+    py, req = shlex.quote(python_path), shlex.quote(req_path)
+    names = '|'.join(BEST_EFFORT_PACKAGES)
+    optional = f"grep -iE '^({names})([^A-Za-z0-9_.-]|$)'"
+    specs = f"sed -e 's/#.*//' -e 's/[[:space:]]//g' {req} | grep -v '^$'"
+    return (
+        f'[ -r {req} ] || {{ echo "ERROR: requirements file not found:" {req} >&2; exit 1; }}; '
+        'set -f; '
+        f'strict=$({specs} | grep -viE \'^({names})([^A-Za-z0-9_.-]|$)\'); '
+        f'if [ -n "$strict" ]; then {py} -m pip install -q $strict || exit 1; fi; '
+        f'for spec in $({specs} | {optional}); do '
+        f'if {py} -m pip install -q "$spec"; then echo "$spec installed"; '
+        'else echo "WARNING: $spec could not be installed (no wheel for this CPU, e.g. Synology '
+        'armv7l, and no compiler); the collector uses its /proc fallbacks without it"; fi; '
+        'done'
+    )
 
 
 def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int,
@@ -255,7 +297,8 @@ def main():
                         help='Print commands without running them')
     parser.add_argument('--upgrade-pip', action='store_true',
                         help='Also upgrade pip and install the requirements file '
-                             '(default: git pull only)')
+                             '(default: git pull only). On Synology/Linux psutil is '
+                             'best-effort, as in the Synology installer')
     parser.add_argument('--requirements', default=DEFAULT_REQUIREMENTS, metavar='RELPATH',
                         help='Requirements file relative to git_path, used with --upgrade-pip '
                              f'(default: {DEFAULT_REQUIREMENTS})')

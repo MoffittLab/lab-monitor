@@ -22,9 +22,14 @@ def test_update_git_pull_only_by_default():
 
 
 def test_update_pip_uses_collector_requirements():
+    # POSIX collectors: the pins come from the remote collector/requirements.txt,
+    # psutil best-effort (see test_tools_update_pip.py)
     cmds = dict(update_collectors.build_commands(NAS, skip_pip=False))
-    assert cmds['pip install'] == ('"/volume1/miniconda/envs/lab-monitor/bin/python" -m pip install '
-                                   '-r "/volume1/lab-monitor/scripts/lab-monitor/collector/requirements.txt" -q')
+    assert cmds['pip install'].startswith('[ -r /volume1/lab-monitor/scripts/lab-monitor/collector/requirements.txt ]')
+    assert "/volume1/miniconda/envs/lab-monitor/bin/python -m pip install -q $strict" in cmds['pip install']
+    cmds = dict(update_collectors.build_commands(WIN, skip_pip=False))
+    assert cmds['pip install'] == ('"C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe" -m pip install '
+                                   '-r "E:/Users/lab-monitor/scripts/lab-monitor/collector/requirements.txt" -q')
 
 
 def test_update_requirements_override_and_windows_paths():

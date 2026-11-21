@@ -27,10 +27,19 @@ What it does:
     3. Reads the collector's config (config_tool.py) to find data_dir and system name
     4. Creates a timestamped backup folder <data_dir>/<name>/backup_YYYYMMDD_HHMMSS
     5. Moves all YYYY-MM.jsonl archive files into the backup folder
-    6. With --also-archive-queues, also MOVES queue.json into the same backup
+    6. With --also-archive-queues, also MOVES queue.json, and any
+       queue.corrupt-*.json the collector set aside, into the same backup
        folder, so messages still waiting to be sent are not sent (they remain in
        the backup and in the archives; send them later with
-       replay_archives.py --source <backup>/queue.json)
+       replay_archives.py --source <backup>/queue.json). The move happens while
+       holding the collector's queue lock (queue.json.lock), so it can't
+       interleave with a collector run updating the queue:
+         - Synology/Linux: with the flock command (util-linux or BusyBox); without
+           it the move goes ahead with a warning
+         - Windows: best effort, the same byte-range lock the collector takes
+       A collector too old to have a queue.json.lock doesn't lock at all; the
+       move then goes ahead with a warning (pause those collectors first).
+       queue.json.lock itself is never moved: it holds no data.
     7. Shows backup locations and file counts. Any failure (unreachable host,
        failed cd/mkdir/move, unexpected output) is reported as a failure.
 
@@ -84,6 +93,10 @@ CONFIRM_WORD = 'ARCHIVE'
 # Same pattern the Manager uses for device names; anything else is refused
 # before it gets near a remote shell command.
 _NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
+
+# How long to wait for a running collector to release queue.json.lock (it
+# only holds it for a read + write of queue.json, never during a send)
+QUEUE_LOCK_WAIT_SECONDS = 120
 
 
 def vprint(msg: str):
@@ -147,10 +160,48 @@ def _is_absolute(path: str, windows: bool) -> bool:
     return path.startswith('/')
 
 
+def _unix_queue_step(backup: str) -> str:
+    """
+    POSIX sh step: move queue.json and queue.corrupt-*.json into backup
+    (already shell-quoted) while holding the collector's queue lock.
+
+    The collector locks queue.json.lock with flock(2) (Python fcntl.flock);
+    the flock command takes the same lock on fd 9.  `flock -n` in a retry
+    loop works with both util-linux and BusyBox flock (BusyBox has no -w).
+    flock is first tried on /dev/null, so a flock that can't work at all (a
+    BusyBox built without the applet) means "no lock" rather than two
+    minutes of retries.  Prints QUEUE_LOCK:, QUEUE: and QUEUE_CORRUPT: lines.
+    """
+    move = (f'q=none; c=0; '
+            f'if [ -e queue.json ]; then mv queue.json {backup}/ || exit 1; q=moved; fi; '
+            f'for f in queue.corrupt-*.json; do '
+            f'if [ -e "$f" ]; then mv "$f" {backup}/ || exit 1; c=$((c+1)); fi; done; '
+            f'echo "QUEUE: $q"; echo "QUEUE_CORRUPT: $c"')
+    wait = QUEUE_LOCK_WAIT_SECONDS
+    # One { ...; } group, so it is a single link of the && chain
+    return (
+        '{ fl=; if command -v flock >/dev/null 2>&1; then '
+        'if ( flock -n 8 ) 8</dev/null >/dev/null 2>&1; then fl=1; fi; fi; '
+        'if [ -e queue.json.lock ]; then '
+        'if [ -n "$fl" ]; then '
+        f'( n=0; until flock -n 9; do n=$((n+1)); if [ $n -ge {wait} ]; then '
+        f'echo "ERROR: queue.json.lock is held by a running collector (waited {wait}s); '
+        f'nothing in the queue was moved" >&2; exit 75; fi; sleep 1; done; '
+        f'echo "QUEUE_LOCK: held"; {move} ) 9<queue.json.lock; '
+        'else '
+        f'echo "QUEUE_LOCK: unavailable (no working flock command)"; {move}; '
+        'fi; '
+        'else '
+        f'echo "QUEUE_LOCK: none (collector predates queue locking)"; {move}; '
+        'fi; }'
+    )
+
+
 def build_unix_command(system_dir: str, backup_folder: str, include_queue: bool) -> str:
     """
     Shell command (Synology/Linux) that moves the archives (and optionally
-    queue.json) into backup_folder inside system_dir.
+    queue.json and queue.corrupt-*.json, under the collector's queue lock)
+    into backup_folder inside system_dir.
 
     Steps are chained with && so a failed cd/mkdir/mv aborts the rest and
     gives a non-zero exit status; paths are shell-quoted.
@@ -166,10 +217,7 @@ def build_unix_command(system_dir: str, backup_folder: str, include_queue: bool)
         'echo "MOVED: $count"',
     ]
     if include_queue:
-        steps.append(
-            f'if [ -e queue.json ]; then mv queue.json {backup}/ && echo "QUEUE: moved"; '
-            'else echo "QUEUE: none"; fi'
-        )
+        steps.append(_unix_queue_step(backup))
     return ' && '.join(steps)
 
 
@@ -190,12 +238,46 @@ def build_windows_script(system_dir: str, backup_folder: str, include_queue: boo
         "    Write-Output \"MOVED: $count\"",
     ]
     if include_queue:
+        # Best effort: the collector locks byte 0 of queue.json.lock with
+        # msvcrt.locking (LockFile); FileStream.Lock takes the same lock.
         lines += [
-            "    if (Test-Path -LiteralPath 'queue.json') {",
-            "        Move-Item -LiteralPath 'queue.json' -Destination (Join-Path $backup 'queue.json')",
-            "        Write-Output 'QUEUE: moved'",
+            "    $lockPath = Join-Path (Get-Location).Path 'queue.json.lock'",
+            "    $lock = $null",
+            "    if (Test-Path -LiteralPath $lockPath) {",
+            f"        $deadline = (Get-Date).AddSeconds({QUEUE_LOCK_WAIT_SECONDS})",
+            "        while ($true) {",
+            "            try {",
+            "                $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)",
+            "                $lock.Lock(0, 1)",
+            "                break",
+            "            } catch {",
+            "                if ($lock) { $lock.Close(); $lock = $null }",
+            f"                if ((Get-Date) -gt $deadline) {{ throw 'queue.json.lock is held by a running collector (waited {QUEUE_LOCK_WAIT_SECONDS}s); nothing in the queue was moved' }}",
+            "                Start-Sleep -Milliseconds 500",
+            "            }",
+            "        }",
+            "        Write-Output 'QUEUE_LOCK: held'",
             "    } else {",
-            "        Write-Output 'QUEUE: none'",
+            "        Write-Output 'QUEUE_LOCK: none (collector predates queue locking)'",
+            "    }",
+            "    try {",
+            "        $q = 'none'",
+            "        if (Test-Path -LiteralPath 'queue.json') {",
+            "            Move-Item -LiteralPath 'queue.json' -Destination (Join-Path $backup 'queue.json')",
+            "            $q = 'moved'",
+            "        }",
+            "        $c = 0",
+            "        foreach ($f in @(Get-ChildItem -LiteralPath . -File | Where-Object { $_.Name -match '^queue\\.corrupt-.*\\.json$' })) {",
+            "            Move-Item -LiteralPath $f.FullName -Destination (Join-Path $backup $f.Name)",
+            "            $c++",
+            "        }",
+            "        Write-Output \"QUEUE: $q\"",
+            "        Write-Output \"QUEUE_CORRUPT: $c\"",
+            "    } finally {",
+            "        if ($lock) {",
+            "            try { $lock.Unlock(0, 1) } catch { }",
+            "            $lock.Close()",
+            "        }",
             "    }",
         ]
     lines += [
@@ -243,6 +325,21 @@ def parse_archive_output(out: str, include_queue: bool) -> tuple:
     if include_queue and queue_state not in ('moved', 'none'):
         return moved, queue_state, f"queue.json state unknown (output: {out[:200]!r})"
     return moved, queue_state, None
+
+
+def parse_queue_details(out: str) -> tuple:
+    """(corrupt files moved, lock state) from the QUEUE_CORRUPT:/QUEUE_LOCK: lines."""
+    corrupt, lock = 0, None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('QUEUE_CORRUPT:'):
+            try:
+                corrupt = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith('QUEUE_LOCK:'):
+            lock = line.split(':', 1)[1].strip()
+    return corrupt, lock
 
 
 def archive_collector(client, git_path: str, config: dict, timeout: float,
@@ -298,6 +395,11 @@ def archive_collector(client, git_path: str, config: dict, timeout: float,
     msg = f"Moved {moved} archive file(s) to {backup_folder}"
     if include_queue:
         msg += '; queue.json moved too' if queue_state == 'moved' else '; no queue.json present'
+        corrupt, lock = parse_queue_details(out)
+        if corrupt:
+            msg += f'; {corrupt} queue.corrupt-*.json file(s) moved too'
+        if lock and lock != 'held':
+            msg += f' (WARNING: moved without the queue lock: {lock})'
     result['ok'] = True
     result['message'] = msg
     return result

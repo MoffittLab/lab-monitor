@@ -9,25 +9,31 @@ collector sends its queue: {queue_id, name, id, messages}.
 
 Replaying is safe to repeat: the Manager de-duplicates on header.msg_id, so
 messages it already holds come back as "duplicate" and are not stored again.
-Messages are sent unchanged — this tool never adds a msg_id (a new random id
-would defeat that de-duplication).
+That includes messages an upgraded collector delivered to the previous
+Manager, which stored them without their msg_id: the Manager recognizes
+those rows by their natural key (see below). Messages are sent unchanged —
+this tool never adds a msg_id (a new random id would defeat the
+de-duplication of rows the Manager stored after its upgrade).
 
 Messages WITHOUT a msg_id (written before the collector's de-duplication
-upgrade) are skipped unless --include-legacy is given. The Manager derives an
-id for them, but the history rows it stored before it gained de-duplication
-carry no id, so replaying them into a Manager that still holds those rows
-stores them a second time. Use --include-legacy only for a system wiped by
-reset_system.py, or a Manager that never received that period.
+upgrade) are skipped unless --include-legacy is given. --include-legacy is
+safe on a live system too: the Manager derives an id for such messages, and
+it also recognizes the history rows it stored before it had de-duplication
+(they carry no id) by their natural key - the header timestamp, plus the user
+name for per-user rows - so messages it already holds come back as
+"duplicate" and only the missing ones are stored. A Manager too old to
+de-duplicate at all is detected first and refused (see --allow-duplicates).
 --since/--until limit the replay to a time window (header timestamps,
 ISO 8601, compared as text).
 
-Dashboard card: the Manager shows the last message it stored on the device
-card (metrics, disk, "last seen") whatever its timestamp, and its network
-totals skip messages older than the newest it has. Replaying older messages
-into a live system therefore rolls the card back. Pause the collector first
+Device card and totals: only a message at least as new as what the Manager
+holds updates the device card (metrics, disk, "last seen") and the disk total,
+so replaying older messages adds history without rolling the card back. The
+lifetime network totals skip messages older than the newest network reading
+(their traffic is already in the later counters). So to rebuild a system's
+totals after reset_system.py, pause the collector first
 (toggle_collectors.py --mode off, or "active": false in its config), replay,
-then resume it and run it once in metrics and disk mode
-(run_collectors.py --mode metrics / --mode disk) to show current values.
+then resume it.
 
 Typical uses:
     - After reset_system.py: rebuild the system from its backup folder
@@ -444,9 +450,8 @@ def print_read_summary(stats: ReadStats):
         print(f"  {stats.repeated} repeated msg_id(s) skipped")
     if stats.legacy:
         print(f"  {stats.legacy} message(s) without a msg_id (written before the collector's")
-        print("  de-duplication upgrade) skipped. Pass --include-legacy to send them, but only")
-        print("  to a system wiped by reset_system.py (or a Manager that never received them):")
-        print("  a Manager that still holds them would store them twice.")
+        print("  de-duplication upgrade) skipped. Pass --include-legacy to send them too; that is")
+        print("  safe on a live system: the Manager recognizes the ones it already holds.")
 
 
 def main():
@@ -472,8 +477,9 @@ def main():
                         help='Only messages with header timestamp < this (ISO 8601 prefix)')
     parser.add_argument('--retries', type=int, default=3, help='Retries per batch on transient failures (default 3)')
     parser.add_argument('--include-legacy', action='store_true',
-                        help='Also send messages without a msg_id (pre-upgrade). Only for a system '
-                             'wiped by reset_system.py: a Manager that holds them stores them twice')
+                        help='Also send messages without a msg_id (written before the de-duplication '
+                             'upgrade). Safe on a live system: the Manager recognizes the ones it '
+                             'already holds by timestamp (and user name)')
     parser.add_argument('--allow-duplicates', action='store_true',
                         help='Replay even to an old Manager without de-duplication')
     parser.add_argument('--dry-run', action='store_true', help='Read and count messages, send nothing')
@@ -552,9 +558,8 @@ def main():
     if not_delivered:
         print("  Some messages were not delivered — re-run to retry (already-stored ones are skipped).")
     if totals['stored']:
-        print("  If newer data already reached the Manager, its device card now shows the last")
-        print("  replayed message: resume the collector and run it once in metrics and disk mode")
-        print("  (run_collectors.py --mode metrics / --mode disk) to show current values.")
+        print("  Messages older than the Manager's newest network reading added history but")
+        print("  nothing to the lifetime network totals (their traffic is in the later counters).")
     print("=" * 60)
     sys.exit(2 if not_delivered else 0)
 

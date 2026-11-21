@@ -19,7 +19,11 @@ How the processes are found:
     (git_path is the server's row in collectors.csv). Before a PID is killed
     it is checked with Get-CimInstance Win32_Process: it must be a live python
     process whose command line runs manager.py / app.py. A stale PID file that
-    now points at some other process is reported and never killed.
+    now points at some other process is reported and never killed. The
+    Manager writes its PID file before it migrates databases on its first
+    start after an upgrade. After the stop, no python process may still run
+    manager.py (a leftover not named by the PID file): the tool then refuses
+    to start the services, because two Managers must never share a data_dir.
 
 How the restart is verified:
     Each service's PID file must name a live python manager.py / app.py
@@ -486,11 +490,33 @@ def kill_processes(client, git_path: str, tasks: Optional[list] = None) -> tuple
             logger.error(f"✗ Could not stop {label} PID {pid} ({result}): {out.strip()[:300]}")
             ok = False
 
+    # No manager.py may still run when the Manager is started again: two
+    # Managers on one data_dir must never happen.  The new Manager refuses a
+    # data_dir another one holds, but an older Manager takes no lock, and on
+    # Windows a second server can bind the same port (SO_REUSEADDR), so
+    # neither the lock nor the port stops it.
+    leftovers = manager_processes(client)
+    if leftovers:
+        ok = False
+        for p in leftovers:
+            logger.error(f"✗ python PID {p.get('pid')} still runs manager.py after the stop "
+                         f"(not the Manager named by the PID file, or it did not exit): "
+                         f"{p.get('command_line')}")
+        logger.error("  Not starting the Manager while it runs. If it is a leftover Lab Monitor "
+                     "Manager (for example one still migrating after its task was ended), let it "
+                     "finish or stop it (taskkill /PID <pid> /F), then run this tool again.")
+
     if stopped:
         logger.info(f"✓ Stopped {len(stopped)} process(es)")
     else:
         logger.warning("No processes were stopped.")
     return ok, stopped
+
+
+def manager_processes(client) -> list:
+    """python processes on the server that run manager.py: [{pid, name, command_line}]."""
+    return [p for p in python_processes(client)
+            if is_service_process(p.get('name'), p.get('command_line'), 'manager.py')]
 
 
 def find_tasks(client) -> list:
@@ -643,7 +669,17 @@ def main():
             if ok:
                 logger.info("Services stay stopped until started again (--start-only, or reboot).")
         elif args.start_only:
-            ok = start_processes(client, args.task)
+            mgr = get_status(client, git_path, SERVICES[0])
+            strays = [p for p in manager_processes(client)
+                      if not (mgr['matches'] and p.get('pid') == mgr.get('pid'))]
+            if strays:
+                ok = False
+                logger.error("✗ Not starting: manager.py runs as python PID(s) "
+                             f"{', '.join(str(p.get('pid')) for p in strays)}, which the PID file "
+                             "does not name; two Managers must never share a data_dir. Stop that "
+                             "process first (or use a full restart, which refuses the same way).")
+            else:
+                ok = start_processes(client, args.task)
             if ok:
                 time.sleep(3)
                 ok = verify_services(client, git_path, timeout=args.verify_timeout)

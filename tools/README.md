@@ -366,18 +366,21 @@ python3 replay_archives.py --manager-url http://atlantis.med.harvard.edu:5000 --
   `max_batch_messages` or 100) to `POST /api/data/queue` as `{queue_id, name, id, messages}`,
   per device (the Manager requires each message's device name to match the batch name).
 - **Safe to repeat:** the Manager de-duplicates on `header.msg_id`, so already-stored messages come
-  back as "duplicate". The tool never adds a `msg_id` itself.
+  back as "duplicate". The tool never adds a `msg_id` itself. History rows the previous Manager
+  stored have no `msg_id`; the upgraded Manager matches every message whose id it doesn't hold
+  against them by timestamp (plus the user name for per-user rows). So messages a collector
+  delivered to the previous Manager also come back as "duplicate", including those sent by a
+  collector upgraded before the Manager (the previous Manager dropped their ids).
 - **Messages without a `msg_id`** (written before the collector's de-duplication upgrade) are
-  **skipped by default**, with a count. The Manager's history rows from before *its* upgrade have no
-  message id either, so a Manager that still holds them would store them twice. Pass
-  `--include-legacy` only for a system wiped by `reset_system.py` (or a Manager that never
-  received that period). `--since` / `--until` limit the replay to a time window (header
-  timestamps, e.g. `--since 2026-08-04T07:00`).
-- **Dashboard card:** the Manager shows the *last stored* message on the device card (metrics, disk,
-  "last seen") whatever its timestamp, and its network totals skip messages older than the newest
-  it has. Replaying older data into a live system therefore rolls the card back. Pause the
-  collector first (`toggle_collectors.py --mode off`), replay, resume it (`--mode on`) and run
-  `run_collectors.py --mode metrics` and `--mode disk` to show current values again.
+  **skipped by default**, with a count. `--include-legacy` sends them too; that is safe on a live
+  system as well, because the same timestamp match recognizes the ones the Manager already holds.
+  `--since` / `--until` limit the replay to a time window (header timestamps, e.g.
+  `--since 2026-08-04T07:00`).
+- **Dashboard card:** only a message at least as new as what the Manager holds updates the device
+  card (metrics, disk, "last seen") and the disk total, so replaying older data adds history
+  without rolling the card back. The lifetime network totals skip messages older than the newest
+  network reading. To rebuild a system's totals after `reset_system.py`, pause the collector first
+  (`toggle_collectors.py --mode off`), replay, then resume it (`--mode on`).
 - Transient errors are retried (`--retries`, default 3); a batch the Manager says is too large
   (HTTP 413) is split in half.
 - Before sending, it checks that the Manager reports per-message results. An **old Manager without
@@ -394,7 +397,9 @@ python3 replay_archives.py --manager-url http://atlantis.med.harvard.edu:5000 --
 ### 6. `restart_manager_dashboard.py` — Restart Manager + Dashboard
 
 Stops and restarts the Manager and Dashboard on the Windows server, then verifies both are really
-up. See [RESTART_MANAGER.md](RESTART_MANAGER.md).
+up. It does not start the services while a `manager.py` process that the PID file does not name
+is still running (two Managers must never share a `data_dir`). See
+[RESTART_MANAGER.md](RESTART_MANAGER.md).
 
 ---
 
@@ -432,6 +437,160 @@ python3 config_tool.py --config local/config.json set active true --json
 - `2` — field not found (get only)
 
 **Used by:** `toggle_collectors.py` and `archive_all_collectors.py` call this remotely.
+
+---
+
+### 8. `verify_upgrade.py` — Prove Existing Data Survives the Upgrade (run on the Manager server)
+
+**Purpose:** before production switches to new Manager code, check that everything the old
+Manager stored (every history row, folder history, per-user history, lifetime network totals,
+device registry and snapshots) is still readable, unchanged, through the new Manager API and
+Dashboard. It runs the OLD Manager and the NEW Manager side by side on two copies of your real
+`data_dir` and compares them. **The live `data_dir` is only read, never written.**
+
+**Where to run it:** on the server that holds the databases (e.g. `E:\Users\lab-monitor\data`),
+with the same Python environment as the Manager and git installed. Run it from a **separate
+checkout of the new code**, so the running Manager keeps its code:
+
+```bat
+cd E:\Users\lab-monitor\scripts\lab-monitor
+git fetch
+git worktree add ..\lab-monitor-new origin/fix/review-findings
+cd ..\lab-monitor-new
+
+REM same python.exe the Manager task uses (see start-manager.bat)
+python tools\verify_upgrade.py --manager-config ..\lab-monitor\manager\config.json ^
+       --work-dir F:\verify --with-dashboard --report F:\verify\report.json
+```
+
+The OLD code comes from `git archive f086e7e` (the last commit before the upgrade; `--old-ref` to
+change it, or `--old-code DIR` with an extracted copy). The NEW code is the checkout the tool is
+in (`--new-code DIR` to test another one). Both are copied into the work directory, so PID files
+and logs never touch the installed copies.
+
+**Options:**
+
+| Option | Meaning |
+|--------|---------|
+| `--manager-config PATH` | the live Manager's `config.json`: `data_dir` is read from it, and the NEW Manager's `--check-config` is run on a copy of it (`config` FAILs if the new Manager would refuse to start, e.g. a placeholder token: see docs/UPGRADE.md, "Fix a refused token without downtime") |
+| `--data-dir PATH` | the live `data_dir` (instead of, or overriding, the config) |
+| `--work-dir PATH` | where the two copies, the code and the logs go (a new subdirectory is created; default: the temp dir). Needs about **4x the data_dir size** free (two copies, the new Manager's backups, the rollback check's restored databases); checked before anything is copied. Must not be inside the data_dir. |
+| `--report PATH` | JSON report (all checks, every difference with the request, old and new value) |
+| `--keep-work` | keep the copies and Manager logs afterwards (for inspection) |
+| `--with-dashboard` | also start the OLD and NEW Dashboards and compare `/api/data` and charts |
+| `--max-folders N` | folder keys per system charted through `/api/history` (default 200; `-1` = all). Volumes and totals are always included, and every folder value of every row is compared anyway through `/api/data`. The sample is listed in the report. |
+| `--window-cells N` | size of the time windows used to compare full histories (rows x columns, default 500000) |
+| `--dashboard-max-points N` | `max_points` of the "All Available" chart checks (default 2000, the Dashboard's `chart_max_points`); a series with more points is checked as a bucket-averaged chart |
+| `--old-history-windows` | also ask the OLD `/api/history` per field and window (slow on big data; by default the OLD answer is computed from the OLD Manager's rows of the same window, which is the same query) |
+| `--startup-timeout`, `--request-timeout` | seconds to wait for `/health` (300) and per request (1800) |
+| `--no-hash`, `--no-quick-check` | faster: skip per-table content hashes / `PRAGMA quick_check` |
+
+**How it keeps the live data safe:**
+- Every file in the `data_dir` is fingerprinted (size, mtime, sha256) before and after the run.
+- Databases are copied with SQLite's online backup API from a read-only source: opened
+  `immutable` when no process has them open; when a `-wal` file exists (the live Manager is
+  running, or was killed) the database and its `-wal` are first copied to a private staging
+  directory while their size/mtime stay stable; only if they keep changing is the live file read
+  through a read-only SQLite connection. Other files (`usage.jsonl`, ...) are copied with shutil.
+- Copy A (OLD Manager) and copy B (NEW Manager, which migrates it on its first start exactly as
+  production will be migrated) are made from the same snapshot.
+- While the live Manager keeps running, its database files change during the run; that is
+  reported as `WARN source` (the tool only reads them). For a strict byte-identical check, stop
+  the "Lab Monitor Manager" task while it runs; collectors keep queueing in the meantime.
+
+**What it checks** (each line of the summary is PASS / WARN / FAIL):
+
+| Check | Meaning |
+|-------|---------|
+| `source` | the live data_dir is unchanged |
+| `copies` | every database copied and passes `PRAGMA quick_check` |
+| `config` | the NEW Manager accepts your config (FAIL if it would refuse it: the upgraded Manager would not start) |
+| `storage` | in copy B after migration: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value |
+| `endpoints` | every read endpoint the Dashboard and tools use, OLD vs NEW, for every system: `/api/devices`, `/api/systems`, `/api/metrics/all`, `/api/usage/all`, `/api/totals`, `/api/user_metrics/*`, `/api/data/*` (every row of every table over the full time range), `/api/usage/*`, `/api/history/*` for every field and the sampled folders (tail query, full range, and the Dashboard's own "All Available" query) |
+| `devices` | every old device is in the new `/api/devices`, `/api/metrics/all`, `/api/usage/all`, `/api/totals` |
+| `totals` | lifetime network totals (and disk totals) identical per device, via the API and in the database |
+| `restart` | the NEW Manager restarted on the migrated copy: nothing migrated twice, every answer identical |
+| `ingest` | one new-format metrics + folder message per device: totals continue from the old values, the new point appears after the old history, a re-send is a duplicate. Two old spellings of one name (`Atlantis` / `ATLANTIS`): the message is sent under the most recently seen one, and the other rows must stay exactly as they were (data under a registered spelling goes to that row) |
+| `legacy-resend` | already-stored messages re-sent the way an OLD collector would (no `msg_id`), and again the way a collector upgraded before the Manager would (its own random `msg_id`, which the old Manager dropped), are acknowledged as duplicates, not stored twice. A scan the old Manager kept only in the device card (its history insert failed, e.g. a folder whose name differs only in case from another) is stored now |
+| `backups` | every database the NEW Manager altered has a `*.pre-upgrade-*.bak` copy with exactly the original content (a backup from an earlier attempt that the new Manager reused counts only if it holds the original) |
+| `files` | non-database files (`usage.jsonl`, ...) are byte-identical after the run |
+| `rollback` | `rollback_upgrade.py --apply` on the migrated copy B (after the new messages above): every database holds its original content again, and the OLD Manager started on it gives the same answers it gave before the upgrade |
+| `dashboard` | (`--with-dashboard`) the NEW Dashboard shows the same systems, metrics, folders and totals as the OLD one, and charts load; a chart longer than `--dashboard-max-points` must cover the whole old time range within one bucket, with every average inside the old values' range |
+
+Systems are taken from the device registry **and** from the `data_dir`: a `data/<name>/data.db`
+without a registry row (the old `DELETE /api/system/<name>` could leave one when Windows kept the
+file open), a registry row without a directory, and per-user rows of a deleted device are all
+compared too (listed under "Warnings").
+
+Only a documented list of **intended** differences is normalized away (timestamps compared as
+instants, fields the new Manager adds such as `msg_id`, NaN as null, `1234.0` = `1234`,
+unmeasured folder keys of the old wide table, generic error bodies, endpoints the old Manager
+could not serve, ...). The full list with the reason for each is `INTENDED` at the top of
+`verify_upgrade.py` and in the report under `intended_differences`, with how often each was
+applied. Anything else is reported under "Unexpected differences", grouped by endpoint, with the
+request, the old and the new value, and a likely cause.
+
+**Exit codes:** `0` PASS (no unexpected differences), `1` differences found (see the summary and
+the report), `2` the verification could not run (bad arguments, not enough space, a Manager that
+would not start; nothing was compared). On FAIL, re-run with `--keep-work` to inspect copy B and
+`logs\new-manager.log` in the work directory.
+
+**Run time:** roughly 5-10 minutes per GB of `data_dir` (one pass over every row on each Manager,
+plus the per-field chart queries); a progress line is printed per system.
+
+**After a PASS:** back up the `data_dir`, then upgrade in the order the Dashboard README gives
+(Dashboard, then Manager, then collectors). The new Manager keeps its own
+`*.pre-upgrade-*.bak` copies next to each database; keep them until you are sure you won't roll
+back (see `rollback_upgrade.py`), then delete them.
+
+---
+
+### 9. `rollback_upgrade.py` — Put the Pre-upgrade Databases Back (run on the Manager server)
+
+**Purpose:** go back to the old Manager after the upgrade. The new Manager copied every database
+it migrated to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` first; this restores those copies so the
+OLD code serves exactly the data it had. Standard library only; nothing is deleted.
+
+```bat
+REM 1. stop the Manager (and Dashboard): Task Scheduler -> End "Lab Monitor Manager", "Lab Monitor Dashboard"
+REM 2. see the plan (changes nothing)
+python tools\rollback_upgrade.py --manager-config manager\config.json
+REM 3. do it
+python tools\rollback_upgrade.py --manager-config manager\config.json --apply
+```
+
+For `metrics.db` and every `<system>\data.db` that has a backup: the newest backup that still has
+the old Manager's layout is chosen (a newer one that already has the new layout, a copy of a partly
+migrated database an earlier build of the new Manager could take, is skipped with a warning; if
+no backup has the old layout, the newest is used with a warning), checked
+(`PRAGMA quick_check`; if any fails, nothing is changed), copied next to the database, the current
+database and its `-wal` / `-shm` / `-journal` files are **renamed** to
+`<db>.post-upgrade-<stamp>` (+ `-wal` ...), and the copy becomes `<db>`. The `.bak` files stay.
+Databases without a backup (systems first seen after the upgrade) are left as they are and listed.
+A database that can't be renamed (still open) is left unchanged and the tool stops with exit 1;
+run it again once the cause is fixed.
+
+| Option | Meaning |
+|--------|---------|
+| `--manager-config PATH` | the Manager `config.json` (`data_dir`, and `port` for the "is a Manager running?" check) |
+| `--data-dir PATH` | the `data_dir` instead |
+| `--apply` | perform the rollback (without it: dry run) |
+| `--use-oldest` | restore the oldest backup of each database instead of the newest old-layout one |
+| `--force` | skip the check that no Manager answers `/health` on the configured port |
+
+Then start the OLD code: check out the commit you ran before (`git checkout f086e7e` in the
+installation, or whatever `git rev-parse HEAD` showed before upgrading) and start the two tasks
+again (the launchers `start-manager.bat` / `start-dashboard.bat` live outside the repository and
+start whichever code is checked out). The old Manager only accepts tokens listed in
+`auth_tokens`: restore `manager\config.json` and `dashboard\config.json` from the
+`config.json.bak-<date>` copies the installer made, or add the Dashboard's `manager_token` (and
+any upgraded collector's token) to `auth_tokens`. Messages received after the upgrade are in the
+`*.post-upgrade-*` files and in the collectors' archives.
+
+**Exit codes:** `0` rolled back (or the dry-run plan is ready), `1` a problem (bad backup, a file
+that could not be renamed), `2` refused (a Manager is running, bad arguments, no backups found).
+`verify_upgrade.py` runs this tool on its migrated copy (check `rollback`), so a PASS there means
+the rollback works on your data.
 
 ---
 
@@ -538,6 +697,8 @@ python3 run_collectors.py --csv collectors.csv --mode disk
 | `restart_manager_dashboard.py` | restarted and verified | CSV / SSH connection error | a stop, start or verification step failed |
 | `reset_system.py` | reset complete | bad config, token refused or Manager unreachable (nothing changed), confirmation declined | local backup done but Manager wipe failed |
 | `replay_archives.py` | all stored or already present | bad args, nothing to send, token refused | some messages not delivered |
+| `verify_upgrade.py` | PASS: no unexpected differences | differences found | could not run (bad args, space, a Manager did not start) |
+| `rollback_upgrade.py` | rolled back / plan ready (dry run) | bad backup or a file could not be renamed | refused: Manager running, bad args, no backups |
 
 `run_collectors.py`, `update_collectors.py` and `toggle_collectors.py` used to exit 0 even when a
 system failed; scripts that relied on that should check for 2.
