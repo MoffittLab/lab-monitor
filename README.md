@@ -66,6 +66,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full detail.
 1. Manager + Dashboard on the Windows server → `install-manager-dashboard-taskscheduler.ps1`
 2. Collector on each Synology NAS → `install-collector-synology.sh`
 3. Collector on each Windows server → `install-collector-windows.ps1`
+4. Collector on each Linux (Ubuntu/Debian) server → `install-collector-linux.sh`
 
 ---
 

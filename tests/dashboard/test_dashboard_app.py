@@ -430,6 +430,35 @@ def test_parse_folder_usage_skips_metadata_and_nulls():
     assert out['units'] == {'_unit': 'bytes'}
 
 
+def test_parse_folder_usage_linux_volumes_at_any_depth():
+    # A Linux collector: volumes from the mount table (/, /mnt/data), folders
+    # from scan_paths "/home/*" and "/*" (/data is a folder, not a volume)
+    raw = {
+        '_volumes': ['/', '/mnt/data'],
+        '/': 10, '/_total_bytes': 100, '/_free_bytes': 90,
+        '/mnt/data': 50 * 10**12, '/mnt/data_total_bytes': 100 * 10**12,
+        '/mnt/data_free_bytes': 50 * 10**12,
+        '/home/alice': 3000, '/data': 12345, '/scratch': 7,
+        'total_usage': 10 + 50 * 10**12,
+    }
+    out = dash.parse_folder_usage(raw)
+    assert [(v['path'], v.get('total_bytes')) for v in out['volumes']] == [
+        ('/', 100), ('/mnt/data', 100 * 10**12)]
+    assert [f['path'] for f in out['folders']] == ['/data', '/home/alice', '/scratch']
+
+
+def test_parse_folder_usage_capacity_marks_a_volume_without_volume_list():
+    # No "_volumes" (collector before it): a key with capacity is a volume at
+    # any depth; otherwise depth decides, as it always did
+    raw = {'/mnt/data': 5, '/mnt/data_total_bytes': 10, '/volume1': 3, '/volume1/Data': 2}
+    out = dash.parse_folder_usage(raw)
+    assert [v['path'] for v in out['volumes']] == ['/mnt/data', '/volume1']
+    assert [f['path'] for f in out['folders']] == ['/volume1/Data']
+    # A malformed "_volumes" is ignored, not trusted
+    out = dash.parse_folder_usage({**raw, '_volumes': 'oops'})
+    assert [v['path'] for v in out['volumes']] == ['/mnt/data', '/volume1']
+
+
 def test_parse_folder_usage_null_total_and_garbage():
     out = dash.parse_folder_usage({'total_usage': None, '/v1/a': 'abc', '/v1_total_bytes': None})
     assert out['total_usage_bytes'] is None

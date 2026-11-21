@@ -27,6 +27,15 @@ parse is moved aside to queue.corrupt-<timestamp>.json and logged — it is
 never treated as empty and overwritten. Every message is also in the
 permanent monthly archive.
 
+Untrusted files: queue.json, its lock and the archive are never opened
+through a symbolic link in their place (O_NOFOLLOW), and queue.json must be
+a regular file. A process that holds capabilities without being root (the
+Linux disk unit runs as labmon with CAP_DAC_READ_SEARCH, so it can read
+files labmon can't) also reads queue.json only if labmon owns it: otherwise
+anything running as labmon could plant a queue.json leading to a root-only
+file and have it copied into labmon's queue and sent to the Manager. A
+refused queue.json is moved aside unread to queue.untrusted-<timestamp>.json.
+
 Message IDs: every new message carries header.msg_id (uuid4 hex). Entries
 queued by older collectors lack one; the first time the queue is read they
 are given the same deterministic id the Manager derives for messages that
@@ -39,6 +48,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import tempfile
 import time
 import uuid
@@ -73,6 +83,78 @@ _LOCK_CONTENTION_ERRNOS = _errnos('EAGAIN', 'EWOULDBLOCK', 'EACCES', 'EDEADLK', 
 # "This filesystem can't lock at all" (e.g. NFS without lockd, some CIFS/FUSE)
 _LOCK_UNSUPPORTED_ERRNOS = _errnos('ENOLCK', 'EOPNOTSUPP', 'ENOTSUP', 'ENOSYS')
 _unlocked_warned = set()
+
+# 0 where the platform lacks them (Windows): plain open() behaviour there
+_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0)     # a planted FIFO must not block open()
+_O_BINARY = getattr(os, 'O_BINARY', 0)
+
+
+class UntrustedFileError(OSError):
+    """A queue file that must not be read: a symlink, not a regular file, or someone else's."""
+
+
+def _is_symlink_error(err: OSError) -> bool:
+    # open(O_NOFOLLOW) on a symlink: ELOOP on Linux, EMLINK on FreeBSD
+    return bool(_O_NOFOLLOW) and err.errno in (errno.ELOOP, getattr(errno, 'EMLINK', errno.ELOOP))
+
+
+def _holds_capabilities() -> bool:
+    """
+    True for a non-root process with effective Linux capabilities, i.e. one
+    that can read files its user can't (the disk unit: CAP_DAC_READ_SEARCH).
+    """
+    if not hasattr(os, 'geteuid') or os.geteuid() == 0:
+        return False
+    try:
+        with open('/proc/self/status', encoding='ascii', errors='replace') as f:
+            for line in f:
+                if line.startswith('CapEff:'):
+                    return int(line.split()[1], 16) != 0
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def read_trusted_file(path: str) -> bytes:
+    """
+    Read a file this collector wrote, refusing (UntrustedFileError) a
+    symlink in its place, anything but a regular file, and, in a process
+    holding capabilities (see _holds_capabilities), a file not owned by
+    this user. FileNotFoundError if it doesn't exist.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_BINARY)
+    except OSError as e:
+        if _is_symlink_error(e):
+            raise UntrustedFileError(e.errno, 'is a symbolic link', path)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UntrustedFileError(errno.EINVAL, 'is not a regular file', path)
+        if _holds_capabilities() and st.st_uid != os.geteuid():
+            raise UntrustedFileError(
+                errno.EPERM, f"is owned by uid {st.st_uid}, not by this user (uid {os.geteuid()}), "
+                f"and this process holds capabilities", path)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return b''.join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def open_for_append(path: str, encoding: str = 'utf-8'):
+    """open(path, 'a') that refuses (OSError) a symlink in path's place."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW | _O_BINARY, 0o666)
+    try:
+        return os.fdopen(fd, 'a', encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class QueueLockTimeout(TimeoutError):
@@ -175,13 +257,37 @@ class QueueLock:
 
 
 def _open_lock_file(lock_path: str):
-    """Open (creating if needed) the lock file. Its content is irrelevant; 'a+b' never truncates it."""
+    """
+    Open (creating if needed) the lock file. Its content is irrelevant; it is
+    opened for append, so it is never truncated. A symlink in its place is
+    removed (it is never followed) and a fresh lock file created.
+    """
+    for attempt in (1, 2):
+        try:
+            return _open_lock_fd(lock_path)
+        except OSError as e:
+            if attempt == 2 or not _is_symlink_error(e):
+                raise
+            logger.warning(f"{lock_path} is a symbolic link; removing it (lock files are never "
+                           f"opened through a link)")
+            os.unlink(lock_path)
+
+
+def _open_lock_fd(lock_path: str):
+    flags = _O_NOFOLLOW | _O_BINARY
     try:
-        return open(lock_path, 'a+b')
+        fd = os.open(lock_path, os.O_RDWR | os.O_APPEND | os.O_CREAT | flags, 0o666)
+        mode = 'a+b'
     except PermissionError:
         # Created by another account (e.g. a one-off run under sudo). flock and
         # msvcrt.locking work on a read-only handle as well.
-        return open(lock_path, 'rb')
+        fd = os.open(lock_path, os.O_RDONLY | flags)
+        mode = 'rb'
+    try:
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _warn_unlocked(lock_path: str, err: OSError):
@@ -293,6 +399,23 @@ def _sidecar_path(queue_path: str, kind: str) -> str:
     return candidate
 
 
+def quarantine_untrusted_queue(queue_path: str, reason: str, log: logging.Logger = None) -> str:
+    """
+    Move a queue.json that must not be read (see read_trusted_file) aside,
+    unread: renaming moves a symlink itself, never what it points to.
+    Raises OSError if it can't be moved.
+    """
+    log = log or logger
+    dest = _sidecar_path(queue_path, 'untrusted')
+    os.replace(queue_path, dest)
+    log.error(
+        f"queue.json was not read: {reason}. Moved it, unread, to {dest} and started a new "
+        f"queue. Only the collector itself should write in this directory; its messages are "
+        f"in the monthly archive files."
+    )
+    return dest
+
+
 def quarantine_corrupt_queue(queue_path: str, reason: str, log: logging.Logger = None) -> str:
     """
     Move an unparseable queue.json aside so it is neither lost nor re-read.
@@ -318,6 +441,8 @@ def load_queue(queue_path: str, log: logging.Logger = None) -> List[dict]:
     Read queue.json. Caller must hold QueueLock.
 
     - Missing file → [].
+    - A symlink, non-regular file, or (capability-holding process) a file
+      owned by another user → moved aside unread (quarantine_untrusted_queue) → [].
     - Unparseable / not a JSON list → quarantined (see above) → [].
     - Entries without header.msg_id get one (see legacy_msg_id), and the
       queue is rewritten so the id sticks across retries.
@@ -326,9 +451,11 @@ def load_queue(queue_path: str, log: logging.Logger = None) -> List[dict]:
     """
     log = log or logger
     try:
-        with open(queue_path, 'rb') as f:
-            raw = f.read()
+        raw = read_trusted_file(queue_path)
     except FileNotFoundError:
+        return []
+    except UntrustedFileError as e:
+        quarantine_untrusted_queue(queue_path, f"{queue_path} {e.strerror}", log)
         return []
 
     if not raw.strip():

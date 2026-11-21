@@ -351,11 +351,17 @@ def parse_folder_usage(raw: dict) -> dict:
         device_type, data_type, timestamp, total_disk_bytes, id, msg_id,
         first_seen, last_seen), "payload_<key>" (a payload key the Manager
         renamed because it collided with one of its columns), and every key
-        starting with "_" (_unit, _timed_out, _errors, ...)
-      - Leaf folders:  /volume1/JeffMoffitt  (depth > 1 after splitting on /)
-      - Volume roots:  /volume1              (depth == 1)
+        starting with "_" (_unit, _timed_out, _errors, _volumes, ...)
+      - Volume roots:  /volume1, E:, /, /mnt/data
+      - Leaf folders:  /volume1/JeffMoffitt, /home/alice, /data
       - Capacity:      /volume1_total_bytes, /volume1_free_bytes
       - Grand total:   total_usage
+
+    A key is a volume when the payload lists it in "_volumes" (collectors
+    since the Linux one) or has capacity keys for it. Only a payload with
+    no "_volumes" falls back to path depth (one component = volume), as
+    older collectors' /volumeN and E: always were. Depth alone can't tell a
+    Linux volume /mnt/data (depth 2) from a folder /data (depth 1).
 
     Null / NaN / non-numeric values mean "not measured" and are skipped
     (contract 4) - they are never reported as 0.
@@ -381,6 +387,10 @@ def parse_folder_usage(raw: dict) -> dict:
     volumes  = {}
     capacity = {}   # vol_path -> {'total_bytes': int, 'free_bytes': int}
     total    = None
+    sizes    = {}   # folder or volume key -> bytes, classified below
+    declared = raw.get('_volumes')
+    declared = ({str(v) for v in declared if v is not None}
+                if isinstance(declared, list) else None)
 
     for key, val in raw.items():
         # "_"-prefixed keys are metadata, never folders (contract 5)
@@ -403,8 +413,15 @@ def parse_folder_usage(raw: dict) -> dict:
             v = _to_int(val)
             if v is None:
                 continue
+            sizes[key] = v
 
-            # Classify: split on forward slash (normalise backslash too)
+    for key, v in sizes.items():
+        if key in capacity or (declared is not None and key in declared):
+            volumes[key] = v
+        elif declared is not None:
+            folders[key] = v       # e.g. /data from scan_paths "/*"
+        else:
+            # Older collector: split on forward slash (normalise backslash too)
             parts = [p for p in key.replace('\\', '/').split('/') if p]
             if len(parts) <= 1:
                 volumes[key] = v   # e.g. /volume1  or  E:

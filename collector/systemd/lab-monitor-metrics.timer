@@ -1,0 +1,13 @@
+# Starts lab-monitor-metrics.service every 5 minutes.
+[Unit]
+Description=Lab Monitor collector - system metrics every 5 minutes
+Documentation=file:///opt/lab-monitor/collector/README.md
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=10s
+Persistent=true
+Unit=lab-monitor-metrics.service
+
+[Install]
+WantedBy=timers.target

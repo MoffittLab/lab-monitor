@@ -799,7 +799,7 @@ function buildDiskHtml(d, sectionCls = '') {
     let volHtml = '';
     for (const vol of (d.volumes || [])) {
         const path     = String(vol.path ?? '');
-        const volLabel = path.replace(/^\//, '');  // strip leading slash
+        const volLabel = path.replace(/^\/(?=.)/, '');  // strip leading slash; Linux "/" stays "/"
         const used     = toNumber(vol.usage_bytes);
         const total    = toNumber(vol.total_bytes);
         if (total !== null && total > 0) {

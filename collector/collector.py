@@ -26,6 +26,8 @@ Configuration:
     If 'volumes' is omitted, collector auto-discovers volume* directories
     (Synology: /volume1, /volume2, etc.)
     (Windows: E:, F:, etc.)
+    (Linux: real filesystems from the mount table: /, /home, /data, ...)
+    The platform is detected (config "platform" overrides it).
 """
 import sys
 import os
@@ -51,6 +53,7 @@ if _COLLECTOR_DIR not in sys.path:
     sys.path.append(_COLLECTOR_DIR)
 
 from lib import local_queue
+from lib import disk_usage
 from lib.disk_usage import (discover_folders, discover_volumes, format_bytes,
                             measure_volume_capacity, scan_folders)
 
@@ -87,6 +90,11 @@ _REMOVE_FLUSH_EVERY = 10
 
 # Template values that mean the token was never filled in
 _PLACEHOLDER_MARKERS = ('CHANGE-ME', 'YOUR-', 'GENERATE-RANDOM', 'SAME-TOKEN')
+
+# Linux defaults (install-collector-linux.sh sets both explicitly).
+# 'Server' is the device type the Dashboard groups under "Servers".
+DEFAULT_LINUX_DATA_DIR = '/var/lib/lab-monitor'
+_DEFAULT_DEVICE_TYPES = {'linux': 'Server'}
 
 
 class _MultiProcessRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -196,14 +204,33 @@ def build_header(name: str, system_id: str, device_type: str) -> dict:
     }
 
 
+def get_platform(config: dict) -> str:
+    """
+    'synology', 'linux' or 'windows': config "platform" when set, otherwise
+    detected (Windows; Synology when a DSM marker file such as
+    /etc/synoinfo.conf exists; any other host is 'linux').
+    """
+    override = config.get('platform')
+    if override is not None:
+        value = str(override).strip().lower()
+        if value in disk_usage.PLATFORMS:
+            return value
+        logger.warning(f"Invalid platform {override!r} in config (expected one of "
+                       f"{', '.join(disk_usage.PLATFORMS)}); detecting it instead")
+    return disk_usage.detect_platform()
+
+
 def get_data_dir(config: dict) -> str:
     """Get or create data directory from config"""
     if sys.platform == 'win32':
         # Windows
         data_dir = config.get('data_dir', 'data')
+    elif 'data_dir' in config:
+        data_dir = config['data_dir']
     else:
         # Synology/Linux
-        data_dir = config.get('data_dir', '/volume1/lab-monitor/data')
+        data_dir = (DEFAULT_LINUX_DATA_DIR if get_platform(config) == 'linux'
+                    else '/volume1/lab-monitor/data')
     
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
@@ -231,7 +258,7 @@ def append_to_archive(archive_path: str, entry: dict, logger: logging.Logger) ->
     """Append entry to monthly JSONL archive"""
     try:
         os.makedirs(os.path.dirname(archive_path), exist_ok=True)
-        with open(archive_path, 'a') as f:
+        with local_queue.open_for_append(archive_path) as f:   # never through a symlink
             f.write(json.dumps(entry) + '\n')
         return True
     except Exception as e:
@@ -256,12 +283,24 @@ def _cfg_number(config: dict, key: str, default, minimum=None, integer: bool = F
         return default
 
 
+def _cfg_bool(config: dict, key: str, default: bool) -> bool:
+    """Read a true/false config value; fall back to default (with a warning) if it's not a boolean."""
+    raw = config.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    logger.warning(f"Invalid {key}={raw!r} in config (expected true or false); using {default!r}")
+    return default
+
+
 def _identity(config: dict, logger: logging.Logger):
     """Return (name, system_id, device_type) from config, or None if 'name' is missing."""
     # Support both 'name' and old 'nas_name' for backward compatibility
     name = config.get('name') or config.get('nas_name')
     system_id = config.get('id') or config.get('nas_id')
-    device_type = config.get('device_type', 'unknown')  # Default to 'unknown' if not specified
+    # Default: 'Server' on Linux, else 'unknown'
+    device_type = config.get('device_type') or _DEFAULT_DEVICE_TYPES.get(get_platform(config), 'unknown')
 
     if not name:
         logger.error("Config missing 'name' field (or old 'nas_name'). Update config.json.")
@@ -413,7 +452,13 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
         timed_out.extend(result['timed_out'])
         errors.extend(result['errors'])
 
-    if not scan_paths:
+    if not scan_paths and nas_type == 'linux':
+        # One level deep in "/" would walk /usr, /var, /home ... as one folder each
+        logger.warning(
+            "No scan_paths configured: reporting volume capacity only. To measure folders, "
+            "set scan_paths in the config, e.g. [\"/home/*\", \"/data/*\"]."
+        )
+    elif not scan_paths:
         # Legacy fallback: one level deep in each volume
         logger.info("No scan_paths configured — falling back to one level deep in each volume.")
         for vol in volumes:
@@ -449,6 +494,12 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
                         root = root[:-2]  # Remove the / + asterisk (in case normpath didn't convert)
                     root = os.path.normpath(root)
                     logger.info(f"Scanning subfolders of: {root}")
+                    # Checked before any stat(): e.g. an NFS /home (dead server = hang)
+                    refusal = disk_usage.scan_root_refusal(root)
+                    if refusal:
+                        logger.error(f"Not scanning {spec}: {refusal} (reported in _errors)")
+                        errors.append(root)
+                        continue
                     if not os.path.isdir(root):
                         logger.warning(f"Glob root does not exist or is not a directory: {root} (reported in _errors)")
                         errors.append(root)
@@ -468,6 +519,11 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
                 else:
                     # Single-folder mode: measure this path as one total
                     logger.info(f"Measuring folder: {spec_normalized}")
+                    refusal = disk_usage.scan_root_refusal(spec_normalized)
+                    if refusal:
+                        logger.error(f"Not scanning {spec}: {refusal} (reported in _errors)")
+                        errors.append(spec_normalized)
+                        continue
                     if not os.path.isdir(spec_normalized):
                         logger.warning(f"Scan path does not exist or is not a directory: {spec_normalized} (reported in _errors)")
                         errors.append(spec_normalized)
@@ -504,6 +560,22 @@ def _default_total_timeout(timeout: float, entries: int, windows: bool) -> float
     return max(TOTAL_TIMEOUT_MULTIPLIER, entries) * timeout
 
 
+def _scan_policy(config: dict, nas_type: str):
+    """
+    Folder-scan rules for this platform (see disk_usage.ScanPolicy).
+
+    "cross_filesystems" (default false on Linux, true elsewhere, which keeps
+    the Synology/Windows behaviour): when false, measuring a folder never
+    descends into another filesystem or mount point below it (du -x).
+    "include_network_mounts" (default false): auto-discover nfs/cifs mounts
+    as volumes and let scans enter them.
+    """
+    cross = _cfg_bool(config, 'cross_filesystems', nas_type != 'linux')
+    include_network = _cfg_bool(config, 'include_network_mounts', False)
+    return disk_usage.ScanPolicy(nas_type, one_filesystem=not cross,
+                                 include_network=include_network)
+
+
 def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     """
     Collect disk usage (daily mode).
@@ -525,7 +597,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
     scan_paths = config.get('scan_paths', [])
     timeout    = _cfg_number(config, 'timeout_seconds', DEFAULT_TIMEOUT_SECONDS, minimum=1)
     # Note: legacy 'scan_depth' parameter is ignored; use 'scan_paths' instead
-    nas_type   = 'synology' if sys.platform != 'win32' else 'windows'
+    nas_type   = get_platform(config)
 
     try:
         # If legacy scan_depth is present, it's ignored (scan_paths takes precedence)
@@ -538,9 +610,11 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         #    Auto-discover if omitted. Measured first so it is always sent,
         #    however the folder scan goes.
         # ------------------------------------------------------------------
+        policy = _scan_policy(config, nas_type)
         if not volumes:
             logger.info("No volumes specified — auto-discovering...")
-            volumes = discover_volumes(nas_type)
+            volumes = discover_volumes(nas_type, mounts=policy.mounts,
+                                       include_network=policy.include_network)
             if volumes:
                 logger.info(f"Auto-discovered volumes: {volumes}")
             else:
@@ -560,8 +634,9 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         # ------------------------------------------------------------------
         # 2. Folder usage — driven by 'scan_paths' (see _measure_scan_paths).
         # ------------------------------------------------------------------
-        scan = _measure_scan_paths(scan_paths, volumes, volume_used, nas_type,
-                                   timeout, total_timeout, logger)
+        with disk_usage.scan_policy(policy):
+            scan = _measure_scan_paths(scan_paths, volumes, volume_used, nas_type,
+                                       timeout, total_timeout, logger)
         if scan['timed_out'] or scan['errors']:
             logger.warning(
                 f"Disk scan incomplete: {len(scan['timed_out'])} folder(s) timed out, "
@@ -579,6 +654,9 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 # Sum of the measured volumes; null if no volume could be measured
                 'total_usage':   sum(volume_used.values()) if volume_used else None,
                 # Metadata ('_' prefix = never a folder)
+                # Which keys are volumes: on Linux a volume can be /mnt/data
+                # and a folder /data, so path depth can't tell them apart
+                '_volumes':      list(volume_used),
                 '_timed_out':    scan['timed_out'],
                 '_errors':       scan['errors'],
                 '_scan_seconds': scan['seconds'],
@@ -1078,6 +1156,40 @@ def _build_exclude_patterns(config: dict) -> list:
     return default_excludes + config.get('exclude_users', [])
 
 
+# Linux accounts. UID_MIN (first UID of a regular login account) comes from
+# /etc/login.defs; useradd --system allocates daemon accounts (labmon,
+# systemd-resolve, nvidia-persistenced, ...) below it.
+LOGIN_DEFS = '/etc/login.defs'
+DEFAULT_UID_MIN = 1000
+OVERFLOW_UID = 65534     # 'nobody' (also every unmapped UID seen from inside a user namespace)
+
+
+def _uid_min() -> int:
+    """UID_MIN from /etc/login.defs, or 1000 (the shadow-utils default) if it isn't set or readable."""
+    try:
+        with open(LOGIN_DEFS) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == 'UID_MIN':
+                    value = int(parts[1])
+                    if value > 0:
+                        return value
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return DEFAULT_UID_MIN
+
+
+def _is_system_uid(uid: int, uid_min: int) -> bool:
+    """A daemon account's UID: 1..UID_MIN-1, or nobody. root (0) is not one (see _seed_user_processes)."""
+    return 0 < uid < uid_min or uid == OVERFLOW_UID
+
+
+def _real_uid(uids) -> Optional[int]:
+    """The real UID from psutil's uids (real, effective, saved) - the one psutil's username names."""
+    real = getattr(uids, 'real', None)
+    return real if isinstance(real, int) and not isinstance(real, bool) else None
+
+
 def _seed_user_processes(config: dict) -> list:
     """
     First pass: iterate all user processes, call cpu_percent() once (returns 0 —
@@ -1086,18 +1198,52 @@ def _seed_user_processes(config: dict) -> list:
     The caller must wait at least ~1 second before calling get_per_user_stats()
     so that psutil can accumulate a meaningful CPU delta between the seed call
     and the real measurement call.
+
+    Not counted, besides exclude_users and the Windows defaults:
+      - the collector itself: its own process, and on Linux every process of
+        its service account when that is a system account (UID below
+        UID_MIN). That is also the daily disk scan, which runs as the same
+        'labmon' for up to the total_timeout_seconds budget. On Windows both
+        run as SYSTEM, which the default excludes hide.
+      - on Linux ("exclude_system_accounts", default true there; false on
+        Synology, which keeps its old behaviour): processes of daemon
+        accounts, i.e. UID 1..UID_MIN-1 or nobody (65534) with an account
+        name on this host - systemd-resolve, messagebus, nvidia-persistenced,
+        ... - the counterpart of the NT AUTHORITY\\* / NT SERVICE\\* defaults.
+        root stays visible: docker containers and sudo jobs, real workloads on
+        a GPU server, run as root. A UID without an account here (psutil
+        reports it as the number, e.g. a container's own user) is shown too.
     """
     try:
         import psutil
         import fnmatch
 
         exclude_patterns = _build_exclude_patterns(config)
+        own_pid = os.getpid()
+        posix = not sys.platform.startswith('win')
+        attrs = ['pid', 'username', 'memory_info']
+        hide_system = skip_uid = None
+        if posix:
+            attrs.append('uids')        # not a valid attribute name on Windows
+            uid_min = _uid_min()
+            hide_system = _cfg_bool(config, 'exclude_system_accounts', get_platform(config) == 'linux')
+            own_uid = os.getuid() if hasattr(os, 'getuid') else None
+            if own_uid is not None and _is_system_uid(own_uid, uid_min):
+                skip_uid = own_uid
         seeded = []
-        for proc in psutil.process_iter(['pid', 'username', 'memory_info']):
+        for proc in psutil.process_iter(attrs):
             try:
+                if proc.info.get('pid', getattr(proc, 'pid', None)) == own_pid:
+                    continue
                 username = proc.info.get('username') or ''
                 if not username:
                     continue
+                if posix:
+                    uid = _real_uid(proc.info.get('uids'))
+                    if uid is not None and (
+                            uid == skip_uid
+                            or (hide_system and _is_system_uid(uid, uid_min) and username != str(uid))):
+                        continue
                 username_lower = username.lower()
                 if any(fnmatch.fnmatch(username_lower, p.lower()) for p in exclude_patterns):
                     continue
@@ -1125,9 +1271,14 @@ def get_per_user_stats(config: dict, logger: logging.Logger,
     will produce 0% CPU — callers should always pass seeded_procs.
 
     Each entry: {username, cpu_percent, ram_bytes, ram_formatted}
+    Without psutil there are no per-user metrics: [] (logged, not an error).
     """
     try:
         import psutil
+    except ImportError:
+        logger.info("psutil is not installed: per-user CPU/RAM metrics are not collected")
+        return []
+    try:
         from collections import defaultdict
         import fnmatch
 
@@ -1182,11 +1333,53 @@ def get_per_user_stats(config: dict, logger: logging.Logger,
         return []
 
 
-def _nvml_or_none(fn, *args):
-    """Call an NVML query; None if this GPU/driver doesn't support it."""
+# NVML return codes (nvml.h) that get a specific explanation in the log
+_NVML_ERROR_NOT_SUPPORTED     = 3
+_NVML_ERROR_NO_PERMISSION     = 4
+_NVML_ERROR_DRIVER_NOT_LOADED = 9
+_NVML_ERROR_LIBRARY_NOT_FOUND = 12
+_NVML_ERROR_GPU_IS_LOST       = 15
+_NVML_ERROR_VERSION_MISMATCH  = 18   # NVML_ERROR_LIB_RM_VERSION_MISMATCH
+
+_NVML_INIT_HINTS = {
+    _NVML_ERROR_LIBRARY_NOT_FOUND:
+        "The NVIDIA driver's NVML library (libnvidia-ml.so.1 / nvml.dll) was not found: "
+        "is the NVIDIA driver installed?",
+    _NVML_ERROR_DRIVER_NOT_LOADED:
+        "The NVIDIA kernel driver is not loaded, or /dev/nvidiactl cannot be opened "
+        "(device permissions, or a service sandbox: see 'GPU servers' in the collector README).",
+    _NVML_ERROR_NO_PERMISSION:
+        "No permission to open the NVIDIA devices (/dev/nvidia*): see 'GPU servers' in the "
+        "collector README.",
+    _NVML_ERROR_VERSION_MISMATCH:
+        "The NVIDIA kernel module and the NVML library are different versions, usually after "
+        "a driver upgrade without a reboot: reboot.",
+}
+
+
+def _nvml_error_text(e: Exception) -> str:
+    """'Insufficient Permissions (NVML error 4)' for an NVMLError, str(e) otherwise."""
+    try:
+        text = str(e)
+    except Exception:
+        text = type(e).__name__
+    code = getattr(e, 'value', None)
+    return f"{text} (NVML error {code})" if isinstance(code, int) else text
+
+
+def _nvml_or_none(fn, *args, problems: Optional[list] = None, what: str = ''):
+    """
+    Call an NVML query; None if this GPU/driver can't answer it. A failure
+    other than "not supported" (normal for e.g. power on some GPUs) is added
+    to `problems` as "what: error" so the caller can log it.
+    """
     try:
         return fn(*args)
-    except Exception:
+    except Exception as e:
+        if getattr(e, 'value', None) == _NVML_ERROR_NOT_SUPPORTED:
+            logger.debug(f"NVML {what or getattr(fn, '__name__', fn)}: not supported")
+        elif problems is not None:
+            problems.append(f"{what}: {_nvml_error_text(e)}")
         return None
 
 
@@ -1201,33 +1394,47 @@ def get_gpu_stats() -> list:
         index, name, gpu_percent, vram_used_bytes, vram_total_bytes,
         vram_used_formatted, vram_total_formatted, temperature_c, power_watts
     Any value the GPU/driver doesn't report is None (never 0).
+
+    nvidia-ml-py is only installed where an NVIDIA driver was found, so an NVML
+    that can't start is logged as a warning, with the likely cause, and so is
+    a query that fails for another reason than "not supported" (NVML errors
+    show up in the collector log / journal, not only as missing values).
     """
     try:
         import pynvml
     except ImportError:
-        return []   # pynvml not installed
+        return []   # nvidia-ml-py not installed: not a GPU host
 
     try:
         pynvml.nvmlInit()
-    except Exception:
-        return []   # no NVIDIA driver / GPU
+    except Exception as e:
+        hint = _NVML_INIT_HINTS.get(getattr(e, 'value', None), '')
+        logger.warning(f"NVIDIA GPU stats unavailable: NVML could not start "
+                       f"({_nvml_error_text(e)}). {hint}".rstrip())
+        return []
 
     gpus = []
+    problems = []
     try:
         count = pynvml.nvmlDeviceGetCount()
         for i in range(count):
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            except Exception:
+            except Exception as e:
+                problems.append(f"GPU {i}: {_nvml_error_text(e)}; GPU left out")
                 continue   # skip individual GPU on error
 
-            raw_name = _nvml_or_none(pynvml.nvmlDeviceGetName, handle)
-            name = raw_name.decode('utf-8') if isinstance(raw_name, bytes) else raw_name
+            def query(fn, *args, what):
+                return _nvml_or_none(fn, handle, *args, problems=problems, what=f"GPU {i} {what}")
 
-            util = _nvml_or_none(pynvml.nvmlDeviceGetUtilizationRates, handle)
-            mem  = _nvml_or_none(pynvml.nvmlDeviceGetMemoryInfo, handle)
-            temp = _nvml_or_none(pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_GPU)
-            power_mw = _nvml_or_none(pynvml.nvmlDeviceGetPowerUsage, handle)
+            raw_name = query(pynvml.nvmlDeviceGetName, what='name')
+            name = raw_name.decode('utf-8', 'replace') if isinstance(raw_name, bytes) else raw_name
+
+            util = query(pynvml.nvmlDeviceGetUtilizationRates, what='utilization')
+            mem  = query(pynvml.nvmlDeviceGetMemoryInfo, what='memory')
+            temp = query(pynvml.nvmlDeviceGetTemperature, pynvml.NVML_TEMPERATURE_GPU,
+                         what='temperature')
+            power_mw = query(pynvml.nvmlDeviceGetPowerUsage, what='power')
 
             vram_used  = mem.used if mem is not None else None
             vram_total = mem.total if mem is not None else None
@@ -1242,14 +1449,18 @@ def get_gpu_stats() -> list:
                 'temperature_c':        temp,
                 'power_watts':          round(power_mw / 1000.0, 1) if power_mw is not None else None,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        problems.append(f"listing the GPUs: {_nvml_error_text(e)}")
     finally:
         try:
             pynvml.nvmlShutdown()
         except Exception:
             pass
 
+    if problems:
+        hint = (" A GPU that is lost needs a reset or reboot." if any(
+            f"(NVML error {_NVML_ERROR_GPU_IS_LOST})" in p for p in problems) else "")
+        logger.warning(f"NVML errors (values sent as null): {'; '.join(problems)}.{hint}")
     return gpus
 
 
@@ -1356,19 +1567,61 @@ def _is_loopback(iface: str) -> bool:
     True for loopback interfaces: 'lo' (Linux/Synology), 'lo0' (BSD/macOS),
     'Loopback Pseudo-Interface 1' (Windows). Loopback traffic never leaves the
     machine, so both the psutil path and the /proc/net/dev fallback exclude it
-    (apart from the upgrade transition in _counts_loopback); every other
-    interface (physical, bond, VPN, bridge) is counted.
+    (apart from the upgrade transition in _counts_loopback); so are Linux
+    virtual interfaces (_is_virtual_nic).
     """
     n = iface.strip().lower()
     return n == 'lo' or (n.startswith('lo') and n[2:].isdigit()) or 'loopback' in n
 
 
-def fallback_network_counters(include_loopback: bool = False) -> tuple:
+SYS_CLASS_NET = '/sys/class/net'
+
+
+def _is_virtual_nic(iface: str) -> bool:
+    """
+    True for a Linux interface with no device behind it: the kernel lists it
+    under /sys/devices/virtual/net, so /sys/class/net/<iface> has no 'device'
+    link. That is docker0, every container's vethXXXX, br-*, virbr*, bond0,
+    VLANs, tun/tap, wireguard, tailscale0, ... Their traffic also crosses a
+    physical NIC (counted there), stays inside the host (container to
+    container), or both - and veths come and go with containers, so summing
+    them makes the totals drop whenever one stops, which the Manager takes as
+    a reboot. Physical, virtio, Xen and USB NICs have a device. Not Linux, or
+    no sysfs entry for the name: False (counted, as before).
+    """
+    if not sys.platform.startswith('linux'):
+        return False
+    entry = os.path.join(SYS_CLASS_NET, iface.strip())
+    try:
+        return os.path.isdir(entry) and not os.path.exists(os.path.join(entry, 'device'))
+    except (OSError, ValueError):
+        return False
+
+
+def _counted_interfaces(names, include_loopback: bool = False, include_virtual: bool = False) -> list:
+    """
+    The interfaces whose counters are summed: every one except loopback
+    (unless include_loopback) and, on Linux, the virtual ones (unless
+    include_virtual; see _is_virtual_nic). Where every non-loopback interface
+    is virtual - a collector inside a container, whose eth0 is a veth - they
+    are all counted rather than none.
+    """
+    counted = [n for n in names if include_loopback or not _is_loopback(n)]
+    if include_virtual:
+        return counted
+    with_device = [n for n in counted if _is_loopback(n) or not _is_virtual_nic(n)]
+    if any(not _is_loopback(n) for n in with_device) or all(_is_loopback(n) for n in counted):
+        return with_device
+    return counted
+
+
+def fallback_network_counters(include_loopback: bool = False, include_virtual: bool = False) -> tuple:
     """
     Read cumulative network byte counters without psutil.
 
-    Sums Receive/Transmit bytes across all non-loopback interfaces (all
-    interfaces if include_loopback) from /proc/net/dev (Linux/Synology). Used when psutil is unavailable, which
+    Sums Receive/Transmit bytes from /proc/net/dev (Linux/Synology) over the
+    interfaces _counted_interfaces() selects (not loopback, not virtual,
+    unless asked to). Used when psutil is unavailable, which
     is the norm on Synology armv7l where psutil has no prebuilt wheel and
     cannot be compiled (no gcc).
 
@@ -1377,9 +1630,7 @@ def fallback_network_counters(include_loopback: bool = False) -> tuple:
         (e.g. Windows) or has no parseable interface rows.
     """
     try:
-        total_in = 0
-        total_out = 0
-        parsed = 0
+        rows = {}
         with open('/proc/net/dev', 'r') as f:
             lines = f.readlines()[2:]  # skip the two header rows
         for line in lines:
@@ -1387,37 +1638,30 @@ def fallback_network_counters(include_loopback: bool = False) -> tuple:
             cols = data.split()
             if len(cols) < 16:
                 continue
-            parsed += 1
-            if _is_loopback(iface) and not include_loopback:
-                continue  # ignore loopback
-            total_in += int(cols[0])   # Receive bytes
-            total_out += int(cols[8])  # Transmit bytes
-        if not parsed:
+            rows[iface.strip()] = (int(cols[0]), int(cols[8]))   # Receive / Transmit bytes
+        if not rows:
             return None, None
-        return total_in, total_out
+        counted = _counted_interfaces(rows, include_loopback, include_virtual)
+        return sum(rows[n][0] for n in counted), sum(rows[n][1] for n in counted)
     except Exception as e:
         logger.warning(f"Network fallback (/proc/net/dev) failed: {e}")
         return None, None
 
 
-def get_network_counters(include_loopback: bool = False) -> tuple:
+def get_network_counters(include_loopback: bool = False, include_virtual: bool = False) -> tuple:
     """
-    Cumulative (bytes_in, bytes_out) over non-loopback interfaces (all
-    interfaces if include_loopback), or (None, None) if unreadable.
+    Cumulative (bytes_in, bytes_out) over the interfaces _counted_interfaces()
+    selects: not loopback, not Linux virtual ones (unless include_loopback /
+    include_virtual). (None, None) if unreadable.
     """
     try:
         import psutil
     except ImportError:
-        return fallback_network_counters(include_loopback)
+        return fallback_network_counters(include_loopback, include_virtual)
     try:
-        total_in = 0
-        total_out = 0
-        for iface, counters in psutil.net_io_counters(pernic=True).items():
-            if _is_loopback(iface) and not include_loopback:
-                continue
-            total_in += counters.bytes_recv
-            total_out += counters.bytes_sent
-        return total_in, total_out
+        nics = psutil.net_io_counters(pernic=True)
+        counted = _counted_interfaces(nics, include_loopback, include_virtual)
+        return sum(nics[n].bytes_recv for n in counted), sum(nics[n].bytes_sent for n in counted)
     except Exception as e:
         logger.warning(f"psutil network counters unavailable: {e}")
         return None, None
@@ -1453,6 +1697,24 @@ def _counts_loopback(previous: Optional[dict]) -> bool:
     return _psutil_available()   # snapshot from an older collector
 
 
+def _counts_virtual(previous: Optional[dict]) -> bool:
+    """
+    Whether this run still counts Linux virtual interfaces (upgrade
+    transition, as for loopback in _counts_loopback): collectors before this
+    version summed docker0, veths, bridges, bonds, tunnels... too. A host whose
+    network snapshot doesn't record the choice ("virtual") keeps counting them
+    until its counters next go backwards - a reboot, or a container's veth
+    disappearing, which the Manager already takes as a reset - and then stops.
+    New installs leave them out from the first run.
+    """
+    if not previous:
+        return False
+    scope = previous.get('virtual')
+    if scope is not None:
+        return scope == 'included'
+    return True   # snapshot from an older collector
+
+
 def _counters_went_backwards(previous: Optional[dict], bytes_in: int, bytes_out: int) -> bool:
     """True if either counter is below the previous snapshot's (reboot / counter reset)."""
     try:
@@ -1469,8 +1731,8 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
         left untouched so the next good run still has a valid baseline;
       - first run, unreadable previous snapshot, or a counter that went
         backwards (reboot/reset) → bandwidth None for this run.
-    Loopback interfaces are not counted (except during the upgrade
-    transition described in _counts_loopback).
+    Loopback and Linux virtual interfaces are not counted (except during the
+    upgrade transitions described in _counts_loopback / _counts_virtual).
     """
     unmeasured = {
         'bytes_in': None,
@@ -1488,19 +1750,25 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
         # Prefer psutil; fall back to /proc/net/dev when it isn't installed
         # (common on Synology armv7l where psutil can't be built).
         include_loopback = _counts_loopback(previous)
-        current_bytes_in, current_bytes_out = get_network_counters(include_loopback)
+        include_virtual = _counts_virtual(previous)
+        current_bytes_in, current_bytes_out = get_network_counters(include_loopback, include_virtual)
         if current_bytes_in is None or current_bytes_out is None:
             logger.warning("Network counters unavailable; sending network fields as null")
             return unmeasured
-        if include_loopback and _counters_went_backwards(previous, current_bytes_in, current_bytes_out):
+        if ((include_loopback or include_virtual)
+                and _counters_went_backwards(previous, current_bytes_in, current_bytes_out)):
             # Reboot/reset: the Manager takes these counters as a new baseline,
-            # so this is the moment to stop counting loopback (_counts_loopback).
-            include_loopback = False
+            # so this is the moment to stop counting loopback and virtual
+            # interfaces (_counts_loopback, _counts_virtual).
+            dropped = [what for what, on in (('loopback', include_loopback),
+                                             ('virtual-interface', include_virtual)) if on]
+            include_loopback = include_virtual = False
             current_bytes_in, current_bytes_out = get_network_counters()
             if current_bytes_in is None or current_bytes_out is None:
                 logger.warning("Network counters unavailable; sending network fields as null")
                 return unmeasured
-            logger.info("Network counters were reset; loopback traffic is no longer counted from now on")
+            logger.info(f"Network counters were reset; {' and '.join(dropped)} traffic is no longer "
+                        f"counted from now on")
 
         current_timestamp = _utcnow().isoformat() + 'Z'
         
@@ -1530,6 +1798,7 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
             'bytes_in': current_bytes_in,
             'bytes_out': current_bytes_out,
             'loopback': 'included' if include_loopback else 'excluded',
+            'virtual': 'included' if include_virtual else 'excluded',
         })
         
         return {

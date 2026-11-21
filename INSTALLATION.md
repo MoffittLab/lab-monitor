@@ -1,6 +1,6 @@
 # Installation Guide
 
-Three installation scripts set everything up. **Upgrading an installation that already has data?**
+Four installation scripts set everything up. **Upgrading an installation that already has data?**
 Follow [docs/UPGRADE.md](docs/UPGRADE.md) instead: it backs up and verifies your data first.
 
 ## Quick Start
@@ -10,6 +10,7 @@ Follow [docs/UPGRADE.md](docs/UPGRADE.md) instead: it backs up and verifies your
 1. **Manager + Dashboard** on the Windows server (atlantis): `install-manager-dashboard-taskscheduler.ps1`
 2. **Collector** on each Synology NAS: `install-collector-synology.sh`
 3. **Collector** on each Windows server: `install-collector-windows.ps1`
+4. **Collector** on each Linux server: `install-collector-linux.sh`
 
 Each collector needs its own token from the Manager config (`collector_tokens`), so install the
 Manager first.
@@ -272,6 +273,69 @@ Get-Content E:\Users\lab-monitor\logs\collector.log -Tail 20 -Wait
 
 On the Manager server itself (atlantis), the collector uses the same checkout and, by default, the
 same `data` folder as the Manager; see [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md).
+
+---
+
+## 4. Collector on Linux Server (Ubuntu / Debian)
+
+**Prerequisites:** Ubuntu 22.04 / 24.04 or Debian 12 with systemd, `sudo`, and network access to the Manager
+(and to PyPI for the pinned packages; offline, the installer falls back to the distribution's
+`python3-requests` / `python3-psutil`).
+
+```bash
+git clone https://github.com/MoffittLab/lab-monitor.git
+cd lab-monitor
+sudo ./install-collector-linux.sh            # asks for the Manager URL, token, name, folders
+```
+
+Non-interactive, generating this device's token:
+
+```bash
+sudo ./install-collector-linux.sh --non-interactive \
+     --manager-url http://atlantis.med.harvard.edu:5000 --generate-token \
+     --scan-paths '/home/*,/data/*'
+```
+
+`--generate-token` prints the exact `"collector_tokens": {"<name>": "<token>"}` entry to add to the Manager
+config (then restart the Manager). `--dry-run` prints every action without changing anything;
+`--print-config` prints the config it would write. `--help` lists all flags (`--name`, `--volumes`,
+`--repo/--ref`, ...).
+
+**What it does:** installs `python3-venv` if missing; creates the system user `labmon`; copies the collector to
+`/opt/lab-monitor` and builds `/opt/lab-monitor/venv`; writes `/etc/lab-monitor/collector.json`
+(`0640 root:labmon`); installs and enables `lab-monitor-metrics.timer` (every 5 minutes) and
+`lab-monitor-disk.timer` (daily 02:00); runs one metrics collection and shows whether the Manager
+acknowledged it. On a server with an NVIDIA driver it also installs nvidia-ml-py and checks that NVML works for
+`labmon` ([GPU servers](collector/README.md#gpu-servers)). Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
+they name). Details: [collector/README.md](collector/README.md#linux--ubuntu).
+
+**Shared storage:** folders on NFS/SMB or cluster filesystems (Lustre, GPFS, ...) are not scanned by
+default, so a server whose `/home` is an NFS mount reports `/home` in the disk scan's errors instead of
+walking the shared tree every night. Measure shared storage on its file server, or set
+`"include_network_mounts": true` on one node.
+
+**Verify (first-install checklist):**
+```bash
+systemctl list-timers 'lab-monitor-*'
+journalctl -u lab-monitor-metrics.service -n 30
+sudo systemctl start lab-monitor-metrics.service   # run once more now
+```
+
+On a GPU server, also:
+```bash
+# NVML works for the service user: prints the number of GPUs
+sudo -u labmon /opt/lab-monitor/venv/bin/python -s -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlDeviceGetCount())"
+# The service found them ("GPUs: N (...)"), and logged no NVML errors
+journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'GPUs:|NVML'
+# Compare with the Dashboard card / the collector's values
+nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv
+```
+Temperature should match within a degree or two and power within a few watts. Utilization is a sample, and
+VRAM used can differ by the driver-reserved amount. Causes and fixes:
+[collector/README.md](collector/README.md#gpu-servers).
+
+**Uninstall:** `sudo /opt/lab-monitor/install-collector-linux.sh --uninstall` (keeps config, data and logs;
+add `--purge` to delete them and the `labmon` user).
 
 ---
 

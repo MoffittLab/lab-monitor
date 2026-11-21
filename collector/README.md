@@ -42,11 +42,11 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 |-------|-------------|
 | `name` | Display name — appears on the Dashboard and in database folder names. 1–64 characters from `A-Z a-z 0-9 _ . -`; the Manager rejects anything else for a new device. A device the previous Manager already registered under another name (such as `Lab PC`) keeps working under exactly that spelling; don't rename it, since a new name starts a new device with its own, empty history. |
 | `id` | Stable unique identifier — use something that won't change (e.g., `synology-triton`) |
-| `device_type` | System type: `synology`, `windows`, or any label you choose |
+| `device_type` | System type: `synology`, `windows`, or any label you choose (default on Linux: `Server`, which the Dashboard groups under Servers) |
 | `manager_url` | URL of the Manager service (`http://` or `https://`). With `http://` the token travels unencrypted. |
 | `manager_token` | Bearer token for this device — the Manager's `collector_tokens` entry keyed by this `name` (or a legacy `auth_tokens` entry) |
 | `volumes` | Drives/volumes to report **capacity** for (used/free/total bytes). Used only for capacity reporting, not folder scanning. |
-| `scan_paths` | Folders to measure for **usage breakdown**. Each entry is either a path (`/volume1/Data1` = measure that folder as a single total) or a glob (`/volume1/Data1/*` = measure each immediate subfolder separately). If omitted, falls back to scanning one level deep in each volume. |
+| `scan_paths` | Folders to measure for **usage breakdown**. Each entry is either a path (`/volume1/Data1` = measure that folder as a single total) or a glob (`/volume1/Data1/*` = measure each immediate subfolder separately). If omitted, falls back to scanning one level deep in each volume (Synology/Windows); on Linux only volume capacity is reported (see [Linux / Ubuntu](#linux--ubuntu)). |
 | `data_dir` | Local data directory for archives and queue |
 | `log_file` | Log file; rotated at 5 MB, 5 backups kept (`collector.log.1` … `.5`) |
 | `log_level` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. An invalid value falls back to `INFO` with a warning. |
@@ -56,10 +56,15 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `max_batch_messages` | Max messages per POST (default 100) |
 | `max_queue_messages` | Max messages kept in `queue.json` while the Manager is unreachable (default 50000; `0` = unlimited). When exceeded, the **oldest** are dropped from the queue with a warning — they stay in the monthly archive. |
 | `exclude_users` | (Optional) Username patterns to exclude from user activity metrics. Supports wildcards. Built-in defaults already exclude `UMFD-*`, `NT AUTHORITY\*`, etc. |
+| `exclude_system_accounts` | (Optional, Linux/Synology) `true` = leave daemon accounts out of the per-user metrics: UID 1 to `UID_MIN`−1 (from `/etc/login.defs`, 1000 on Ubuntu) and `nobody` (65534), such as `systemd-resolve`, `messagebus` or `nvidia-persistenced`. `root` and UIDs without an account on the host (e.g. a container's own user, shown as the number) are kept. Default `true` on Linux, `false` on Synology (its previous behaviour). The collector's own service account (`labmon`, a system account) is never counted either way, including the nightly disk scan. |
+| `platform` | (Optional) `synology`, `linux` or `windows`. Default: detected — Windows; Synology if `/etc/synoinfo.conf` or `/usr/syno` exists; any other host is `linux`. |
+| `include_network_mounts` | (Optional, Linux) `true` = also auto-discover network and cluster filesystems (nfs/nfs4/cifs/smb3, ceph, Lustre, GPFS, BeeGFS, GlusterFS, AFS) as volumes and let scans enter them. Default `false`: a `scan_paths` entry on one is not scanned and is listed in `_errors`. |
+| `cross_filesystems` | (Optional) `false` = measuring a folder never descends into another filesystem or mount point below it (like `du -x`). Default `false` on Linux, `true` (the historical behaviour) on Synology/Windows. |
 
 `volumes` examples:
 - Synology: `["/volume1", "/volume2"]`
 - Windows: `["E:/Users", "F:"]`
+- Linux: leave it out to auto-discover the real filesystems, or e.g. `["/", "/data"]`
 
 `config.json` holds the token. The Synology installer creates it with mode `600` (readable only by the
 installing user, who must also be the Task Scheduler user — or use root). Re-running the installer over an
@@ -122,7 +127,8 @@ On Windows folders are measured with PowerShell `Get-ChildItem` (the path is han
     "total_usage":            24876669222912,
     "_timed_out":             ["/volume2/Archive"],
     "_errors":                [],
-    "_scan_seconds":          5321.4
+    "_scan_seconds":          5321.4,
+    "_volumes":               ["/volume1", "/volume2"]
   }
 }
 ```
@@ -137,6 +143,7 @@ bytes plus `<vol>_total_bytes` / `<vol>_free_bytes`; `total_usage` is the sum of
 | `_timed_out` | Folders that hit a time budget. They are **omitted** from the folder keys, not reported as 0. |
 | `_errors` | Folders that couldn't be scanned (unreadable, or a configured path that doesn't exist). Also omitted. A glob root (`/x/*`) or volume that can't be listed is listed here itself, since its subfolders are unknown. |
 | `_scan_seconds` | How long the folder scan took |
+| `_volumes` | The keys above that are volumes (those whose capacity was measured). On Linux a volume can be `/mnt/data` and a folder `/data`, so path depth can't tell them apart; the Dashboard uses this list (and, for older collectors without it, the `_total_bytes` keys and then path depth). |
 
 Volume capacity is measured first and is always sent, however the folder scan goes.
 
@@ -191,7 +198,13 @@ Measures CPU%, RAM%, uptime, and network traffic. Network bandwidth is computed 
 
 `network_bytes_in/out` are cumulative OS counters (since last boot), summed over every interface **except
 loopback** (`lo`, `lo0`, `Loopback Pseudo-Interface 1`) — the same rule with psutil and with the `/proc/net/dev`
-fallback, since loopback traffic never leaves the machine. `network_bandwidth_*_mbps` is the average rate since
+fallback, since loopback traffic never leaves the machine. On Linux and Synology, **virtual interfaces** are left
+out too: those with no device behind them (no `/sys/class/net/<if>/device`), such as `docker0`, each
+container's `veth*`, `br-*`, `virbr*`, bonds, VLANs, `tun`/`tap`, WireGuard and `tailscale0`. Their traffic is
+also counted on a physical NIC, or never leaves the host. A veth also disappears when its container stops, so
+counting it would make the totals drop, which the Manager would read as a reboot (and would add all traffic
+since boot again). A bond is counted through its physical ports. If every interface is virtual (a collector
+inside a container), they are all counted. `network_bandwidth_*_mbps` is the average rate since
 the previous metrics run; it is `null` on the first run and right after a counter reset (reboot). If the
 counters can't be read at all, all four fields are `null` and the stored snapshot is left untouched.
 
@@ -199,7 +212,9 @@ counters can't be read at all, all four fields are `null` and the stored snapsho
 counters fall, which the Manager reads as a reboot, adding all traffic since boot to the lifetime totals a second
 time. So a psutil host upgraded from an older collector keeps counting loopback until its counters next reset
 (reboot), then switches; `network_snapshot.json` records which mode is in use (`"loopback"`). New installs exclude
-loopback from the first run.
+loopback from the first run. Virtual interfaces follow the same rule (`"virtual"` in the snapshot): a host
+upgraded from a collector that counted them keeps counting them until its counters next go backwards (a reboot,
+or a container stopping, which the Manager already reads as a reset), then stops.
 
 Without psutil (common on Synology armv7l) the collector reads `/proc`: CPU from two `/proc/stat` samples one
 second apart, RAM from `/proc/meminfo` (`MemAvailable`, or `MemFree + Buffers + Cached` on older kernels),
@@ -312,6 +327,182 @@ Large folders (50 TB+) take time. Check logs for per-folder timing and raise `ti
 
 ---
 
+## Linux / Ubuntu
+
+Installed by `install-collector-linux.sh` (Ubuntu 22.04 / 24.04, Debian 12; see
+[INSTALLATION.md](../INSTALLATION.md#4-collector-on-linux-server-ubuntu--debian)). Example config:
+[config.linux.example.json](config.linux.example.json).
+
+| Path | Contents |
+|------|----------|
+| `/opt/lab-monitor/collector` | Code, owned by root (the service can't modify it) |
+| `/opt/lab-monitor/venv` | Python venv: `requirements.txt` (+ `requirements-gpu.txt` on [GPU servers](#gpu-servers)) |
+| `/etc/lab-monitor/collector.json` | Config, mode `0640 root:labmon` (it holds the token) |
+| `/var/lib/lab-monitor/<name>/` | `data_dir`: archive, queue, network snapshot |
+| `/var/log/lab-monitor/collector.log` | Log file (every line is in the journal too) |
+| `/etc/systemd/system/lab-monitor-*` | Units, copied from [`systemd/`](systemd/) |
+
+**Scheduling.** `lab-monitor-metrics.timer` starts `lab-monitor-metrics.service` every 5 minutes
+(`OnCalendar=*:0/5`); `lab-monitor-disk.timer` starts `lab-monitor-disk.service` daily at 02:00 plus up to
+15 minutes of random delay. Both timers are `Persistent=`, so a run missed while the server was off happens
+at boot.
+
+**Sandbox.** Both services run as the system user `labmon` (no login shell) with `ProtectSystem=strict`
+(writable: only `/var/lib/lab-monitor` and `/var/log/lab-monitor`), `PrivateTmp`, `NoNewPrivileges`, a
+system-call filter (`@system-service`) and only `AF_INET`/`AF_INET6`/`AF_UNIX` sockets; the disk service
+also gets no W+X memory and no devices. The metrics service has no capabilities and no access to `/home`, but
+can reach the NVIDIA devices (see [GPU servers](#gpu-servers)); it reads `/proc` for every user's processes (per-user metrics),
+which world-readable `/proc` files allow (unless `/proc` is mounted with `hidepid=`). The disk service must
+read every file under `scan_paths` whoever owns it, so it gets exactly one capability,
+`CAP_DAC_READ_SEARCH` (skip read/search permission checks — no write access, nothing else of root), sees
+`/home` read-only, and runs at `Nice=19` with idle I/O priority. Change a setting with a drop-in
+(`sudo systemctl edit lab-monitor-disk.service`): e.g. `ReadWritePaths=` for a `data_dir` elsewhere.
+
+**Time budget.** The disk service's `TimeoutStartSec` is the collector's overall scan budget
+(`total_timeout_seconds`, 3 h in the installer's config) + 1 h for volume capacity and the upload. The
+installer writes it to `/etc/systemd/system/lab-monitor-disk.service.d/50-timeout.conf` from the config;
+re-run it after changing `scan_paths`, `timeout_seconds` or `total_timeout_seconds`. The metrics service
+gets 4 minutes, below its 5-minute interval.
+
+**Volumes** (when `volumes` is left out) come from `/proc/self/mounts`: ext2/3/4, xfs, btrfs, zfs, f2fs (and
+bcachefs, jfs, reiserfs, nilfs2), plus nfs/nfs4/cifs/smb3 with `"include_network_mounts": true`. Pseudo,
+virtual and ephemeral filesystems (proc, sysfs, tmpfs, devtmpfs, overlay, snap squashfs, cgroup, efivarfs,
+the vfat `/boot/efi`, fuse.\*, autofs, ...) and mounts under `/proc`, `/sys`, `/dev`, `/run`, `/snap` and
+container runtimes' directories are left out. A filesystem mounted several times (btrfs subvolumes of one
+device such as `/` and `/home`, bind mounts) is reported once, under its first mount point — reporting each
+would count it twice in `total_usage`. Each ZFS dataset is its own volume; as its capacity is "used by the
+dataset + free in the pool", the Dashboard's summed capacity over-counts a pool with many datasets: list
+`volumes` explicitly there.
+
+**Folders.** Set `scan_paths` (typically `["/home/*", "/data/*"]`): without it only volume capacity is
+reported, and a warning says so — one level deep in `/` would walk `/usr`, `/var`, `/proc`, ...
+- A glob lists the subfolders except hidden ones, `lost+found`, and subfolders that are pseudo-filesystem
+  mounts (`/proc`, `/sys`, `/dev`, `/run`, tmpfs, snaps, fuse, ...), network mounts (unless
+  `include_network_mounts`) or automount points of unknown type (see below). A subfolder that is another *local* filesystem (say one ZFS dataset per
+  project) is kept and measured on its own.
+- With `"cross_filesystems": false` (the Linux default) measuring a folder stays on that folder's
+  filesystem, like `du -x`: it doesn't descend into mount points, bind mounts or nested btrfs subvolumes
+  (e.g. snapper's `.snapshots`), so a volume mounted inside a scanned folder isn't counted twice. The log
+  lists what was left out ("did not enter N other filesystem(s) / mount point(s)"). `true` enters them —
+  but never pseudo filesystems, and network mounts only with `include_network_mounts`.
+- Synology's system names (`@eaDir`, `#recycle`, `*.hbk`) are ordinary folders on Linux and are counted;
+  `lost+found` and `.snapshots` are skipped at every level.
+- Nothing under `/proc`, `/sys`, `/dev` or `/run` is ever measured, even when listed in `scan_paths` (such
+  entries are reported in `_errors`): sizes there are meaningless (`/proc/kcore` "is" 128 TiB).
+- The same goes for a `scan_paths` entry or glob root that is itself on a never-entered filesystem: a network
+  mount (unless `include_network_mounts`), a pseudo filesystem, or an automount point of unknown type. It is
+  checked against the mount table before anything is `stat`'ed, so a dead NFS server can't hang the run. So
+  on a server whose `/home` is NFS, the default `/home/*` lands in `_errors` with a hint, instead of every
+  node walking the shared home tree each night: measure shared storage on its file server (or set
+  `include_network_mounts` on one node only).
+- Each mount point is judged by the filesystem mounted on top of it. A systemd automount
+  (`x-systemd.automount` in fstab) that is mounted counts as that filesystem. One not mounted right now is
+  entered (which mounts it) only when `/etc/fstab` says it holds a local filesystem — or a network one with
+  `include_network_mounts`; any other automount point is skipped with a warning.
+
+**Metrics.** With psutil (in the venv) as on other platforms, per-user metrics included. Without it the
+`/proc` fallbacks provide CPU, RAM, uptime and network, and there are no per-user metrics (an INFO line
+says so).
+
+```bash
+systemctl list-timers 'lab-monitor-*'                    # next and last runs
+journalctl -u lab-monitor-metrics.service -f              # metrics log
+journalctl -u lab-monitor-disk.service --since today      # disk scan log
+sudo systemctl start lab-monitor-metrics.service          # collect metrics now (waits, shows failure)
+sudo systemctl start --no-block lab-monitor-disk.service  # scan disks now, in the background
+sudoedit /etc/lab-monitor/collector.json
+```
+
+Run a scan through `systemctl start`, not `sudo -u labmon .../collector.py`: only the unit grants
+`CAP_DAC_READ_SEARCH`, so a manual run as `labmon` can't read other users' private folders (they land in
+`_errors`, or are skipped inside a measured folder and undercount it). A
+manual run as root leaves root-owned files in `data_dir`; the installer gives them back to `labmon` on its
+next run.
+
+### GPU servers
+
+A Linux server with an NVIDIA GPU reports exactly what a Windows GPU server reports, from the same code
+(nvidia-ml-py, i.e. NVML): in `system_metrics`, `gpu_count`, the `gpus` list (per GPU: `index`, `name`,
+`gpu_percent`, `vram_used_bytes`, `vram_total_bytes`, `vram_used_formatted`, `vram_total_formatted`,
+`temperature_c`, `power_watts`) and the flat history fields `gpu_N_percent` (`%`), `gpu_N_vram_used`
+(`bytes`), `gpu_N_temp_c` (`°C`) and `gpu_N_power_w` (`W`), each with its `*_unit` sibling. A value the GPU
+can't report is `null`; `gpu_N_temp_c` / `gpu_N_power_w` are left out for a GPU without that sensor.
+[`tests/collector/test_collector_gpu_parity.py`](../tests/collector/test_collector_gpu_parity.py) builds the
+metrics, per-user and disk messages as Windows and as Linux and fails on any difference in keys, units or
+value types. The expected differences are in its `KNOWN_DIFFERENCES`: Linux paths and user names, and a per-user
+row for `root`. Windows hides its service accounts by default, and Linux hides daemon accounts
+(`exclude_system_accounts`, on by default). Neither platform counts the collector itself: on Linux that means
+every process of `labmon`, the nightly disk scan included. `root` stays visible because docker containers and
+`sudo` jobs run as root. So that row also carries the system services and dockerd; add `"root"` to
+`exclude_users` to hide it. Network totals leave out docker's virtual interfaces (see
+[Metrics mode](#metrics-mode-system_metrics)), so containers starting and stopping don't reset them.
+
+**Install.** The installer adds `requirements-gpu.txt` (pinned `nvidia-ml-py`) when it finds an NVIDIA
+driver by any of: `/proc/driver/nvidia/version` (kernel module loaded), `libnvidia-ml.so.1` in `ldconfig -p`,
+or `nvidia-smi` on `PATH`. It prints which it found. A re-run or upgrade keeps nvidia-ml-py when the venv
+already has it, even if the driver isn't visible at that moment. The installer then runs NVML as `labmon` and
+explains a failure, for example a driver/library version mismatch (reboot after a driver upgrade), missing
+`/dev/nvidia*` nodes or restrictive device permissions. After the test run it checks the service's
+`GPUs: N (...)` log line.
+
+**Sandbox (metrics unit).** NVML opens `/dev/nvidiactl`, `/dev/nvidia0`..`N` (plus `/dev/nvidia-caps/*`, and
+`/dev/nvidia-nvswitch*` on NVSwitch systems). It reads `/proc/driver/nvidia` and `/sys`, talks to
+nvidia-persistenced over `AF_UNIX`, and loads `libnvidia-ml.so.1` from wherever `ldconfig` finds it
+(`/usr/lib/x86_64-linux-gnu` on Ubuntu; `ProtectSystem=strict` leaves it readable and loadable). So
+[`lab-monitor-metrics.service`](systemd/lab-monitor-metrics.service), unlike the disk unit:
+- has no `PrivateDevices=yes` (it hides every `/dev/nvidia*`), and no `DevicePolicy=closed|strict` or
+  `DeviceAllow=` (any allow-list blocks every device it doesn't name);
+- has no `ProtectClock=yes`. On systemd < 252, which includes Ubuntu 22.04's systemd 249, that setting implies
+  `DeviceAllow=char-rtc r` and blocks the GPUs the same way
+  ([systemd#18142](https://github.com/systemd/systemd/issues/18142)). Without capabilities the service can't
+  set the clock anyway;
+- has no `ProcSubset=pid` (it hides `/proc/driver/nvidia`) or `ProtectProc=invisible`;
+- sets `MemoryDenyWriteExecute=no`. NVIDIA doesn't document libnvidia-ml as W^X-safe. Its 470 and 580 builds
+  have no executable stack, text relocations or W+X segments, but some memory protections are computed at run
+  time and it can load `libcuda.so.1`. For a Python service the setting adds little;
+- keeps `SystemCallFilter=@system-service`. libnvidia-ml's system calls (`ioctl`, `mmap`, the NUMA calls in
+  `@resources`, fork+exec of nvidia-modprobe) are all in that set. The one exception, `iopl`, needs
+  `CAP_SYS_RAWIO` anyway.
+
+`tests/collector/test_collector_linux.py` fails if the unit gains any of those blockers. To restrict devices
+in a drop-in anyway, allow the NVIDIA majors too: `DevicePolicy=closed` plus `DeviceAllow=char-nvidia* rw`
+(the pattern matches the `nvidia*` names in `/proc/devices`). With `NoNewPrivileges=yes`, NVML can't use the
+setuid `nvidia-modprobe` to create missing device nodes, so they must exist before the service runs:
+`sudo systemctl enable --now nvidia-persistenced` creates them at boot.
+
+**Troubleshooting.** NVML problems are logged as warnings in `journalctl -u lab-monitor-metrics.service` and
+`collector.log`. `NVIDIA GPU stats unavailable: NVML could not start (...)` names the cause:
+
+| NVML error | Likely cause |
+|------------|--------------|
+| `Driver Not Loaded`, `Unknown Error` | kernel module not loaded, `/dev/nvidiactl` missing, or a sandbox blocks the devices |
+| `Insufficient Permissions` | `/dev/nvidia*` not readable by `labmon` (`NVreg_DeviceFileMode` / `NVreg_DeviceFileGID`): add `labmon` to that group |
+| `RM has detected an NVML/RM version mismatch` | driver upgraded without a reboot: reboot |
+| `NVML Shared Library Not Found` | `libnvidia-ml.so.1` not in `ldconfig -p` (driver's NVML package missing) |
+
+`NVML errors (values sent as null): GPU 1 utilization: ...` means a single query failed. "Not supported"
+(e.g. no power sensor) is normal and isn't logged.
+
+**First-install checklist (GPU servers):**
+```bash
+# 1. NVML works for the service user (prints the number of GPUs)
+sudo -u labmon /opt/lab-monitor/venv/bin/python -s -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlDeviceGetCount())"
+# 2. The service found them, and NVML logged no errors
+journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'GPUs:|NVML'
+# 3. The collector's values match the driver's
+nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv
+```
+Compare step 3 with the GPU section of the device's Dashboard card, or with the `GPUs:` log line and
+`gpu_N_*` fields in `/var/lib/lab-monitor/<name>/<YYYY-MM>.jsonl`. Temperature should agree within a degree
+or two and power within a few watts. Utilization is a sample, so compare under a steady load. VRAM used can
+differ by the driver-reserved amount (a few hundred MiB), since NVML's memory queries and nvidia-smi
+account for reserved memory differently.
+
+Not reported yet on either platform, and possible later additions: per-user GPU memory (from NVML's
+per-process lists), fan speed, clocks, ECC errors and throttle reasons.
+
+---
+
 ## Upgrading
 
 **Rollout order: Dashboard, then Manager, then collectors.** Upgrade a collector only once the Manager and the
@@ -340,7 +531,7 @@ When upgrading:
 
 - `requests` — HTTP POST to Manager (required)
 - `psutil` — CPU, RAM, network measurements (optional; `/proc` fallbacks on Linux/Synology)
-- `nvidia-ml-py` — NVIDIA GPU stats (optional; `requirements-gpu.txt`)
+- `nvidia-ml-py` — NVIDIA GPU stats (optional; `requirements-gpu.txt`; see [GPU servers](#gpu-servers))
 
 ```bash
 pip install -r requirements.txt
