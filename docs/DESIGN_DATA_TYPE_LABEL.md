@@ -1,5 +1,14 @@
 # Data Type Label Enhancement
 
+> **Historical design proposal.** The `data_type` label it proposes is implemented, but several
+> details differ from this text: messages without a label go to the `not_specified` table (not
+> `not-specified`); the per-system database is `data/<system>/data.db`; new columns are **not**
+> backfilled with `NaN` (earlier rows read `NULL`, meaning "not measured"); `folder_usage` is stored
+> one row per folder; `data_type` must start with a letter and use only letters, digits, `_` and
+> `-`; and no handler classes or `data_types.py` exist. Current behaviour:
+> [ARCHITECTURE.md](ARCHITECTURE.md), [METRICS.md](../METRICS.md),
+> [manager/README.md](../manager/README.md#storage).
+
 ## Overview
 
 Add an optional `data_type` field to the data portion of each message. This allows the manager to apply special handling, validation, or transformation logic based on the data's semantic type, while maintaining backward compatibility with untyped (flat key-value) data.

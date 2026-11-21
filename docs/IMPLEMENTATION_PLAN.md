@@ -1,5 +1,16 @@
 # Implementation Plan: Message Format + Typed Data Storage
 
+> **Historical document.** This is the plan the header + data message format and the typed
+> per-system storage were built from. It is kept for reference and is **not** a description of the
+> current code. Since then, among other things: `shared/models.py` was removed (nothing imported
+> it); schema evolution no longer backfills `NaN` (earlier rows simply read `NULL`); `folder_usage`
+> is stored narrow (`folder_usage_msgs` / `folder_usage_items`, the old wide table kept as
+> `folder_usage_legacy`); every message carries a `msg_id` and the Manager acknowledges each one;
+> tokens are scoped; and `metrics.db` gained per-user tables and `dead_letter`. For the current
+> design see [ARCHITECTURE.md](ARCHITECTURE.md), [METRICS.md](../METRICS.md) and
+> [manager/README.md](../manager/README.md); for what happens to existing data see
+> [UPGRADE.md](UPGRADE.md).
+
 ## Overview
 
 Five files change. One new file is created.

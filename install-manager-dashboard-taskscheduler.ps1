@@ -11,11 +11,16 @@
 #   - First install: random admin and read tokens are generated. The read token
 #     is written into the Dashboard config as manager_token. -CollectorNames
 #     generates one collector token per device and prints them.
+#   - The Dashboard always gets a READ token, never the admin token. If the
+#     Dashboard config is (re)created while an existing Manager config without
+#     read_tokens is kept, a new read token is added to that Manager config.
 #   - Re-running KEEPS the existing manager\config.json and dashboard\config.json
 #     (tokens are never reset). Pass -ForceNewConfig to regenerate the TOKENS in
 #     both configs: every other setting (data_dir, log_file, ports, cors_origins,
 #     history_retention_days, the Dashboard login, ...) is kept. The old files
-#     are backed up next to them; collectors then need new tokens.
+#     are backed up next to them. auth_tokens and collector_tokens are REMOVED
+#     (it asks first): every collector gets HTTP 401 until it has a new token
+#     (-CollectorNames generates them).
 #   - -AdminToken / -ReadToken let you supply your own tokens (>= 16 characters,
 #     not a placeholder). -ManagerToken (deprecated) is stored as a shared
 #     collector token allowed to write for ANY device ("*").
@@ -27,7 +32,16 @@
 #     account's password (or takes -TaskCredential) and Task Scheduler stores
 #     it. Re-run the installer after that password changes.
 #   - Mapped drive letters (Z:) are not visible to scheduled tasks: use the UNC
-#     path instead. The script stops before changing anything if it finds one.
+#     path instead. The script stops at step 7 if it finds one, before it
+#     installs packages, writes a config or touches a service.
+#
+# Safety order: configs are only PREPARED in steps 5-6. The paths (step 7)
+# and the new Manager's own config check (step 9: manager.py --check-config
+# on the config as it will be written) must pass before any config is
+# written (step 10) or any running service is stopped (step 11). A refused
+# config stops the install with the old services still running
+# (-IgnoreConfigCheck overrides that). The old "Lab Monitor Startup" task is
+# removed only after both new tasks are registered.
 #
 # This script:
 # 1.  Creates directory structure
@@ -35,18 +49,23 @@
 # 3.  Creates/verifies the Conda environment
 # 4.  Clones/updates the lab-monitor repository (git errors stop the install;
 #     -SkipGitPull skips the pull)
-# 5.  Installs dependencies from requirements.txt (Flask, waitress, requests, ...)
-# 6.  Creates the Manager config (or keeps the existing one)
-# 7.  Creates the Dashboard config (or keeps the existing one)
-# 8.  Validates the Manager config and the Python dependencies, and picks the
-#     task account (stored password if data_dir/logs are on a network share)
-# 9.  Stops Manager/Dashboard processes started by an earlier install
-# 10. Creates launcher batch files (output -> logs\*-console.log, restart loop)
-# 11. Registers "Lab Monitor Manager" and "Lab Monitor Dashboard" tasks
-#     (at startup, whether or not anyone is logged on, restart on failure)
-# 12. Configures Windows Firewall
-# 13. Starts both tasks
-# 14. Verifies the services are running
+# 5.  Prepares the Manager config (or keeps the existing one)
+# 6.  Prepares the Dashboard config (or keeps the existing one)
+# 7.  Checks data_dir / log paths and picks the task account (stored password
+#     if data_dir/logs are on a network share; a mapped drive stops here)
+# 8.  Installs dependencies from requirements.txt (Flask, waitress, requests, ...)
+# 9.  Validates the Manager config (stops here if the new Manager refuses it)
+#     and the Python dependencies
+# 10. Writes the prepared configs (previous files backed up)
+# 11. Stops Manager/Dashboard processes started by an earlier install; stops
+#     here if a manager.py process is still running
+# 12. Creates launcher batch files (output -> logs\*-console.log, restart loop)
+# 13. Registers "Lab Monitor Manager" and "Lab Monitor Dashboard" tasks
+#     (at startup, whether or not anyone is logged on, restart on failure),
+#     then removes the old "Lab Monitor Startup" task
+# 14. Configures Windows Firewall
+# 15. Starts both tasks
+# 16. Verifies the services are running
 #
 
 param(
@@ -59,7 +78,8 @@ param(
     [string]$DashboardPort = "5001",
     [System.Management.Automation.PSCredential]$TaskCredential,
     [switch]$ForceNewConfig,
-    [switch]$SkipGitPull
+    [switch]$SkipGitPull,
+    [switch]$IgnoreConfigCheck
 )
 
 # Check if running from Anaconda Prompt
@@ -313,33 +333,14 @@ if (Test-Path "$RepoDir\manager\manager.py") {
 }
 Write-Host ""
 
-# Step 5: Install dependencies into the conda environment
-Write-Step "Step 5: Installing dependencies"
-Write-Host "  Upgrading pip..."
-conda run -n $CondaEnv python -m pip install --upgrade pip 2>&1 | Out-Null
+# Steps 5 and 6 only PREPARE the configs. Nothing is written, installed or
+# stopped until every check (paths in step 7, the new Manager's own config
+# check in step 9) has passed; step 10 writes the configs.
+$PendingManager = $null      # Manager config to write in step 10 ($null = keep the file)
+$PendingDashboard = $null    # Dashboard config to write in step 10 ($null = keep the file)
 
-Write-Host "  Installing from requirements.txt (Flask, waitress, requests, paramiko)..."
-$PipOut = conda run -n $CondaEnv python -m pip install -r "$RepoDir\requirements.txt" 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Success "Dependencies installed"
-} else {
-    Write-Host "[WARNING] pip install failed (exit code $LASTEXITCODE):" -ForegroundColor Yellow
-    Show-CommandOutput $PipOut -Color Yellow
-}
-
-# Full path of the environment's python.exe, used by the launchers
-$PythonExe = (conda run -n $CondaEnv python -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
-if ($PythonExe) { $PythonExe = $PythonExe.Trim() }
-if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
-    Write-Host "[WARNING] Could not resolve the environment's python.exe; launchers will use 'python.exe' from PATH" -ForegroundColor Yellow
-    $PythonExe = "python.exe"
-} else {
-    Write-Host "  Python: $PythonExe"
-}
-Write-Host ""
-
-# Step 6: Create Manager configuration (existing config is kept)
-Write-Step "Step 6: Manager configuration"
+# Step 5: Prepare the Manager configuration (existing config is kept)
+Write-Step "Step 5: Manager configuration"
 $ManagerConfigFile = "$RepoDir\manager\config.json"
 $ExistingManager = $null
 $CreatedManagerConfig = $false
@@ -353,7 +354,7 @@ if (Test-Path $ManagerConfigFile) {
             Write-Error-Custom "Existing $ManagerConfigFile is not valid JSON: $_"
             exit 1
         }
-        Write-Host "  [WARNING] Existing $ManagerConfigFile is not valid JSON; a new config is written (the old file is backed up)." -ForegroundColor Yellow
+        Write-Host "  [WARNING] Existing $ManagerConfigFile is not valid JSON; a new config will be written (the old file is backed up)." -ForegroundColor Yellow
         $ExistingManager = $null
     }
 }
@@ -376,10 +377,11 @@ if ($ExistingManager -and -not $ForceNewConfig) {
     if ($BadTokens.Count -gt 0) {
         Write-Host ""
         Write-Host "  [WARNING] The existing Manager config has $($BadTokens.Count) placeholder or too-short token(s)." -ForegroundColor Red
-        Write-Host "            The Manager REFUSES TO START with such tokens. Either edit" -ForegroundColor Red
-        Write-Host "            $ManagerConfigFile and replace them with random tokens," -ForegroundColor Red
-        Write-Host "            or re-run this script with -ForceNewConfig (new tokens only - data_dir and the" -ForegroundColor Red
-        Write-Host "            other settings are kept; collectors then need the new tokens)." -ForegroundColor Red
+        Write-Host "            The new Manager REFUSES TO START with such tokens, so this install stops at" -ForegroundColor Red
+        Write-Host "            step 9 (before anything is stopped or changed). Fix the config first; the way" -ForegroundColor Red
+        Write-Host "            without downtime is in docs\UPGRADE.md, 'Fix a refused token without downtime'." -ForegroundColor Red
+        Write-Host "            (-ForceNewConfig replaces ALL tokens: every collector and the Dashboard then" -ForegroundColor Red
+        Write-Host "            get HTTP 401 until each has its new token.)" -ForegroundColor Red
         Write-Host ""
     }
     $HasScoped = ($ExistingManager.PSObject.Properties.Name -contains "admin_tokens") -or
@@ -391,7 +393,28 @@ if ($ExistingManager -and -not $ForceNewConfig) {
         Write-Host "         (one per device) - see manager\README.md." -ForegroundColor Yellow
     }
 } else {
-    Backup-File $ManagerConfigFile
+    if ($ExistingManager) {
+        # -ForceNewConfig drops every token collectors use today
+        $DroppedKeys = @(@("auth_tokens", "collector_tokens") | Where-Object { $ExistingManager.PSObject.Properties.Name -contains $_ })
+        if ($DroppedKeys.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  [WARNING] -ForceNewConfig replaces ALL tokens in $ManagerConfigFile." -ForegroundColor Red
+            Write-Host "            Removed: $($DroppedKeys -join ', '). New: one admin token, one read token (Dashboard)" -ForegroundColor Red
+            if ($CollectorNames -or $ManagerToken) {
+                Write-Host "            and the collector tokens from -CollectorNames / -ManagerToken." -ForegroundColor Red
+            } else {
+                Write-Host "            and NO collector token (no -CollectorNames / -ManagerToken given)." -ForegroundColor Red
+            }
+            Write-Host "            Every collector gets HTTP 401 until its config has a new token (they keep" -ForegroundColor Red
+            Write-Host "            queueing meanwhile). To fix one bad token without that, see docs\UPGRADE.md," -ForegroundColor Red
+            Write-Host "            'Fix a refused token without downtime'." -ForegroundColor Red
+            $Answer = Read-Host "Replace all tokens? [y/N]"
+            if ($Answer -ne 'y' -and $Answer -ne 'Y') {
+                Write-Host "  Stopped. No config was written and nothing was stopped." -ForegroundColor Yellow
+                exit 1
+            }
+        }
+    }
     if (-not $AdminToken) { $AdminToken = New-RandomToken }
     if (-not $ReadToken) { $ReadToken = New-RandomToken }
 
@@ -421,9 +444,9 @@ if ($ExistingManager -and -not $ForceNewConfig) {
         $ManagerConfig["read_tokens"] = @($ReadToken)
         $ManagerConfig["collector_tokens"] = $CollectorTokens
         if ($PSBoundParameters.ContainsKey("ManagerPort")) { $ManagerConfig["port"] = [int]$ManagerPort }
-        Write-JsonFile -Path $ManagerConfigFile -Object $ManagerConfig
+        $PendingManager = $ManagerConfig
         $CreatedManagerConfig = $true
-        Write-Success "Manager tokens regenerated in $ManagerConfigFile (random admin + read tokens)"
+        Write-Success "Manager tokens will be regenerated (random admin + read tokens; written in step 10)"
         Write-Host "  Other settings kept, including data_dir = $($ManagerConfig['data_dir'])"
     } else {
         $ManagerConfig = [ordered]@{
@@ -437,35 +460,63 @@ if ($ExistingManager -and -not $ForceNewConfig) {
             max_request_bytes = 33554432
             max_messages_per_request = 10000
             history_retention_days = $null
+            backup_before_migration = $true
             log_file = "$LogsDir\manager.log"
             log_level = "INFO"
             debug = $false
         }
-        Write-JsonFile -Path $ManagerConfigFile -Object $ManagerConfig
+        $PendingManager = $ManagerConfig
         $CreatedManagerConfig = $true
-        Write-Success "Manager config created at $ManagerConfigFile (random admin + read tokens)"
+        Write-Success "A new Manager config will be created (random admin + read tokens; written in step 10)"
     }
 }
 Write-Host ""
 
-# Step 7: Create Dashboard configuration (existing config is kept)
-Write-Step "Step 7: Dashboard configuration"
+# Step 6: Prepare the Dashboard configuration (existing config is kept)
+Write-Step "Step 6: Dashboard configuration"
 $DashboardConfigFile = "$RepoDir\dashboard\config.json"
 if ((Test-Path $DashboardConfigFile) -and -not $ForceNewConfig) {
     Write-Success "Keeping existing Dashboard config: $DashboardConfigFile"
     if ($CreatedManagerConfig) {
-        Write-Host "  [WARNING] A new Manager config was generated but the Dashboard config was kept." -ForegroundColor Yellow
+        Write-Host "  [WARNING] A new Manager config will be written but the Dashboard config is kept." -ForegroundColor Yellow
         Write-Host "            Set manager_token in $DashboardConfigFile to the Manager's read token." -ForegroundColor Yellow
+    } elseif ($ExistingManager) {
+        # Both configs kept: point out a Dashboard that still uses a full-rights token
+        $KeptDashboard = Read-JsonFile $DashboardConfigFile
+        $KeptDashToken = ""
+        if ($KeptDashboard -and ($KeptDashboard.PSObject.Properties.Name -contains "manager_token")) {
+            $KeptDashToken = [string]$KeptDashboard.manager_token
+        }
+        $FullRights = @()
+        foreach ($Key in @("admin_tokens", "auth_tokens")) {
+            if ($ExistingManager.PSObject.Properties.Name -contains $Key) { $FullRights += @($ExistingManager.$Key) }
+        }
+        if ($KeptDashToken -and ($FullRights -contains $KeptDashToken)) {
+            Write-Host "  [NOTE] The Dashboard's manager_token is a Manager admin/legacy token (full rights)." -ForegroundColor Yellow
+            Write-Host "         Give it a read token instead: add a random token to read_tokens in" -ForegroundColor Yellow
+            Write-Host "         $ManagerConfigFile, put the same token in manager_token in" -ForegroundColor Yellow
+            Write-Host "         $DashboardConfigFile and restart both tasks." -ForegroundColor Yellow
+        }
     }
 } else {
-    # Dashboard gets a READ token: it can't ingest or delete if its host is compromised
+    # Dashboard gets its own READ token (never the admin token): it can't
+    # ingest or delete if its host or config file is compromised
     $DashToken = $ReadToken
     if (-not $CreatedManagerConfig -and $ExistingManager) {
         $DashToken = $null
-        foreach ($Key in @("read_tokens", "admin_tokens", "auth_tokens")) {
-            if (-not $DashToken -and ($ExistingManager.PSObject.Properties.Name -contains $Key)) {
-                $DashToken = @($ExistingManager.$Key) | Select-Object -First 1
-            }
+        $ExistingRead = @()
+        if ($ExistingManager.PSObject.Properties.Name -contains "read_tokens") {
+            $ExistingRead = @($ExistingManager.read_tokens | Where-Object { $_ })
+        }
+        $DashToken = $ExistingRead | Where-Object { -not (Get-TokenProblem ([string]$_)) } | Select-Object -First 1
+        if (-not $DashToken) {
+            # The kept Manager config has no usable read token: add a new one
+            # (every other token and setting stays as it is)
+            $DashToken = New-RandomToken
+            $UpdatedManager = ConvertTo-OrderedHashtable $ExistingManager
+            $UpdatedManager["read_tokens"] = @($ExistingRead + $DashToken)
+            $PendingManager = $UpdatedManager
+            Write-Success "A new read token for the Dashboard will be added to read_tokens in $ManagerConfigFile (other tokens and settings unchanged; written in step 10)"
         }
     }
     if (-not $DashToken) {
@@ -473,15 +524,14 @@ if ((Test-Path $DashboardConfigFile) -and -not $ForceNewConfig) {
         $DashToken = ""
     }
     $ExistingDashboard = Read-JsonFile $DashboardConfigFile
-    Backup-File $DashboardConfigFile
     if ($ExistingDashboard) {
         # -ForceNewConfig: new manager_token only; login, URLs and the rest are kept
         $DashboardConfig = ConvertTo-OrderedHashtable $ExistingDashboard
         $DashboardConfig["manager_token"] = $DashToken
         if ($PSBoundParameters.ContainsKey("DashboardPort")) { $DashboardConfig["port"] = [int]$DashboardPort }
         if ($PSBoundParameters.ContainsKey("ManagerPort")) { $DashboardConfig["manager_url"] = "http://localhost:$ManagerPort" }
-        Write-JsonFile -Path $DashboardConfigFile -Object $DashboardConfig
-        Write-Success "Dashboard manager_token updated in $DashboardConfigFile (other settings kept)"
+        $PendingDashboard = $DashboardConfig
+        Write-Success "Dashboard manager_token will be updated (other settings kept; written in step 10)"
     } else {
         $DashboardConfig = [ordered]@{
             host = "0.0.0.0"
@@ -494,34 +544,21 @@ if ((Test-Path $DashboardConfigFile) -and -not $ForceNewConfig) {
             log_level = "INFO"
             debug = $false
         }
-        Write-JsonFile -Path $DashboardConfigFile -Object $DashboardConfig
-        Write-Success "Dashboard config created at $DashboardConfigFile (uses the Manager read token)"
+        $PendingDashboard = $DashboardConfig
+        Write-Success "A new Dashboard config will be created (uses the Manager read token; written in step 10)"
     }
 }
 Write-Host ""
 
-# Step 8: Validate config and dependencies (no services are started here)
-Write-Step "Step 8: Validating Manager config and Python dependencies"
-$CheckOut = conda run -n $CondaEnv python "$RepoDir\manager\manager.py" --config "$ManagerConfigFile" --check-config 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Success "Manager config is valid"
-} else {
-    Write-Host "[WARNING] Manager config check failed - the Manager will not start until this is fixed:" -ForegroundColor Red
-    Show-CommandOutput $CheckOut -Color Red
-}
-$ImportOut = conda run -n $CondaEnv python -c "import flask, flask_cors, waitress, requests" 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Success "Python dependencies import cleanly"
-} else {
-    Write-Host "[WARNING] Some Python dependencies are missing:" -ForegroundColor Yellow
-    Show-CommandOutput $ImportOut -Color Yellow
-}
-
-# Task account. S4U (no stored password) has no network access, so data_dir
-# or log files on a share need an account whose password Task Scheduler stores.
+# Step 7: Check the paths and pick the task account (before anything changes).
+# S4U (no stored password) has no network access, so data_dir or log files
+# on a share need an account whose password Task Scheduler stores.
+Write-Step "Step 7: Checking data and log paths, choosing the task account"
 $ServicePaths = [ordered]@{}
-$FinalManager = Read-JsonFile $ManagerConfigFile
-$FinalDashboard = Read-JsonFile $DashboardConfigFile
+$FinalManager = $PendingManager
+if (-not $FinalManager) { $FinalManager = Read-JsonFile $ManagerConfigFile }
+$FinalDashboard = $PendingDashboard
+if (-not $FinalDashboard) { $FinalDashboard = Read-JsonFile $DashboardConfigFile }
 if ($FinalManager) {
     $ServicePaths["Manager data_dir"] = [string]$FinalManager.data_dir
     $ServicePaths["Manager log_file"] = [string]$FinalManager.log_file
@@ -540,7 +577,7 @@ if ($MappedPaths.Count -gt 0) {
     Write-Error-Custom "These paths use a mapped (or missing) drive letter, which scheduled tasks can't see:"
     $MappedPaths | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
     Write-Host "  Replace each one with its UNC path (\\server\share\...; 'net use' lists the mappings)" -ForegroundColor Yellow
-    Write-Host "  in the config file, then re-run. Nothing has been stopped or re-registered." -ForegroundColor Yellow
+    Write-Host "  in the config file, then re-run. Nothing has been installed, written, stopped or re-registered." -ForegroundColor Yellow
     exit 1
 }
 $UseStoredPassword = $false
@@ -561,7 +598,7 @@ if ($UncPaths.Count -gt 0) {
     if (-not $TaskCredential) {
         Write-Error-Custom "No credentials given. The tasks can't reach the share without them."
         Write-Host "  Re-run and enter the password, pass -TaskCredential (Get-Credential), or use a local data_dir." -ForegroundColor Yellow
-        Write-Host "  Nothing has been stopped or re-registered." -ForegroundColor Yellow
+        Write-Host "  Nothing has been installed, written, stopped or re-registered." -ForegroundColor Yellow
         exit 1
     }
     $CredentialOk = Test-TaskCredential $TaskCredential
@@ -570,7 +607,7 @@ if ($UncPaths.Count -gt 0) {
         Write-Host "          (wrong password, or the account is locked or expired)." -ForegroundColor Red
         $Answer = Read-Host "Register the tasks with it anyway? [y/N]"
         if ($Answer -ne 'y' -and $Answer -ne 'Y') {
-            Write-Host "  Stopped. Nothing has been stopped or re-registered." -ForegroundColor Yellow
+            Write-Host "  Stopped. Nothing has been installed, written, stopped or re-registered." -ForegroundColor Yellow
             exit 1
         }
     }
@@ -582,8 +619,95 @@ if ($UncPaths.Count -gt 0) {
 }
 Write-Host ""
 
-# Step 9: Stop services started by an earlier install
-Write-Step "Step 9: Stopping previously started Manager/Dashboard (if any)"
+# Step 8: Install dependencies into the conda environment
+Write-Step "Step 8: Installing dependencies"
+Write-Host "  Upgrading pip..."
+conda run -n $CondaEnv python -m pip install --upgrade pip 2>&1 | Out-Null
+
+Write-Host "  Installing from requirements.txt (Flask, waitress, requests, paramiko)..."
+$PipOut = conda run -n $CondaEnv python -m pip install -r "$RepoDir\requirements.txt" 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Success "Dependencies installed"
+} else {
+    Write-Host "[WARNING] pip install failed (exit code $LASTEXITCODE):" -ForegroundColor Yellow
+    Show-CommandOutput $PipOut -Color Yellow
+}
+
+# Full path of the environment's python.exe, used by the launchers
+$PythonExe = (conda run -n $CondaEnv python -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
+if ($PythonExe) { $PythonExe = $PythonExe.Trim() }
+if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
+    Write-Host "[WARNING] Could not resolve the environment's python.exe; launchers will use 'python.exe' from PATH" -ForegroundColor Yellow
+    $PythonExe = "python.exe"
+} else {
+    Write-Host "  Python: $PythonExe"
+}
+Write-Host ""
+
+# Step 9: The NEW Manager checks the config it will run with (touches no
+# database and no log file). A refused config stops the install here, while
+# the running services are still untouched.
+Write-Step "Step 9: Validating the Manager config and Python dependencies"
+$CheckConfigFile = $ManagerConfigFile
+if ($PendingManager) {
+    # The config that step 10 would write, checked before it replaces anything
+    $CheckConfigFile = "$RepoDir\manager\config.check.json"
+    Write-JsonFile -Path $CheckConfigFile -Object $PendingManager
+}
+$CheckOut = conda run -n $CondaEnv python "$RepoDir\manager\manager.py" --config "$CheckConfigFile" --check-config 2>&1
+$CheckExit = $LASTEXITCODE
+if ($PendingManager) { Remove-Item -Path $CheckConfigFile -Force -ErrorAction SilentlyContinue }
+$ConfigCheckPassed = ($CheckExit -eq 0)
+if ($ConfigCheckPassed) {
+    Write-Success "The new Manager accepts the config"
+} else {
+    Write-Error-Custom "The new Manager refuses this config (manager.py --check-config, exit code $CheckExit):"
+    Show-CommandOutput $CheckOut -Color Red
+    if (-not $IgnoreConfigCheck) {
+        Write-Host "  Stopped here: the running Manager and Dashboard were NOT stopped, no task was changed and" -ForegroundColor Yellow
+        Write-Host "  no config file was written. Fix the config (usually a placeholder or short token; the way" -ForegroundColor Yellow
+        Write-Host "  without downtime is in docs\UPGRADE.md, 'Fix a refused token without downtime'), then re-run" -ForegroundColor Yellow
+        Write-Host "  with -SkipGitPull. Until then $RepoDir holds the new code: re-run before the next reboot," -ForegroundColor Yellow
+        Write-Host "  or the old startup task starts the new code with this config, which it refuses." -ForegroundColor Yellow
+        Write-Host "  (-IgnoreConfigCheck installs anyway; the Manager then stays down until the config is fixed.)" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "[WARNING] -IgnoreConfigCheck: installing anyway. The Manager will NOT start until the config is fixed." -ForegroundColor Red
+}
+$ImportOut = conda run -n $CondaEnv python -c "import flask, flask_cors, waitress, requests" 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Success "Python dependencies import cleanly"
+} else {
+    Write-Host "[WARNING] Some Python dependencies are missing:" -ForegroundColor Yellow
+    Show-CommandOutput $ImportOut -Color Yellow
+}
+Write-Host ""
+
+# Step 10: Write the configs prepared in steps 5 and 6
+Write-Step "Step 10: Writing configuration files"
+if ($PendingManager) {
+    Backup-File $ManagerConfigFile
+    Write-JsonFile -Path $ManagerConfigFile -Object $PendingManager
+    Write-Success "Manager config written: $ManagerConfigFile"
+} else {
+    Write-Success "Manager config unchanged: $ManagerConfigFile"
+}
+if ($PendingDashboard) {
+    Backup-File $DashboardConfigFile
+    Write-JsonFile -Path $DashboardConfigFile -Object $PendingDashboard
+    Write-Success "Dashboard config written: $DashboardConfigFile"
+} else {
+    Write-Success "Dashboard config unchanged: $DashboardConfigFile"
+}
+Write-Host ""
+
+# Step 11: Stop services started by an earlier install
+Write-Step "Step 11: Stopping previously started Manager/Dashboard (if any)"
+# Recorded just BEFORE stopping: after a rollback (docs\UPGRADE.md) the
+# collectors' data from this moment on is replayed into the old Manager.
+$StopTimeUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss")
+Add-Content -Path "$LogsDir\installer-stop-times.txt" -Value "$StopTimeUtc UTC  Manager/Dashboard stopped by the installer" -Encoding ASCII
+Write-Host "  Stopping at $StopTimeUtc UTC (recorded in $LogsDir\installer-stop-times.txt; a rollback replays from it)"
 foreach ($TaskName in @($LegacyTaskName, $ManagerTaskName, $DashboardTaskName)) {
     $Existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($Existing -and $Existing.State -eq "Running") {
@@ -604,20 +728,50 @@ foreach ($PidName in @("manager.pid", "dashboard.pid")) {
         }
     }
 }
+# Two Managers must never use one data_dir. The new Manager refuses a
+# data_dir another new Manager holds, but an older Manager takes no lock and
+# on Windows a second server can bind the same port, so check for a
+# manager.py that neither a task nor a PID file accounted for.
+Start-Sleep -Seconds 2
+$Leftovers = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -match 'manager\.py' })
+if ($Leftovers.Count -gt 0) {
+    Write-Host "[WARNING] manager.py is still running (not named by a PID file):" -ForegroundColor Red
+    $Leftovers | ForEach-Object { Write-Host "    PID $($_.ProcessId): $($_.CommandLine)" -ForegroundColor Red }
+    Write-Host "  If these are Lab Monitor Managers, they must be stopped before the new one starts." -ForegroundColor Yellow
+    $Answer = Read-Host "Stop these processes now? [y/N]"
+    if ($Answer -eq 'y' -or $Answer -eq 'Y') {
+        foreach ($P in $Leftovers) {
+            Stop-Process -Id ([int]$P.ProcessId) -Force -ErrorAction SilentlyContinue
+            Write-Host "  Stopped python.exe PID $($P.ProcessId)"
+        }
+        Start-Sleep -Seconds 2
+        $Leftovers = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.CommandLine -match 'manager\.py' })
+    }
+    if ($Leftovers.Count -gt 0) {
+        Write-Error-Custom "manager.py is still running; the new tasks are NOT registered or started."
+        Write-Host "  Stop it (Stop-Process -Id <PID> -Force), then re-run this installer with -SkipGitPull." -ForegroundColor Yellow
+        Write-Host "  (The configs were written in step 10; the services named by the PID files were stopped.)" -ForegroundColor Yellow
+        exit 1
+    }
+}
 Write-Host ""
 
-# Step 10: Create launcher batch files
-Write-Step "Step 10: Creating launcher batch files"
+# Step 12: Create launcher batch files
+Write-Step "Step 12: Creating launcher batch files"
 # Each launcher runs its service in the foreground and restarts it 10 s after
 # it exits.  The Manager's exit code 2 means "config refused" (e.g. a
-# placeholder token): retrying can't help, so the launcher stops.
+# placeholder token): retrying can't help, so the launcher stops.  Exit code
+# 3 means another Manager holds the data_dir: retried every 60 s.
 # stdout/stderr (startup errors, tracebacks) go to logs\<service>-console.log;
-# the services' own rotating logs are logs\manager.log / logs\dashboard.log.
+# the services' own logs are logs\manager.log (rotating) / logs\dashboard.log.
 # (echo lines put the redirection first: "code 2>> file" would redirect stderr.)
 $ManagerLauncherContent = @"
 @echo off
 REM Lab Monitor Manager launcher - run by the "$ManagerTaskName" scheduled task.
-REM Restarts the Manager if it exits; stops on exit code 2 (config refused).
+REM Restarts the Manager if it exits; stops on exit code 2 (config refused);
+REM waits 60 s on exit code 3 (another Manager holds the data_dir).
 setlocal
 set LOG=$LogsDir\manager-console.log
 cd /d $RepoDir\manager
@@ -630,6 +784,11 @@ set RC=%ERRORLEVEL%
 if "%RC%"=="2" (
     >> "%LOG%" echo [%DATE% %TIME%] config refused - fix manager\config.json, then start the task again
     exit /b 2
+)
+if "%RC%"=="3" (
+    >> "%LOG%" echo [%DATE% %TIME%] another Manager holds the data_dir - retrying in 60 s
+    ping -n 61 127.0.0.1 > nul
+    goto run
 )
 ping -n 11 127.0.0.1 > nul
 goto run
@@ -656,17 +815,11 @@ Set-Content -Path $DashboardLauncher -Value $DashboardLauncherContent -Encoding 
 Write-Success "Launchers created: $ManagerLauncher, $DashboardLauncher"
 Write-Host ""
 
-# Step 11: Register Task Scheduler tasks
-Write-Step "Step 11: Registering Windows Task Scheduler tasks"
-
-# The old single task started both services in the background; replace it
-if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Host "  Removed old task '$LegacyTaskName' (replaced by one task per service)"
-}
+# Step 13: Register Task Scheduler tasks
+Write-Step "Step 13: Registering Windows Task Scheduler tasks"
 
 # S4U = run whether or not the user is logged on, without storing a password
-# (no network access). With a stored password (step 8) the task can reach
+# (no network access). With a stored password (step 7) the task can reach
 # a UNC data_dir.
 $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType S4U -RunLevel Highest
 
@@ -688,6 +841,7 @@ $TaskDefs = @(
     @{ Name = $DashboardTaskName; Launcher = $DashboardLauncher; Description = "Lab Monitor Dashboard (port $DashboardPort)" }
 )
 $RegisterFailed = $false
+$RegisteredNow = @()
 foreach ($Def in $TaskDefs) {
     $Action = New-ScheduledTaskAction -Execute $Def.Launcher
     $TaskArgs = @{
@@ -708,14 +862,34 @@ foreach ($Def in $TaskDefs) {
     }
     try {
         Register-ScheduledTask @TaskArgs | Out-Null
+        $RegisteredNow += $Def.Name
         Write-Success "Task registered: $($Def.Name)"
     } catch {
         Write-Error-Custom "Failed to register task '$($Def.Name)': $($_.Exception.Message)"
         $RegisterFailed = $true
     }
 }
+$LegacyTask = Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
 if ($RegisterFailed) {
+    if ($LegacyTask) {
+        # Back to the previous setup: the old task (kept) starts both services again
+        foreach ($Name in $RegisteredNow) {
+            Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Start-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
+        Write-Host "  The old task '$LegacyTaskName' was kept and started again (it runs the code checked out now)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  The services are stopped. Start them by hand once the tasks exist:" -ForegroundColor Yellow
+        Write-Host "    Start-ScheduledTask '$ManagerTaskName'; Start-ScheduledTask '$DashboardTaskName'" -ForegroundColor Yellow
+    }
     Write-Host "  Fix the problem (e.g. a wrong password) and re-run with -SkipGitPull." -ForegroundColor Yellow
+    exit 1
+}
+# The old single task started both services in the background; it is
+# replaced only now that both new tasks are registered
+if ($LegacyTask) {
+    Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "  Removed old task '$LegacyTaskName' (replaced by one task per service)"
 }
 Write-Host "  Trigger: at system startup (no login required), restart on failure"
 if ($UseStoredPassword) {
@@ -725,8 +899,8 @@ if ($UseStoredPassword) {
 }
 Write-Host ""
 
-# Step 12: Configure Windows Firewall
-Write-Step "Step 12: Configuring Windows Firewall"
+# Step 14: Configure Windows Firewall
+Write-Step "Step 14: Configuring Windows Firewall"
 Write-Host "  Opening ports $ManagerPort (Manager) and $DashboardPort (Dashboard)..."
 
 # Manager
@@ -745,8 +919,8 @@ if ($LASTEXITCODE -ne 0) {
 Write-Success "Firewall configured"
 Write-Host ""
 
-# Step 13: Start services now (they also start at every boot)
-Write-Step "Step 13: Starting services"
+# Step 15: Start services now (they also start at every boot)
+Write-Step "Step 15: Starting services"
 foreach ($TaskName in @($ManagerTaskName, $DashboardTaskName)) {
     try {
         Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
@@ -757,8 +931,8 @@ foreach ($TaskName in @($ManagerTaskName, $DashboardTaskName)) {
 }
 Write-Host ""
 
-# Step 14: Verify services are running
-Write-Step "Step 14: Verifying services"
+# Step 16: Verify services are running
+Write-Step "Step 16: Verifying services"
 Start-Sleep -Seconds 8
 
 # Win32_Process exposes CommandLine on Windows PowerShell 5.1 (Get-Process does not)
@@ -781,6 +955,15 @@ try {
     Write-Success "Manager /health: $($Health.StatusCode)"
 } catch {
     Write-Host "[WARNING] Manager /health did not answer yet: $($_.Exception.Message)" -ForegroundColor Yellow
+    if ($ConfigCheckPassed) {
+        Write-Host "          On the first start after an upgrade the Manager backs up and migrates the existing" -ForegroundColor Yellow
+        Write-Host "          databases before it listens; that can take minutes on a large data_dir. Follow it in" -ForegroundColor Yellow
+        Write-Host "          $LogsDir\manager.log ('Backed up ...', 'migrated ...') and do not stop it meanwhile." -ForegroundColor Yellow
+        Write-Host "          If manager.log shows nothing new, read $LogsDir\manager-console.log." -ForegroundColor Yellow
+    } else {
+        Write-Host "          The config check in step 9 FAILED (-IgnoreConfigCheck): the Manager refuses its config" -ForegroundColor Red
+        Write-Host "          and will not start until $ManagerConfigFile is fixed (see $LogsDir\manager-console.log)." -ForegroundColor Red
+    }
 }
 Write-Host ""
 
@@ -870,7 +1053,27 @@ Write-Host "   Get-CimInstance Win32_Process -Filter ""Name = 'python.exe'"" | W
 Write-Host ""
 Write-Host "2. Access Dashboard:"
 Write-Host "   http://atlantis.med.harvard.edu:$DashboardPort"
-Write-Host "   (optional login: python app.py --hash-password, then add the 'auth' block - see dashboard\README.md)"
+$FinalDashboard = Read-JsonFile $DashboardConfigFile
+$DashHost = "0.0.0.0"
+$DashPort = $DashboardPort
+if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "host") -and $FinalDashboard.host) {
+    $DashHost = [string]$FinalDashboard.host
+}
+if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "port") -and $FinalDashboard.port) {
+    $DashPort = [string]$FinalDashboard.port
+}
+if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "auth") -and $FinalDashboard.auth) {
+    Write-Host "   Login: enabled (basic auth, user '$($FinalDashboard.auth.username)')"
+} else {
+    Write-Host "   Login: NOT enabled. The Dashboard listens on ${DashHost}:$DashPort, so anyone who can" -ForegroundColor Yellow
+    Write-Host "   reach that port sees host names, user names and folder paths. To require a login:" -ForegroundColor Yellow
+    Write-Host "     conda activate $CondaEnv"
+    Write-Host "     cd $RepoDir\dashboard"
+    Write-Host "     python app.py --hash-password"
+    Write-Host "   then paste the printed ""auth"" block into $DashboardConfigFile and restart the Dashboard:"
+    Write-Host "     Stop-ScheduledTask '$DashboardTaskName'; Start-ScheduledTask '$DashboardTaskName'"
+    Write-Host "   (see dashboard\README.md, Security)"
+}
 Write-Host ""
 Write-Host "3. Check logs:"
 Write-Host "   Get-Content '$LogsDir\manager.log' -Tail 20"

@@ -2,135 +2,88 @@
 
 ## Overview
 
-Atlantis (Windows Server) will run **both** the Manager (central service) and the Collector (monitoring its own system). This document explains how the data storage works when both components share the same machine and data directory.
+Atlantis (Windows Server) runs **both** the Manager and Dashboard (the central services) and a
+Collector (monitoring atlantis itself). This page explains how the two share the machine, the
+checkout and, by default, the data directory.
+
+- One checkout: `E:\Users\lab-monitor\scripts\lab-monitor` holds `manager\`, `dashboard\` and
+  `collector\`. Updating it (installer or `git pull`) updates all three at once.
+- One data directory by default: `E:\Users\lab-monitor\data` is the Manager's `data_dir` and the
+  collector's `data_dir`.
 
 ---
 
 ## Data Directory Structure
 
-Both components use the **same `data_dir`**: `E:\Users\lab-monitor\data`
-
 ```
 E:\Users\lab-monitor\data\
 ├── metrics.db                    ← Manager: central summary DB
-│                                   (devices, device_snapshot, device_totals tables)
+│                                   (devices, device_snapshot, device_totals, per-user, dead_letter)
 │
-├── atlantis\                     ← System folder: "atlantis" (collector name)
+├── atlantis\                     ← one folder per system
 │   ├── data.db                   ← Manager: full history for atlantis
-│   │                               (folder_usage, system_metrics, etc. tables)
+│   ├── data.db.pre-upgrade-<stamp>.bak  ← Manager: copy taken before the upgrade migration
 │   ├── 2026-08.jsonl             ← Collector: archive (append-only)
 │   ├── 2026-09.jsonl             ← Collector: archive
-│   └── queue.json                ← Collector: pending messages (temporary)
+│   ├── queue.json                ← Collector: messages not yet acknowledged
+│   ├── queue.json.lock           ← Collector: queue lock
+│   └── network_snapshot.json     ← Collector: previous network counters
 │
-├── triton\                       ← System folder: "triton" (other collector)
-│   ├── data.db                   ← Manager: full history for triton
-│   ├── 2026-08.jsonl             ← Collector: archive
-│   └── queue.json                ← Collector: pending messages
-│
+├── triton\                       ← another collector: only the Manager's files here
+│   └── data.db
 └── other-system\
-    ├── data.db
-    ├── 2026-08.jsonl
-    └── queue.json
+    └── data.db
 ```
+
+The Manager names each folder after the **normalized** device name (lowercase; anything other than
+`a-z 0-9 _` becomes `_`). The collector names its folder after its configured `name` exactly. They
+meet in one folder when the name is already lowercase letters, digits and `_` (like `atlantis`); on
+Windows, folder names are case-insensitive, so `Atlantis` also lands in `atlantis\`. A name with
+`-` or `.` (e.g. `win-srv`) gives two folders: `win-srv\` (collector) and `win_srv\` (Manager).
+Either way the files don't conflict.
 
 ---
 
 ## Component Responsibilities
 
-### Manager (Flask service, port 5000)
+### Manager (port 5000)
 
-1. **Central summary database** (`metrics.db`):
-   - `devices` table — all registered systems + metadata
-   - `device_snapshot` — latest metrics and disk state per system
-   - `device_totals` — lifetime network bytes, current disk total
+1. **Central summary database** (`metrics.db`): device registry, latest snapshots, lifetime totals,
+   per-user tables, rejected messages.
+2. **Per-system history** (`<system>\data.db`): `folder_usage_msgs` / `folder_usage_items` (one row
+   per folder per daily scan; `folder_usage_legacy` after an upgrade), `system_metrics` (one row per
+   5-minute run), `user_metrics`, and any other `data_type`.
 
-2. **Per-system history databases** (`<system_name>/data.db`):
-   - `folder_usage` table — one row per daily disk run
-   - `system_metrics` table — one row per 5-min metrics run
-   - Any other `data_type` tables
+### Collector (metrics every 5 min, disk daily at 02:00)
 
-### Collector (runs every 5 min for metrics, daily for disk)
-
-1. **Local archives** (`<system_name>/YYYY-MM.jsonl`):
-   - Permanent, append-only record of all measurements
-   - Never deleted; survives network outages
-   - Written **before** any network call
-
-2. **Local queue** (`<system_name>/queue.json`):
-   - Temporary file holding messages ready to send
-   - POSTs to Manager as `POST /api/data/queue`
-   - Deleted only after Manager ACKs with matching `queue_id`
+1. **Local archive** (`<name>\YYYY-MM.jsonl`): permanent, append-only record of every message,
+   written before any network call.
+2. **Local queue** (`<name>\queue.json`): messages waiting for the Manager. Sent in batches to
+   `POST /api/data/queue`; each message is removed once the Manager reports it `stored`,
+   `duplicate` or `rejected`.
 
 ---
 
-## Data Flow: Atlantis (Dual Role)
-
-### 1. Collector runs (every 5 min for metrics, daily for disk)
+## Data Flow on Atlantis
 
 ```
-┌─────────────────────────────────────┐
-│  Collector (atlantis)               │
-│  - Measure CPU%, RAM%, network      │
-│  - Measure disk usage by folder     │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  Append to E:\Users\lab-monitor\data\atlantis\          │
-│              2026-08.jsonl (archive)                    │
-│                                                         │
-│  Example: {"header": {...}, "data": {...}}             │
-└─────────────┬───────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  Append to E:\Users\lab-monitor\data\atlantis\          │
-│            queue.json (staging)                         │
-└─────────────┬───────────────────────────────────────────┘
-              │
-              ▼ POST /api/data/queue
-              │ (to http://localhost:5000)
-┌─────────────▼───────────────────────────────────────────┐
-│  Manager (Flask service, local on same machine)         │
-│  - Receives queue batch                                 │
-│  - Stores in data/atlantis/data.db (per-system)        │
-│  - Updates data/metrics.db (central summary)            │
-│  - Responds with {status: ok, queue_id: "..."}         │
-└─────────────┬───────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  Collector deletes queue.json                           │
-│  (only after verified ACK with matching queue_id)       │
-└─────────────────────────────────────────────────────────┘
-```
+Collector (atlantis, run by Task Scheduler)
+  │  measure CPU / RAM / network / users (every 5 min), disk (02:00)
+  ▼
+append to data\atlantis\YYYY-MM.jsonl  (archive)
+  ▼
+append to data\atlantis\queue.json     (under queue.json.lock)
+  ▼  POST http://localhost:5000/api/data/queue  (atlantis's collector token)
+Manager (task "Lab Monitor Manager")
+  │  store each message in data\atlantis\data.db + update data\metrics.db
+  │  answer per message: stored / duplicate / rejected / error
+  ▼
+Collector removes the acknowledged messages from queue.json; "error" ones stay for the next run
 
-### 2. Dashboard queries (every 30 sec)
-
-```
-┌────────────────────────────────────────────────────────┐
-│  Dashboard (port 5001)                                 │
-│  - GET /api/devices                                    │
-│  - GET /api/metrics/all                                │
-│  - GET /api/usage/all                                  │
-│  - etc.                                                │
-└────────────────────┬─────────────────────────────────┘
-                     │
-                     ▼ (Bearer token auth)
-        ┌────────────────────────────────┐
-        │  Manager (Flask service)       │
-        │  - Query metrics.db            │
-        │  - Return current state        │
-        └────────────────────┬───────────┘
-                             │
-                             ▼
-              ┌──────────────────────────────┐
-              │  E:\Users\lab-monitor\       │
-              │  - data/metrics.db           │
-              │  - data/atlantis/data.db     │
-              │  - data/triton/data.db       │
-              │  - etc.                      │
-              └──────────────────────────────┘
+Dashboard (task "Lab Monitor Dashboard", port 5001)
+  │  GET /api/devices, /api/metrics/all, /api/usage/all, /api/totals, /api/user_metrics/all
+  ▼  (read token, http://localhost:5000)
+Manager reads metrics.db (and data.db for history charts)
 ```
 
 ---
@@ -138,18 +91,22 @@ E:\Users\lab-monitor\data\
 ## Configuration: Atlantis Setup
 
 ### Manager config
-**File:** `E:\Users\lab-monitor\scripts\lab-monitor\manager\local\config.json`
+**File:** `E:\Users\lab-monitor\scripts\lab-monitor\manager\config.json`
 
 ```json
 {
   "host": "0.0.0.0",
   "port": 5000,
   "data_dir": "E:\\Users\\lab-monitor\\data",
-  "auth_tokens": ["YOUR-SECURE-TOKEN"],
-  "cors_origins": [
-    "http://localhost:5001",
-    "http://atlantis.med.harvard.edu:5001"
-  ],
+  "admin_tokens": ["<random admin token>"],
+  "read_tokens": ["<random read token for the Dashboard>"],
+  "collector_tokens": {
+    "atlantis": "<random token for atlantis>",
+    "triton":   "<random token for triton>"
+  },
+  "cors_origins": [],
+  "history_retention_days": null,
+  "backup_before_migration": true,
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
   "log_level": "INFO",
   "debug": false
@@ -165,8 +122,9 @@ E:\Users\lab-monitor\data\
   "id": "windows-atlantis",
   "device_type": "Server",
   "manager_url": "http://localhost:5000",
-  "manager_token": "YOUR-SECURE-TOKEN",
+  "manager_token": "<the atlantis entry of collector_tokens>",
   "volumes": ["E:", "F:"],
+  "scan_paths": ["E:/Users/*"],
   "data_dir": "E:\\Users\\lab-monitor\\data",
   "log_file": "E:\\Users\\lab-monitor\\logs\\collector.log",
   "log_level": "INFO",
@@ -175,20 +133,15 @@ E:\Users\lab-monitor\data\
 }
 ```
 
-**Key points:**
-- `manager_url` is `http://localhost:5000` (same machine)
-- `manager_token` must be in Manager's `auth_tokens` list
-- Both use the same `data_dir` — **no conflict**
-
 ### Dashboard config
-**File:** `E:\Users\lab-monitor\scripts\lab-monitor\dashboard\local\config.json`
+**File:** `E:\Users\lab-monitor\scripts\lab-monitor\dashboard\config.json`
 
 ```json
 {
   "host": "0.0.0.0",
   "port": 5001,
   "manager_url": "http://localhost:5000",
-  "manager_token": "YOUR-SECURE-TOKEN",
+  "manager_token": "<one of the Manager's read_tokens>",
   "refresh_interval_seconds": 30,
   "log_file": "E:\\Users\\lab-monitor\\logs\\dashboard.log",
   "log_level": "INFO",
@@ -196,154 +149,125 @@ E:\Users\lab-monitor\data\
 }
 ```
 
+**Key points:**
+- `manager_url` is `http://localhost:5000` for both the collector and the Dashboard.
+- The collector's `manager_token` is its own `collector_tokens` entry (key = its `name`); the
+  Dashboard's is a read token. A legacy `auth_tokens` token still works for both, with full rights.
+- Both components may use the same `data_dir`; their files never conflict.
+
 ---
 
 ## Concurrency & Safety
 
-### No conflicts between Collector and Manager
+| Component | Files | Location | Access |
+|-----------|-------|----------|--------|
+| Collector | `YYYY-MM.jsonl` | `data\<name>\` | Append only |
+| Collector | `queue.json`, `queue.json.lock` | `data\<name>\` | Locked, atomic rewrite |
+| Manager | `data.db` (+ `-wal`, `-shm`) | `data\<normalized name>\` | SQLite, one locked connection per database |
+| Manager | `metrics.db` (+ `-wal`, `-shm`) | `data\` | SQLite, one locked connection |
 
-| Component | Files Created | Location | Access |
-|-----------|---------------|----------|--------|
-| **Collector** | `YYYY-MM.jsonl` | `data/<name>/` | Write-append only |
-| **Collector** | `queue.json` | `data/<name>/` | Create, write, delete |
-| **Manager** | `data.db` | `data/<name>/` | SQLite (threaded) |
-| **Manager** | `metrics.db` | `data/` | SQLite (threaded) |
+- The Manager uses SQLite WAL mode: readers don't block the writer. Writes for one message happen in
+  one transaction. A writer waits up to 10 s for a lock another process holds (for example a database
+  browser with an open transaction); if the database stays locked, the messages are answered `error`
+  and stay queued on the collectors.
+- Only **one** Manager may use the data directory. The installer stops older instances before it
+  starts the task; check with
+  `Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object CommandLine -match 'manager\.py'`.
+- The collector and the Manager don't share any file.
 
-### SQLite WAL mode
-
-Both Manager databases use SQLite WAL (Write-Ahead Logging):
-```python
-db.execute('PRAGMA journal_mode=WAL')
-```
-
-This means:
-- ✅ Multiple readers can access the same database simultaneously
-- ✅ A writer doesn't block readers (and vice versa)
-- ✅ Collector can write to `queue.json` while Manager reads `data.db`
-- ✅ Safe for concurrent access from multiple processes
-
-### Network loop (all on localhost)
-
-Collector POSTs to Manager at `http://localhost:5000`:
-- ✅ No network latency; local IPC-like speed
-- ✅ Instant acknowledgment
-- ✅ Queue deletion happens immediately after successful ACK
+**Things that touch the shared data directory:**
+- `tools\verify_upgrade.py` reads it and fingerprints every file; the collector's own archive and
+  queue changing during the run show up as a `source` difference (see
+  [UPGRADE.md](UPGRADE.md#step-1-verify-against-your-real-data)).
+- Re-running `install-collector-windows.ps1` resets the permissions of everything under
+  `E:\Users\lab-monitor` (SYSTEM and Administrators get full control, Users read), including the
+  Manager's databases. The data itself is not changed; the Manager tasks run elevated as an
+  administrator and keep access.
+- Upgrading the checkout upgrades the collector together with the Manager: don't do it while
+  atlantis's 02:00 disk run is in progress.
 
 ---
 
 ## Data Retention
 
-### Archives (permanent)
+| Data | Retention |
+|------|-----------|
+| Collector archives `data\atlantis\YYYY-MM.jsonl` | Forever (never deleted by the collector) |
+| Manager history (`data.db`, `user_metrics_history`) | Forever by default. With `history_retention_days` set, rows older than that are appended to `data\<system>\archive\<YYYY-MM>-<data_type>.jsonl` and then deleted, once a day |
+| Manager snapshots and totals (`metrics.db`) | One row per system, always current |
+| Pre-upgrade backups (`*.pre-upgrade-*.bak`) | Until you delete them (after the upgrade is confirmed) |
+| Queue `queue.json` | Until acknowledged (usually seconds) |
 
-`data/atlantis/2026-08.jsonl`, `data/atlantis/2026-09.jsonl`, etc.
-- **Retention:** Forever (unless manually deleted)
-- **Size:** Small (one entry per collection run)
-- **Purpose:** Permanent local record
-
-### Central summary (Manager)
-
-`data/metrics.db`
-- **Retention:** Configurable via `retention_days` in Manager config (default: 90 days)
-- **Size:** Very small (one snapshot per system)
-- **Purpose:** Current state for Dashboard
-
-### Per-system history (Manager)
-
-`data/atlantis/data.db`, `data/triton/data.db`, etc.
-- **Retention:** Configurable via `retention_days`
-- **Size:** Moderate (one row per collection run; ~24 metrics runs/day × systems)
-- **Purpose:** Full typed history for trend analysis
-
-### Queue (temporary)
-
-`data/atlantis/queue.json`
-- **Retention:** Until ACK'd (usually seconds)
-- **Size:** Small (batched messages)
-- **Purpose:** Ensures reliable delivery
+`retention_days` (from older configs) has no effect.
 
 ---
 
-## Disk Space Estimate (Atlantis)
+## Disk Space
 
-For atlantis running both Manager and as a collector for 1 year:
+Rough growth per system:
+- `system_metrics`: 288 rows a day (one per 5 minutes).
+- `user_metrics`: 288 rows a day per active user, in `data.db` and in `metrics.db`.
+- `folder_usage`: one scan a day, one row per folder.
+- The collector archive holds every message once more as JSON.
 
+To see the real numbers:
+```powershell
+Get-ChildItem E:\Users\lab-monitor\data -Recurse -File | Measure-Object -Property Length -Sum
+Get-ChildItem E:\Users\lab-monitor\data -Recurse -Filter *.db | Sort-Object Length -Descending | Select-Object FullName, Length -First 10
 ```
-Archives (2026-01.jsonl through 2026-12.jsonl):
-  - 12 months × 30 disk runs/month + ~260 metric runs/month
-  - ~290 messages/month × 500 bytes/message ≈ 145 KB/month
-  - 1 year: ~1.7 MB
-
-data.db per system (atlantis + other collectors, e.g., 5 systems):
-  - Per system: ~260 metric runs/month × 12 months = 3,120 rows/year
-  - Plus daily disk runs: ~30 rows/month × 12 months = 360 rows/year
-  - Per system: ~3,480 rows/year × 200 bytes/row ≈ 700 KB/system/year
-  - 5 systems: ~3.5 MB
-
-metrics.db (central summary, ~10 KB per snapshot):
-  - devices table: ~10 rows × 200 bytes = 2 KB
-  - device_snapshot table: ~10 rows × 1 KB = 10 KB
-  - device_totals table: ~10 rows × 500 bytes = 5 KB
-  - Total: ~20 KB
-
-TOTAL for 1 year with 5 collectors: ~6-8 MB
-```
-
-**Atlantis drive space:** 6-8 MB is negligible. Even 10 years would be <100 MB.
 
 ---
 
 ## Advantages of This Setup
 
-1. **Simple installation** — only one Windows server needed for central monitoring
-2. **Self-monitoring** — atlantis automatically reports its own health
-3. **No external dependencies** — no separate Manager host required
-4. **Low overhead** — localhost traffic is instant; no network delays
-5. **Reliable** — queue survives Manager outages (though unlikely since it's the same machine)
-6. **Scalable** — add more collectors (Synology, other Windows servers) without changing atlantis setup
+1. **Simple installation**: one Windows server for the central services
+2. **Self-monitoring**: atlantis reports its own health
+3. **No external dependencies**: no separate Manager host
+4. **Low overhead**: the collector reaches the Manager over localhost
+5. **Reliable**: the collector's queue survives a Manager restart
+6. **Scalable**: add more collectors without changing atlantis
 
 ---
 
 ## Troubleshooting Atlantis Dual Role
 
-### "Manager connection refused" in Collector logs
-
-**Cause:** Manager service not running  
-**Fix:** Check Windows Task Scheduler:
+### "Network error" / connection refused in the collector log
+The Manager isn't running (or is still migrating after an upgrade):
 ```powershell
-Get-ScheduledTask -TaskName "Lab Monitor*" | Select-Object -Property TaskName, State
-tasklist | findstr python
+Get-ScheduledTask -TaskName "Lab Monitor*" | Select-Object TaskName, State
+Get-Content E:\Users\lab-monitor\logs\manager-console.log -Tail 20
+Invoke-RestMethod http://localhost:5000/health
 ```
 
-### "Invalid token" from Manager
-
-**Cause:** Collector's `manager_token` doesn't match Manager's `auth_tokens`  
-**Fix:** Verify both configs have same token:
+### HTTP 401 / 403 in the collector log
+401: the collector's `manager_token` matches no Manager token. 403: it is another device's
+collector token (the `collector_tokens` key must be this collector's `name`) or a read token.
 ```powershell
-notepad E:\Users\lab-monitor\scripts\lab-monitor\manager\local\config.json
+notepad E:\Users\lab-monitor\scripts\lab-monitor\manager\config.json
 notepad E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json
 ```
+Restart the Manager after changing its config.
 
-### Queue.json accumulating (not being deleted)
-
-**Cause:** Manager not responding with ACK or ACK has wrong `queue_id`  
-**Fix:** Check Manager logs:
+### queue.json keeps growing
+The Manager is not acknowledging. Check the collector log for the HTTP status and the Manager log:
 ```powershell
+Get-Content E:\Users\lab-monitor\logs\collector.log -Tail 50
 Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 50
 ```
+Messages answered `error` stay queued on purpose (a database problem on the Manager side).
 
-### Dashboard shows stale data
-
-**Cause:** Manager running but Dashboard not refreshing  
-**Fix:** Verify Dashboard can reach Manager:
+### Dashboard shows "Manager unreachable" or stale data
 ```powershell
-curl http://localhost:5000/health
-# Should return: {"status": "ok"}
+Invoke-RestMethod http://localhost:5000/health      # {"status": "ok"}
+Invoke-RestMethod http://localhost:5001/health
 ```
+The Dashboard banner lists the failing Manager calls; `HTTP 401` means its `manager_token` is wrong.
 
 ---
 
 ## See Also
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System design
+- [UPGRADE.md](UPGRADE.md) — Upgrading an existing installation
 - [INSTALLATION.md](../INSTALLATION.md) — Installation steps
-- [CONFIG.md](../CONFIG.md) — Configuration security
+- [CONFIG.md](../CONFIG.md) — Configuration and security
