@@ -29,6 +29,7 @@ from werkzeug.exceptions import HTTPException
 from functools import wraps
 import re
 
+import snapshot
 from metrics import MetricsDB
 from data_store import (
     TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE,
@@ -191,6 +192,7 @@ _logger = logging.getLogger('manager')
 _metrics_db = None
 _data_store = None
 _user_metrics = None   # initialised in init_app()
+_snapshots = None      # snapshot.SnapshotRunner, initialised in init_app()
 _auth = None
 _cors_enabled = False
 # Grandfathered device names already logged once by this process
@@ -383,12 +385,16 @@ def validate_config(config: dict, logger: logging.Logger) -> _AuthConfig:
             raise ConfigError(f"{key} must be a positive integer")
     if not isinstance(config.get('backup_before_migration', True), bool):
         raise ConfigError("backup_before_migration must be true or false")
+    try:
+        snapshot.settings_from_config(config)
+    except ValueError as e:
+        raise ConfigError(str(e))
     return auth
 
 
 def init_app(config: dict, logger: logging.Logger = None):
     """Initialize app with config. Raises ConfigError for unsafe config."""
-    global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled
+    global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled, _snapshots
     logger = logger or logging.getLogger('manager')
 
     auth = validate_config(config, logger)
@@ -433,6 +439,12 @@ def init_app(config: dict, logger: logging.Logger = None):
     # User metrics store (per-user CPU/RAM snapshots and history)
     _user_metrics = _metrics_db.users
     logger.info("User metrics store initialized")
+
+    # Nightly snapshots to a second location (scheduled by main(), not here)
+    if _snapshots is not None:
+        _snapshots.stop()
+    _snapshots = snapshot.SnapshotRunner(data_dir, snapshot.settings_from_config(config),
+                                         logging.getLogger('snapshot'))
 
     for name in _metrics_db.get_all_systems():
         if not is_valid_device_name(name):
@@ -1308,6 +1320,43 @@ def delete_system(name: str):
 
 
 # ---------------------------------------------------------------------------
+# Snapshots to a second location (off unless snapshot.enabled)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/snapshot', methods=['GET'])
+@require_scope('read')
+def get_snapshot_status():
+    """
+    Snapshot settings and the outcome of the last runs:
+        {"enabled", "dest_dir", "time", "keep_daily", "keep_monthly",
+         "running", "running_since", "next_run", "last_attempt",
+         "last_success", "last_snapshot", "last_bytes", "last_files",
+         "last_seconds", "last_failure", "last_error", "hours_since_success"}
+    Times are UTC ISO-8601.  A last_failure newer than last_success means the
+    most recent run failed (last_error says why).
+    """
+    return jsonify(_snapshots.describe()), 200
+
+
+@app.route('/api/snapshot', methods=['POST'])
+@require_scope('admin')
+def run_snapshot():
+    """Start a snapshot now, in the background (admin token).  202, or 409."""
+    if not _snapshots.settings['enabled']:
+        return _error(409, "Snapshots are disabled (set snapshot.enabled and snapshot.dest_dir)")
+    if _snapshots._thread is None or not _snapshots._thread.is_alive():
+        # Not started by main() (e.g. under a test client): run on a one-off thread
+        if _snapshots.running_since is not None:
+            return _error(409, "A snapshot is already running")
+        threading.Thread(target=_snapshots.run, args=('manual',),
+                         name='nas-snapshot-manual', daemon=True).start()
+    elif not _snapshots.trigger():
+        return _error(409, "A snapshot is already running")
+    _logger.info(f"Snapshot requested via POST /api/snapshot from {request.remote_addr}")
+    return jsonify({"status": "started", "dest_dir": _snapshots.settings['dest_dir']}), 202
+
+
+# ---------------------------------------------------------------------------
 # History retention (off unless history_retention_days is set)
 # ---------------------------------------------------------------------------
 
@@ -1405,6 +1454,7 @@ def main():
     logger.info("=" * 60)
 
     start_retention_thread(config, logger)
+    _snapshots.start()
 
     host = config.get("host", "0.0.0.0")
     port = config.get("port", 5000)

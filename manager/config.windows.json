@@ -17,6 +17,14 @@
   "backup_before_migration": true,
   "threads": 8,
 
+  "snapshot": {
+    "enabled": false,
+    "dest_dir": "\\\\nas.example.org\\lab-monitor\\snapshots",
+    "time": "03:30",
+    "keep_daily": 14,
+    "keep_monthly": 12
+  },
+
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
   "log_level": "INFO",
   "log_max_bytes": 10485760,

@@ -50,7 +50,8 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `backup_before_migration` | `true` | Before the Manager changes a database written by an older version for the first time, it copies it to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` next to it. If the copy fails, that database is not migrated. `false` migrates without a copy. See [Upgrading](#upgrading-from-the-previous-manager). |
 | `threads` | 8 | waitress worker threads. |
 | `log_file` | none | Rotating log file (10 MiB × 5; `log_max_bytes`, `log_backup_count`). Every module logs here. An existing file larger than `log_max_bytes` (the previous Manager's unrotated log) is renamed to `<log_file>.pre-rotation-<stamp>` at startup, outside the rotation set, so rotation never deletes it. `--check-config` never opens the log file. |
-| `data_dir` | `data` | Where `metrics.db` and the per-system databases live. A UNC path (`\\server\share\...`) works, but see [Running from Task Scheduler](#running-from-task-scheduler). Mapped drive letters don't work for scheduled tasks. |
+| `data_dir` | `data` | Where `metrics.db` and the per-system databases live. **Use a local disk.** SQLite in WAL mode is not safe on a network share (it showed up as `disk I/O error` and failed transactions); keep a copy on the NAS with [snapshots](#snapshots-to-a-nas) instead. A UNC path (`\\server\share\...`) still starts, but see [Running from Task Scheduler](#running-from-task-scheduler). Mapped drive letters don't work for scheduled tasks. |
+| `snapshot` | disabled | Daily copy of every database to `snapshot.dest_dir` (e.g. a NAS share). See [Snapshots to a NAS](#snapshots-to-a-nas). |
 | `log_level` | `INFO` | Level for the log file. The console gets `WARNING` and above when a log file is set (`console_log_level` to change). |
 
 **The Manager refuses to start** (exit code 2) if any configured token is a placeholder (contains `CHANGE-ME`, `YOUR-`, `GENERATE-RANDOM`, `PLACEHOLDER`, …) or is shorter than 16 characters, or if no tokens are configured at all. `python manager.py --config config.json --check-config` validates the config and exits without starting (it touches no database and no log file).
@@ -294,6 +295,8 @@ Time series of one numeric field, oldest first. A volume path that lost its lead
 | Endpoint | Meaning |
 |----------|---------|
 | `GET /api/dead_letter?limit=100` | Most recent rejected messages with the reason and raw message |
+| `GET /api/snapshot` | Snapshot settings and outcome: `enabled`, `dest_dir`, `time`, `running`, `next_run`, `last_success`, `last_snapshot`, `last_failure`, `last_error`, `hours_since_success` (read token) |
+| `POST /api/snapshot` | Start a snapshot now, in the background: `202`, or `409` if one is running or snapshots are disabled (admin token) |
 | `DELETE /api/system/<name>` | Permanently deletes the system's central rows (registry, snapshot, totals, per-user rows) and its `data.db`. Any spelling of the name works: the row of exactly that spelling if one is registered, else the one it resolves to. If another registered spelling shares the `data.db` (see [Central summary](#central-summary-metricsdb)), only the named one's central rows go and the `data.db` is kept (`per_system_db_kept_for`). |
 
 ### Health
@@ -315,6 +318,58 @@ python archive_metrics.py --config config.json --days 365
 ```
 
 ---
+
+## Snapshots to a NAS
+
+The live databases belong on a local disk; the Manager copies them to a second location once a day so they are backed up there (and covered by that NAS's own snapshots and replication).
+
+```json
+"snapshot": {
+  "enabled": true,
+  "dest_dir": "\\\\nas.example.org\\lab-monitor\\snapshots",
+  "time": "03:30",
+  "keep_daily": 14,
+  "keep_monthly": 12
+}
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn snapshots on. `dest_dir` is then required. |
+| `dest_dir` | — | Where snapshots go. A UNC path for a share. It must be outside `data_dir`. The Manager's account needs write access to it (see [Running from Task Scheduler](#running-from-task-scheduler)). |
+| `time` | `03:30` | Daily start, local server time (after the collectors' 02:00 disk scans). |
+| `keep_daily` | 14 | The newest N snapshots are kept. |
+| `keep_monthly` | 12 | Also kept: the newest snapshot of each of the last N months. `0` for none. |
+| `verify_copy` | `true` | Read every copied file back from `dest_dir` and compare its SHA-256. |
+| `catch_up` | `true` | If the Manager was down at the scheduled time, take the missed snapshot `startup_delay_seconds` (600) after it starts. |
+
+**What one run does.** Each database (`metrics.db`, every `<system>/data.db`) is copied with SQLite's online backup API to `<data_dir>\.snapshot-staging\`. That is a consistent copy, taken while the Manager keeps storing messages. Each copy is made self-contained (`journal_mode=DELETE`, no `-wal` file) and checked with `PRAGMA quick_check`. The checked files, plus any retention archives under `<system>/archive/`, are then copied to `<dest_dir>\snapshot-<UTC stamp>.partial\` as plain files, so SQLite never opens anything on the share. Each one is read back and compared by SHA-256. `manifest.json` (files, sizes, hashes, row counts per table) is written, and the folder is renamed to `snapshot-<stamp>`. **A folder without `.partial` is always complete.** A failed run removes its `.partial` folder and staging files and logs an `ERROR`; the previous snapshots are untouched.
+
+**Space.** Staging needs free space on the `data_dir` disk about the size of the databases, only during the run. `dest_dir` needs that much per kept snapshot. A run that would not fit is refused before it copies anything.
+
+**Pruning** deletes only folders named `snapshot-<stamp>` that hold a `manifest.json` and are outside the keep rules, and the Manager's own `.partial` folders older than a day. Nothing else in `dest_dir` is touched.
+
+**Checking.** `GET /api/snapshot` (read token) shows the last success and failure. A `last_failure` newer than `last_success` means the last run failed; `last_error` says why. `POST /api/snapshot` (admin token) takes one now. To check a snapshot's files against its manifest and run `quick_check` on each database (read-only; nothing is written next to it):
+
+```powershell
+python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapshot-20261122T083000Z
+```
+
+**Restoring.**
+1. Stop the Manager.
+2. Move the current `metrics.db`, `<system>\data.db` and their `-wal` / `-shm` files aside.
+3. Copy all databases from one snapshot folder into `data_dir`. They belong to one point in time, so copy them together.
+4. Start the Manager. Collectors still hold anything not yet acknowledged; messages acknowledged after the snapshot are in the collectors' JSONL archives (`tools/replay_archives.py`).
+
+### Moving `data_dir` off the NAS
+
+1. Stop the Manager task and check that no `manager.py` is left running.
+2. Copy the whole old `data_dir` (with `-wal` / `-shm` files, while the Manager is stopped) to a local folder, e.g. `E:\Users\lab-monitor\manager-data`:
+   `robocopy \\nas\share\old-data-dir E:\Users\lab-monitor\manager-data /E /COPY:DAT /R:1 /W:1`. Exit codes below 8 are success.
+3. In `manager\config.json` set `data_dir` to the local folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a `snapshots` folder next to the old data).
+4. Re-run the installer. It sees the UNC `dest_dir` and registers the tasks with a stored password, because an S4U task can't reach a share.
+5. Start the Manager. Check `/health` and the Dashboard, then `POST /api/snapshot` and `GET /api/snapshot` until `last_success` is set, and `snapshot.py verify` the new folder.
+6. Keep the old NAS `data_dir` untouched until you have checked a few days; then remove it by hand.
 
 ## Upgrading from the previous Manager
 
@@ -351,7 +406,7 @@ python archive_metrics.py --config config.json --days 365
 `install-manager-dashboard-taskscheduler.ps1` registers the tasks "Lab Monitor Manager" and "Lab Monitor Dashboard". They start at boot, whether or not anyone is logged on, and restart on failure.
 
 - **Local `data_dir` (the default, `E:\Users\lab-monitor\data`):** the tasks run as the installing user through S4U, so no password is stored.
-- **`data_dir` or a `log_file` on a UNC path (`\\server\share\...`):** an S4U task has no network access and couldn't open the share. The installer detects this, asks for the account's password (or takes `-TaskCredential (Get-Credential)`), and registers the tasks with that stored password. The account needs access to the share. Re-run the installer after that password changes, or the tasks stop starting.
+- **`data_dir`, a `log_file` or an enabled `snapshot.dest_dir` on a UNC path (`\\server\share\...`):** an S4U task has no network access and couldn't open the share. The installer detects this, asks for the account's password (or takes `-TaskCredential (Get-Credential)`), and registers the tasks with that stored password. The account needs access to the share. Re-run the installer after that password changes, or the tasks stop starting.
 - **Mapped drive letters (`Z:\...`):** scheduled tasks can't see drive mappings. The installer stops before it installs packages, writes a config or touches a service, and asks you to use the UNC path.
 - **A config the new Manager refuses** stops the installer before it stops the running services or writes a config (`-IgnoreConfigCheck` overrides that).
 - **Re-running the installer** keeps both config files. `-ForceNewConfig` regenerates only the tokens (the old files are backed up). `data_dir`, the log paths, retention, ports and the Dashboard login are kept, but every existing token goes, `auth_tokens` and `collector_tokens` included: collectors get `401` until they have new ones.

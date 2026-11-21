@@ -562,6 +562,11 @@ if (-not $FinalDashboard) { $FinalDashboard = Read-JsonFile $DashboardConfigFile
 if ($FinalManager) {
     $ServicePaths["Manager data_dir"] = [string]$FinalManager.data_dir
     $ServicePaths["Manager log_file"] = [string]$FinalManager.log_file
+    # Nightly snapshots are written by the Manager task, so a share there needs
+    # network access just like a UNC data_dir
+    if ($FinalManager.snapshot -and $FinalManager.snapshot.enabled -eq $true) {
+        $ServicePaths["Manager snapshot.dest_dir"] = [string]$FinalManager.snapshot.dest_dir
+    }
 }
 if ($FinalDashboard) {
     $ServicePaths["Dashboard log_file"] = [string]$FinalDashboard.log_file
