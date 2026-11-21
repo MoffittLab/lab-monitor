@@ -5,22 +5,32 @@ Lab Monitor Collector
 Runs on each NAS/Windows system with two modes:
 
 DISK MODE (daily):
-  1. Measures disk usage of configured folders (auto-discovers if not specified)
+  1. Measures disk usage of configured folders (auto-discovers if not specified),
+     and in the same walk the storage breakdown: file counts, cold data and
+     usage per file owner (a second message, storage_breakdown)
   2. Appends to local archive (monthly JSONL)
   3. Appends entry to queue.json
   4. POSTs the queue to the Manager in batches
   5. Removes each message from queue.json once the Manager acknowledges it
 
 METRICS MODE (every 5 minutes):
-  1. Measures CPU%, RAM%, network traffic
-  2. Appends to local archive (monthly JSONL)
-  3. Appends entry to queue.json
+  1. Measures CPU (averaged since the previous run, from OS counters), RAM,
+     network traffic, disk I/O, GPUs, and CPU-seconds / RAM / GPU use per user
+  2. Appends system and user metrics to the local archive (monthly JSONL) and
+     queue.json: from here on they are safe whatever else happens
+  3. Runs the optional collectors (who is connected, storage health), each in
+     a thread with its own time budget, and records their messages too
   4. POSTs the queue to the Manager in batches
   5. Removes each message from queue.json once the Manager acknowledges it
+
+HEALTH MODE (by hand): a full storage-health check, recorded and sent at once.
 
 Usage:
     python collector.py --config config.json --mode disk     # Daily
     python collector.py --config config.json --mode metrics  # Every 5 min
+    python collector.py --config config.json --mode health   # Storage health now
+    Add --dry-run (any mode) to print the messages as JSON on stdout instead:
+    nothing is archived, queued, sent or saved.
 
 Configuration:
     If 'volumes' is omitted, collector auto-discovers volume* directories
@@ -35,11 +45,13 @@ import json
 import logging
 import logging.handlers
 import argparse
+import importlib
 import re
 import socket
+import threading
 import time
 import uuid
-from collections import Counter, deque
+from collections import Counter, deque, namedtuple
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -54,6 +66,12 @@ if _COLLECTOR_DIR not in sys.path:
 
 from lib import local_queue
 from lib import disk_usage
+from lib import gpu
+from lib import perf_counters
+from lib import platform_info
+from lib import proc_accounting
+from lib import settings
+from lib import storage_breakdown
 from lib.disk_usage import (discover_folders, discover_volumes, format_bytes,
                             measure_volume_capacity, scan_folders)
 
@@ -208,20 +226,14 @@ def get_platform(config: dict) -> str:
     """
     'synology', 'linux' or 'windows': config "platform" when set, otherwise
     detected (Windows; Synology when a DSM marker file such as
-    /etc/synoinfo.conf exists; any other host is 'linux').
+    /etc/synoinfo.conf exists; any other host is 'linux'). The one answer
+    every module uses: lib/platform_info.platform_kind.
     """
-    override = config.get('platform')
-    if override is not None:
-        value = str(override).strip().lower()
-        if value in disk_usage.PLATFORMS:
-            return value
-        logger.warning(f"Invalid platform {override!r} in config (expected one of "
-                       f"{', '.join(disk_usage.PLATFORMS)}); detecting it instead")
-    return disk_usage.detect_platform()
+    return platform_info.platform_kind(config)
 
 
-def get_data_dir(config: dict) -> str:
-    """Get or create data directory from config"""
+def get_data_dir(config: dict, create: bool = True) -> str:
+    """Get (and unless create=False, create) the data directory from config"""
     if sys.platform == 'win32':
         # Windows
         data_dir = config.get('data_dir', 'data')
@@ -232,8 +244,17 @@ def get_data_dir(config: dict) -> str:
         data_dir = (DEFAULT_LINUX_DATA_DIR if get_platform(config) == 'linux'
                     else '/volume1/lab-monitor/data')
     
-    os.makedirs(data_dir, exist_ok=True)
+    if create:
+        os.makedirs(data_dir, exist_ok=True)
     return data_dir
+
+
+def _device_dir(config: dict, nas_name: str, create: bool = True) -> str:
+    """data/<name>/, where this device's queue, archive and state files live."""
+    nas_dir = os.path.join(get_data_dir(config, create), nas_name)
+    if create:
+        os.makedirs(nas_dir, exist_ok=True)
+    return nas_dir
 
 
 def get_archive_path(config: dict, nas_name: str) -> str:
@@ -323,14 +344,14 @@ def _fmt(value, suffix: str = '') -> str:
     return 'n/a' if value is None else f"{value}{suffix}"
 
 
-def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
-                     logger: logging.Logger) -> bool:
+def _record(config: dict, name: str, entries: list, logger: logging.Logger) -> bool:
     """
-    Write new messages to the permanent archive and the queue, then sync.
+    Write new messages to the permanent archive and the queue (no sync).
     
     Both appends happen under the queue lock so concurrent collector runs
     can't interleave archive lines or lose each other's queue entries. The
-    archive is written even if the queue can't be updated.
+    archive is written even if the queue can't be updated. True once the
+    messages are queued.
     """
     try:
         archive_path = get_archive_path(config, name)
@@ -363,10 +384,32 @@ def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
         return False
 
     logger.info(f"Archived {len(entries)} message(s) to {archive_path}; queue now holds {queued}")
+    return True
 
-    # Try to sync queue to manager
+
+def _sync(config: dict, name: str, system_id: str, logger: logging.Logger) -> bool:
+    """Post the queue to the Manager (sync_queue_to_manager)."""
+    try:
+        queue_path = get_queue_path(config, name)
+    except OSError as e:
+        logger.error(f"Cannot create the data directory for {name} (data_dir={config.get('data_dir')!r}): "
+                     f"{e}. Nothing was sent to the Manager.")
+        return False
     return sync_queue_to_manager(config, name, system_id, queue_path, logger)
-        
+
+
+def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
+                     logger: logging.Logger) -> bool:
+    """_record() the messages, then _sync() the queue (disk mode)."""
+    if not _record(config, name, entries, logger):
+        return False
+    return _sync(config, name, system_id, logger)
+
+
+def _print_messages(entries: list) -> None:
+    """--dry-run: the messages as one JSON list on stdout (the log goes to stderr)."""
+    print(json.dumps(entries, indent=2), flush=True)
+
 
 def _path_key(path: str) -> str:
     """Normalised path for equality checks ('E:\\' ~ 'e:', '/volume1/' ~ '/volume1')."""
@@ -399,7 +442,8 @@ def _measure_volumes(volumes: list, logger: logging.Logger) -> tuple:
 
 
 def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_type: str,
-                        timeout: float, total_timeout: float, logger: logging.Logger) -> dict:
+                        timeout: float, total_timeout: float, logger: logging.Logger,
+                        breakdown=None) -> dict:
     """
     Folder usage, driven by 'scan_paths'.
 
@@ -423,11 +467,16 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
     filesystem are authoritative (they include snapshots, metadata and the
     system folders the scanner skips). Use "/volume1/*" for a breakdown.
 
+    breakdown: disk_usage.BreakdownOptions for the storage breakdown, or None.
+
     Returns: {'sizes': {path: bytes}, 'timed_out': [...], 'errors': [...], 'seconds': float}
+    With breakdown also 'files', 'folder_seconds', 'breakdown' and
+    'breakdown_unavailable' (see disk_usage.scan_folders).
     """
     start = time.monotonic()
     deadline = start + total_timeout
     sizes, timed_out, errors = {}, [], []
+    extra = {'files': {}, 'folder_seconds': {}, 'breakdown': {}, 'breakdown_unavailable': []}
     volume_roots = {_path_key(v) for v in volume_used}
     seen = set()
 
@@ -447,7 +496,14 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
                 continue
             seen.add(key)
             todo.append(folder)
-        result = scan_folders(todo, timeout=timeout, deadline=deadline)
+        if breakdown is None:
+            result = scan_folders(todo, timeout=timeout, deadline=deadline)
+        else:
+            result = scan_folders(todo, timeout=timeout, deadline=deadline, breakdown=breakdown)
+            extra['files'].update(result.get('files') or {})
+            extra['folder_seconds'].update(result.get('seconds') or {})
+            extra['breakdown'].update(result.get('breakdown') or {})
+            extra['breakdown_unavailable'].extend(result.get('breakdown_unavailable') or [])
         sizes.update(result['sizes'])
         timed_out.extend(result['timed_out'])
         errors.extend(result['errors'])
@@ -533,12 +589,15 @@ def _measure_scan_paths(scan_paths: list, volumes: list, volume_used: dict, nas_
                 logger.error(f"Failed to scan scan_paths entry {spec!r}: {e}", exc_info=True)
                 errors.append(str(spec))
 
-    return {
+    result = {
         'sizes':     sizes,
         'timed_out': timed_out,
         'errors':    errors,
         'seconds':   round(time.monotonic() - start, 1),
     }
+    if breakdown is not None:
+        result.update(extra)
+    return result
 
 
 def _default_total_timeout(timeout: float, entries: int, windows: bool) -> float:
@@ -576,11 +635,21 @@ def _scan_policy(config: dict, nas_type: str):
                                  include_network=include_network)
 
 
-def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
+def collect_disk_usage(config: dict, logger: logging.Logger, dry_run: bool = False) -> bool:
     """
     Collect disk usage (daily mode).
 
     Legacy scan_depth parameter in config is silently ignored; use scan_paths instead.
+    dry_run: print the message instead of recording and sending it.
+
+    With storage_breakdown.enabled (default) the same walk also measures
+    file counts, cold data and (Linux, DSM) per-owner usage, sent as a
+    second message, 'storage_breakdown' (lib/storage_breakdown.py);
+    folder_usage is built exactly as without it. The time each folder took
+    is kept in storage_breakdown_state.json (never by dry_run): only a
+    folder whose previous measurement took at most
+    storage_breakdown.max_timeout_fraction of its timeout gets the slower
+    breakdown walker (disk_usage.BreakdownOptions).
     """
     logger.info("=== DISK USAGE COLLECTION ===")
 
@@ -634,9 +703,12 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         # ------------------------------------------------------------------
         # 2. Folder usage — driven by 'scan_paths' (see _measure_scan_paths).
         # ------------------------------------------------------------------
+        breakdown = _breakdown_options(config, name, nas_type, logger)
         with disk_usage.scan_policy(policy):
             scan = _measure_scan_paths(scan_paths, volumes, volume_used, nas_type,
-                                       timeout, total_timeout, logger)
+                                       timeout, total_timeout, logger,
+                                       breakdown=breakdown.scan_options(breakdown.previous)
+                                       if breakdown is not None else None)
         if scan['timed_out'] or scan['errors']:
             logger.warning(
                 f"Disk scan incomplete: {len(scan['timed_out'])} folder(s) timed out, "
@@ -662,15 +734,297 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
                 '_scan_seconds': scan['seconds'],
             }
         }
+        entries = [entry]
+        if breakdown is not None:
+            payload = storage_breakdown.build_payload(scan, list(scan['sizes']), breakdown)
+            if payload is not None:
+                entries.append({'header': build_header(name, system_id, device_type),
+                                'data': {'data_type': 'storage_breakdown', **payload}})
+                logger.info(f"Storage breakdown: {len(payload['folders'])} folder(s), "
+                            f"{len(payload['_breakdown_unavailable'])} measured without it "
+                            f"(first run, or too close to their timeout)")
     except Exception as e:
         logger.error(f"Disk collection failed: {e}", exc_info=True)
         return False
 
-    return _record_and_sync(config, name, system_id, [entry], logger)
+    if dry_run:
+        _print_messages(entries)
+        return True
+    sent = _record_and_sync(config, name, system_id, entries, logger)
+    if breakdown is not None:
+        _save_breakdown_state(breakdown.state_path, scan.get('folder_seconds') or {}, logger)
+    return sent
 
 
-def collect_metrics(config: dict, logger: logging.Logger) -> bool:
-    """Collect system metrics: CPU, RAM, network (5-minute mode)"""
+def _breakdown_options(config: dict, name: str, nas_type: str, logger: logging.Logger):
+    """storage_breakdown.Options for this disk run (with .previous and .state_path), or None when disabled."""
+    try:
+        options = storage_breakdown.Options(config, nas_type == 'windows', logger)
+        if not options.enabled:
+            return None
+        options.state_path = os.path.join(_device_dir(config, name, create=False), storage_breakdown.STATE_FILE)
+        options.previous = storage_breakdown.load_state(options.state_path)
+        return options
+    except Exception as e:
+        logger.warning(f"Storage breakdown unavailable this run ({e}); folder_usage is measured as usual")
+        return None
+
+
+def _save_breakdown_state(path: str, seconds: dict, logger: logging.Logger) -> None:
+    """storage_breakdown_state.json: {folder: seconds its measurement took} for the next run's time guard."""
+    try:
+        local_queue.atomic_write_json(path, seconds)
+    except Exception as e:
+        logger.warning(f"Could not write {path} ({e}); the next disk run measures every folder without "
+                       f"the storage breakdown")
+
+
+COUNTER_LOCK_TIMEOUT = 20    # seconds to wait for another run's perf_snapshot.json
+
+
+def get_perf_snapshot_path(config: dict, nas_name: str, create: bool = True) -> str:
+    """Path to perf_snapshot.json, the interval counters' baseline (lib/perf_counters.py)."""
+    return os.path.join(_device_dir(config, nas_name, create), perf_counters.SNAPSHOT_FILE)
+
+
+def measure_counters(config: dict, name: str, logger: logging.Logger, dry_run: bool = False) -> dict:
+    """
+    Interval counters for this run: CPU, disk I/O and per-user CPU-seconds
+    averaged over the time since the previous run (lib/perf_counters.py,
+    lib/proc_accounting.py), against the baseline in perf_snapshot.json.
+
+    Under perf_snapshot.json's lock (waits up to 20 s) it reads the clock,
+    CPU, disk and process counters, loads the previous snapshot, decides the
+    window (perf_counters.window), saves the new snapshot and reports counter
+    values only if that save worked, so the windows of two runs never
+    overlap. A window under 5 s keeps the previous snapshot and reports no
+    counters. On a lock timeout, or when the counters fail, the snapshot is
+    left alone and there are no counters, but the processes are still read
+    for the users (RAM, process counts; CPU None) and the GPU owners.
+    dry_run (--dry-run) reads the snapshot but never writes it or its lock.
+
+    Returns {} when nothing could be measured, else a dict with
+      status       'ok' | 'reboot' | 'short' | 'stale' | 'none' | 'unavailable'
+                   | 'locked' (lock timeout) | 'error' (the counters failed)
+      interval_s   (1 dp) and, when there is a window: cpu_percent,
+                   cpu_iowait_percent, cpu_steal_percent,
+                   proc_cpu_coverage_percent and perf_counters.DISK_FIELDS
+      users        {username: {cpu_seconds, cpu_cores, cpu_percent, ram_bytes,
+                   process_count}} (CPU values None without a window) over the
+                   processes _user_filter() keeps, or None when per-process data
+                   is unavailable
+      owner_of     {pid: username} of every process (excluded users too), or None
+      uid_of       {pid: uid} (Linux/DSM)
+    """
+    try:
+        path = get_perf_snapshot_path(config, name, create=not dry_run)
+    except OSError as e:
+        logger.warning(f"Interval counters unavailable: cannot create the data directory ({e})")
+        return {}
+    try:
+        if dry_run:
+            return _measure_counters_locked(config, path, logger, persist=False)
+        with local_queue.QueueLock(path, timeout=COUNTER_LOCK_TIMEOUT):
+            return _measure_counters_locked(config, path, logger, persist=True)
+    except local_queue.QueueLockTimeout:
+        logger.warning(f"Another collector run holds {path}.lock: interval counters are sent as null "
+                       f"this run and the snapshot is left as it is")
+        status = 'locked'
+    except Exception as e:
+        logger.warning(f"Interval counters failed ({e}); they are sent as null this run", exc_info=True)
+        status = 'error'
+    # No window, but the users are still reported and the GPU part gets the owners
+    try:
+        table = proc_accounting.read_processes(config, log=logger)
+        uid_of = table.uid_of() if table is not None else {}
+        users, _ = proc_accounting.user_cpu(None, table, None, None, os.cpu_count(),
+                                            keep=_user_filter(config, uid_of))
+    except Exception as e:
+        logger.warning(f"Per-user metrics unavailable this run ({e})")
+        return {}
+    return {'status': status, 'users': users, 'uid_of': uid_of,
+            'owner_of': table.owner_of if table is not None else None}
+
+
+def _measure_counters_locked(config: dict, path: str, logger: logging.Logger, persist: bool) -> dict:
+    max_window = settings.value(config, 'counter_max_window_seconds')
+    clock = perf_counters.clock_now()
+    cpu = perf_counters.read_cpu_counters()
+    disks = perf_counters.read_disk_counters(config) if settings.value(config, 'disk_io') else None
+    table = proc_accounting.read_processes(config, log=logger)
+    uid_of = table.uid_of() if table is not None else {}
+    keep = _user_filter(config, uid_of)
+    ncpu = os.cpu_count()
+    result = {'owner_of': table.owner_of if table is not None else None, 'uid_of': uid_of}
+
+    def without_window(status):
+        result['status'] = status
+        result['users'], _ = proc_accounting.user_cpu(None, table, None, None, ncpu, keep=keep)
+        return result
+
+    if clock is None or cpu is None:
+        return without_window('unavailable')
+    prev = perf_counters.load_snapshot(path)
+    status, interval = perf_counters.window(perf_counters.snapshot_clock(prev) if prev else None,
+                                            clock, max_window)
+    if status == 'short':
+        logger.info(f"Only {interval:.1f}s since the previous run: no interval counters this run "
+                    f"(the previous baseline is kept)")
+        return without_window(status)
+    if status == 'stale':
+        logger.info(f"More than counter_max_window_seconds ({max_window:.0f}s) since the previous run: "
+                    f"interval counters start from a new baseline")
+    elif status == 'reboot':
+        logger.info("The host rebooted since the previous run: interval counters are averages since boot")
+
+    base_cpu = base_disks = base_procs = None
+    if status == 'ok':
+        base_cpu = perf_counters.snapshot_cpu(prev)
+        base_disks = perf_counters.snapshot_disks(prev)
+        if table is not None and prev['source'].get('proc') == table.source:
+            base_procs = proc_accounting.prev_table(prev)
+    elif status == 'reboot':
+        base_cpu = perf_counters.zero_cpu(cpu)
+        base_disks = perf_counters.zero_disks(disks)
+        if table is not None:
+            base_procs = proc_accounting.zero_baseline(clock, table.hz)
+    cpu_values = perf_counters.cpu_metrics(base_cpu, cpu)
+    if status in ('ok', 'reboot') and cpu_values is None:
+        logger.info("CPU counters went backwards or changed source since the previous run: "
+                    "interval counters start from a new baseline")
+        status = 'none'
+
+    if persist and not perf_counters.save_snapshot(
+            path, perf_counters.build_snapshot(clock, cpu, disks, table)):
+        return without_window(status)
+    if cpu_values is None:
+        return without_window(status)
+
+    users, coverage = proc_accounting.user_cpu(
+        base_procs, table, interval, cpu_values['attributable_s'], ncpu,
+        settings.value(config, 'user_cpu_count_children'), keep)
+    result.update({
+        'status':                    status,
+        'interval_s':                round(interval, 1),
+        'cpu_percent':               cpu_values['cpu_percent'],
+        'cpu_iowait_percent':        cpu_values['cpu_iowait_percent'],
+        'cpu_steal_percent':         cpu_values['cpu_steal_percent'],
+        'proc_cpu_coverage_percent': coverage,
+        'users':                     users,
+    })
+    result.update(perf_counters.disk_metrics(base_disks, disks, interval, platform_info.is_32bit()))
+    return result
+
+
+USERNAME_MAX_CHARS = 256     # contract R10: longer names are cut
+
+# The per-user GPU fields of a user who holds no GPU on a host where they were measured
+_NO_GPU_USE = {'gpu_vram_bytes': 0, 'gpu_util_percent': 0.0, 'gpu_busy_seconds': 0.0,
+               'gpus_held': 0, 'gpu_held_seconds': 0.0, 'gpu_processes': 0}
+
+
+def _user_metrics_data(config: dict, cpu_users: Optional[dict], gpu_users: Optional[dict],
+                       interval_s: Optional[float], legacy_rows: Optional[list] = None) -> list:
+    """
+    The data of the user_metrics messages: one per user in the union of the
+    per-user CPU/RAM rows and the per-user GPU data. A user seen only on a GPU
+    gets null cpu_percent / ram_bytes / ram_formatted. The GPU fields are on
+    every row where per-user GPU data exists (0 for users without GPU use);
+    the CPU-seconds fields wherever per-process accounting works.
+
+    user_metrics: "all"; "off" (no messages); "active" (only users with
+    cpu_cores >= user_metrics_min_cores, RSS >= user_metrics_min_ram_bytes,
+    or a GPU held; without a window only the RAM and GPU tests apply);
+    "auto" = "active" on Synology, "all" elsewhere.
+    legacy_rows: get_per_user_stats() rows (perf_counters false) instead of
+    cpu_users.
+    """
+    mode = settings.value(config, 'user_metrics')
+    if mode == 'off':
+        return []
+    if mode == 'auto':
+        mode = 'active' if get_platform(config) == 'synology' else 'all'
+    min_cores = settings.value(config, 'user_metrics_min_cores')
+    min_ram = settings.value(config, 'user_metrics_min_ram_bytes')
+
+    rows = {}
+    for row in legacy_rows or []:
+        rows[row['username'][:USERNAME_MAX_CHARS]] = {
+            'cpu_percent': row['cpu_percent'], 'ram_bytes': row['ram_bytes'],
+            'ram_formatted': row['ram_formatted']}
+    for username, c in (cpu_users or {}).items():
+        rows[username[:USERNAME_MAX_CHARS]] = {
+            'cpu_percent':   c['cpu_percent'],
+            'ram_bytes':     c['ram_bytes'],
+            'ram_formatted': format_bytes(c['ram_bytes']),
+            'cpu_seconds':   c['cpu_seconds'],
+            'cpu_cores':     c['cpu_cores'],
+            'interval_s':    interval_s if c['cpu_seconds'] is not None else None,
+            'process_count': c['process_count'],
+        }
+    if gpu_users is not None:
+        for username in gpu_users:
+            rows.setdefault(username, {'cpu_percent': None, 'ram_bytes': None, 'ram_formatted': None})
+        for username, row in rows.items():
+            row.update(gpu_users.get(username) or _NO_GPU_USE)
+
+    def active(row):
+        cores, ram = row.get('cpu_cores'), row.get('ram_bytes')
+        return ((cores is not None and cores >= min_cores) or (ram is not None and ram >= min_ram)
+                or bool(row.get('gpus_held')))
+
+    data = [{'data_type': 'user_metrics', 'username': username, **row}
+            for username, row in rows.items() if mode == 'all' or active(row)]
+    data.sort(key=lambda d: (d.get('cpu_seconds') is None and d.get('cpu_percent') is None,
+                             -(d.get('cpu_seconds') or d.get('cpu_percent') or 0),
+                             -(d.get('gpu_busy_seconds') or 0), d['username']))
+    return data
+
+
+def _metrics_summary(cpu_percent, counters: dict, ram_percent, uptime_formatted, network_stats: dict,
+                     user_count: int, gpu_stats: list) -> str:
+    """The run's one INFO line. 'GPUs: ...' stays last: install-collector-linux.sh reads it from the journal."""
+    interval = counters.get('interval_s')
+    window = f" (avg {interval:.0f}s)" if interval is not None else " (1-s sample)"
+    parts = [f"CPU: {_fmt(cpu_percent, '%')}{window if cpu_percent is not None else ''}"]
+    if counters.get('cpu_iowait_percent') is not None:
+        parts.append(f"iowait: {counters['cpu_iowait_percent']}%")
+    parts += [f"RAM: {_fmt(ram_percent, '%')}", f"Uptime: {_fmt(uptime_formatted)}",
+              f"Network: {network_stats}"]
+    if counters.get('disk_read_bytes_per_s') is not None:
+        disk = (f"Disk: r {format_bytes(counters['disk_read_bytes_per_s'])}/s "
+                f"w {format_bytes(counters['disk_write_bytes_per_s'])}/s")
+        if counters.get('disk_busy_max_percent') is not None:
+            disk += f" busy {counters['disk_busy_max_percent']:.0f}% {counters['disk_busy_max_name']}"
+        parts.append(disk)
+    coverage = counters.get('proc_cpu_coverage_percent')
+    parts.append(f"Users: {user_count}" + (f" (coverage {coverage:.0f}%)" if coverage is not None else ''))
+    if gpu_stats:
+        gpu_list = [f"{g.get('name') or 'Unknown'} {_fmt(g.get('gpu_percent'), '%')}" for g in gpu_stats]
+        parts.append(f"GPUs: {len(gpu_stats)} ({', '.join(gpu_list)})")
+    else:
+        parts.append("GPUs: none/unavailable")
+    return ' | '.join(parts)
+
+
+def collect_metrics(config: dict, logger: logging.Logger, dry_run: bool = False) -> bool:
+    """
+    Collect system metrics (5-minute mode):
+
+      1. interval counters (measure_counters), RAM, network, uptime and the
+         GPUs (lib/gpu.collect, with the counters' process owners);
+      2. the system_metrics message and 3. one user_metrics message per user;
+      4. _record() them: the system metrics are safe before anything optional
+         runs;
+      5. the optional collectors (_optional_collectors: who is connected,
+         storage health), each in a bounded thread; 6. _record() their
+         messages, then one _sync(); 7. their state files, written last and
+         only once their messages are recorded.
+
+    "perf_counters": false restores the old path: per-user seeding, the 1-s
+    CPU sample and psutil per-process cpu_percent. dry_run (--dry-run):
+    print the messages instead of 4-7; no state file is written.
+    """
     logger.info("=== METRICS COLLECTION ===")
 
     if not config.get('active', True):
@@ -683,32 +1037,44 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
     name, system_id, device_type = ident
     
     try:
-        # Seed per-user CPU tracking BEFORE the system-level sleep.
-        # psutil.cpu_percent(interval=None) always returns 0.0 on the first call
-        # for a given process object — it needs two samples with elapsed time between
-        # them to compute a real percentage.  By seeding here, the 1-second blocking
-        # call inside get_cpu_percent() becomes our measurement window for free.
-        user_procs_seed = _seed_user_processes(config)
+        counters, seeded = {}, None
+        if settings.value(config, 'perf_counters'):
+            counters = measure_counters(config, name, logger, dry_run=dry_run)
+        else:
+            # Old path: seed per-user CPU tracking BEFORE the system-level
+            # sleep. psutil.cpu_percent(interval=None) always returns 0.0 on
+            # the first call for a given process object, so the 1-second
+            # blocking call inside get_cpu_percent() is the measurement window.
+            seeded = _seed_user_processes(config)
 
         # Every getter returns None for a value it can't measure; None is sent
         # as JSON null (never 0) so the Manager/Dashboard show "unmeasured".
-        cpu_percent = get_cpu_percent()   # blocks ~1 s — this IS the measurement window
+        cpu_percent = counters.get('cpu_percent')
+        if cpu_percent is None:
+            cpu_percent = get_cpu_percent()   # the 1-s sample: no interval average this run
         ram_percent = get_ram_percent()
         total_ram_bytes = get_total_ram_bytes()
-        network_stats = get_network_stats(config, name)
+        network_stats = (get_network_stats(config, name, persist=False) if dry_run
+                         else get_network_stats(config, name))
         uptime_seconds = get_uptime_seconds()
         uptime_formatted = format_uptime(uptime_seconds)
-        
-        gpu_stats = get_gpu_stats()
-        if gpu_stats:
-            gpu_list = [f"{g.get('name') or 'Unknown'} {_fmt(g.get('gpu_percent'), '%')}" for g in gpu_stats]
-            gpu_summary = f" | GPUs: {len(gpu_stats)} ({', '.join(gpu_list)})"
+
+        interval_s = counters.get('interval_s')
+        owner_of = counters.get('owner_of')
+        if seeded is not None:
+            # The seeded processes' psutil names, so a GPU user's row is the same user as their CPU row
+            owner_of = {item['proc'].pid: item['username'] for item in seeded}
+        sample = gpu.collect(config, owner_of, interval_s, logger,
+                             user_filter=_user_filter(config, counters.get('uid_of')))
+        gpu_stats = sample.devices
+
+        if seeded is not None:
+            legacy_rows, cpu_users = get_per_user_stats(config, logger, seeded_procs=seeded), None
         else:
-            gpu_summary = " | GPUs: none/unavailable"
-        logger.info(
-            f"CPU: {_fmt(cpu_percent, '%')} | RAM: {_fmt(ram_percent, '%')} | "
-            f"Uptime: {_fmt(uptime_formatted)} | Network: {network_stats}{gpu_summary}"
-        )
+            legacy_rows, cpu_users = None, counters.get('users')
+        user_data = _user_metrics_data(config, cpu_users, sample.per_user, interval_s, legacy_rows)
+        logger.info(_metrics_summary(cpu_percent, counters, ram_percent, uptime_formatted,
+                                     network_stats, len(user_data), gpu_stats))
 
         # Create message (header + data).
         # Each numeric field is accompanied by a sibling *_unit field so any
@@ -727,17 +1093,32 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
             gpu_flat[f'{p}_vram_used_unit']   = 'bytes'
             if g.get('temperature_c') is not None:
                 gpu_flat[f'{p}_temp_c']       = g['temperature_c']
-                gpu_flat[f'{p}_temp_c_unit']  = '\u00b0C'
+                gpu_flat[f'{p}_temp_c_unit']  = '°C'
             if g.get('power_watts') is not None:
                 gpu_flat[f'{p}_power_w']      = g['power_watts']
                 gpu_flat[f'{p}_power_w_unit'] = 'W'
+        if gpu_stats:
+            # The dt behind the per-user GPU-seconds
+            gpu_flat['gpu_sample_seconds']      = sample.sample_seconds
+            gpu_flat['gpu_sample_seconds_unit'] = 's'
 
         entry = {
             'header': build_header(name, system_id, device_type),
             'data': {
                 'data_type':                        'system_metrics',
+                # The average since the previous run when interval_s is set,
+                # else a 1-s sample (first run, no valid baseline)
                 'cpu_percent':                      cpu_percent,
                 'cpu_percent_unit':                 '%',
+                'interval_s':                       interval_s,
+                'interval_s_unit':                  's',
+                'cpu_count':                        os.cpu_count(),
+                'cpu_iowait_percent':               counters.get('cpu_iowait_percent'),
+                'cpu_iowait_percent_unit':          '%',
+                'cpu_steal_percent':                counters.get('cpu_steal_percent'),
+                'cpu_steal_percent_unit':           '%',
+                'proc_cpu_coverage_percent':        counters.get('proc_cpu_coverage_percent'),
+                'proc_cpu_coverage_percent_unit':   '%',
                 'ram_percent':                      ram_percent,
                 'ram_percent_unit':                 '%',
                 'total_ram_bytes':                  total_ram_bytes,
@@ -753,6 +1134,20 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
                 'network_bandwidth_in_mbps_unit':   'Mbps',
                 'network_bandwidth_out_mbps':       network_stats.get('bandwidth_out_mbps'),
                 'network_bandwidth_out_mbps_unit':  'Mbps',
+                # Sums over the physical disks (md arrays and virtual devices left out)
+                'disk_read_bytes_per_s':            counters.get('disk_read_bytes_per_s'),
+                'disk_read_bytes_per_s_unit':       'B/s',
+                'disk_write_bytes_per_s':           counters.get('disk_write_bytes_per_s'),
+                'disk_write_bytes_per_s_unit':      'B/s',
+                'disk_read_iops':                   counters.get('disk_read_iops'),
+                'disk_read_iops_unit':              'ops/s',
+                'disk_write_iops':                  counters.get('disk_write_iops'),
+                'disk_write_iops_unit':             'ops/s',
+                'disk_await_ms':                    counters.get('disk_await_ms'),
+                'disk_await_ms_unit':               'ms',
+                'disk_busy_max_percent':            counters.get('disk_busy_max_percent'),
+                'disk_busy_max_percent_unit':       '%',
+                'disk_busy_max_name':               counters.get('disk_busy_max_name'),
                 'gpus':                             gpu_stats,
                 'gpu_count':                        len(gpu_stats),
                 **gpu_flat,
@@ -761,26 +1156,232 @@ def collect_metrics(config: dict, logger: logging.Logger) -> bool:
         entries = [entry]
         
         # Per-user metrics (one message per user for normalized history storage)
-        # Pass the pre-seeded process list so cpu_percent() returns real values.
-        user_stats = get_per_user_stats(config, logger, seeded_procs=user_procs_seed)
-        for user in user_stats:
-            entries.append({
-                'header': build_header(name, system_id, device_type),
-                'data': {
-                    'data_type':     'user_metrics',
-                    'username':      user['username'],
-                    'cpu_percent':   user['cpu_percent'],
-                    'ram_bytes':     user['ram_bytes'],
-                    'ram_formatted': user['ram_formatted'],
-                },
-            })
-        logger.info(f"Collected {len(entries)} message(s) (including {len(user_stats)} user metrics)")
+        for data in user_data:
+            entries.append({'header': build_header(name, system_id, device_type), 'data': data})
+        logger.info(f"Collected {len(entries)} message(s) (including {len(user_data)} user metrics)")
         
     except Exception as e:
         logger.error(f"Metrics collection failed: {e}", exc_info=True)
         return False
 
-    return _record_and_sync(config, name, system_id, entries, logger)
+    if dry_run:
+        optional = _optional_collectors(config, name, logger)
+        _print_messages(entries + [{'header': build_header(name, system_id, device_type), 'data': r.payload}
+                                   for r in optional if r.payload is not None])
+        return True
+
+    if not _record(config, name, entries, logger):
+        return False
+    optional = _optional_collectors(config, name, logger)
+    extra = [{'header': build_header(name, system_id, device_type), 'data': r.payload}
+             for r in optional if r.payload is not None]
+    recorded = _record(config, name, extra, logger) if extra else True
+    synced = _sync(config, name, system_id, logger)
+    if recorded:
+        _commit_state(optional, logger)
+    return recorded and synced
+
+
+# ---------------------------------------------------------------------------
+# Optional collectors (sessions, storage health), run after the metrics are
+# recorded
+# ---------------------------------------------------------------------------
+#
+# Interface of lib/sessions.py and lib/storage_health.py. A module that isn't
+# there is skipped (logged at DEBUG). Both functions run in a daemon thread
+# within a time budget and must not write any file: they return their new
+# state, which the main thread writes (local_queue.atomic_write_json to
+# data/<name>/<module>.STATE_FILE) only after their message was recorded, so a
+# failed record or an abandoned thread can never leave state saying "sent".
+# Reading their own state file is fine (also under --dry-run). Every
+# subprocess they start needs its own timeout.
+#
+#   sessions.STATE_FILE = 'sessions_state.json'
+#   sessions.collect(config, data_dir, name, logger=None) -> (payload, state)
+#       payload: the 'sessions' message data (contract item 13, with
+#                'data_type': 'sessions'), or None for no message;
+#       state:   the new sessions_state.json ({last_full_utc, hash}), or None
+#                to leave it as it is.
+#       Called only when sessions.enabled; budget sessions.timeout_seconds.
+#   sessions.failure_payload(config, status) -> payload
+#       The message sent when collect() raised (status 'error') or overran
+#       its budget ('timeout'): null counts, every source in _sources set to
+#       that status, _list_state 'none'. A Manager clears its stored list on
+#       'none', so once that message is recorded the collector writes the
+#       state _SESSIONS_FAILED_STATE: the next list is sent in full.
+#   storage_health.STATE_FILE = 'storage_health_state.json'
+#   storage_health.maybe_collect(config, data_dir, name, force=False, logger=None)
+#           -> (payload, state)
+#       payload: the 'storage_health' message data (contract item 14), or
+#                None when nothing needs to be sent this run; force=True
+#                (--mode health) always gives one, with trigger 'manual';
+#       state:   the new storage_health_state.json, or None.
+#       Called when storage_health.enabled (always for --mode health);
+#       budget storage_health.timeout_seconds + 10.
+#
+#   data_dir is get_data_dir(config); a module's state file is
+#   os.path.join(data_dir, name, STATE_FILE).
+
+OPTIONAL_COLLECTORS = ('sessions', 'storage_health')
+# storage_health's budget is its own timeout_seconds plus this margin, so its
+# PowerShell / subprocess timeouts fire before the thread is abandoned
+HEALTH_BUDGET_MARGIN_SECONDS = 10
+
+_OptionalResult = namedtuple('_OptionalResult', 'kind payload state_path state status')
+
+# sessions_state.json after a failed sessions run ({last_full_utc, hash}, as sessions.py writes it)
+_SESSIONS_FAILED_STATE = {'last_full_utc': None, 'hash': None}
+
+
+class _Bounded:
+    """fn(*args, **kwargs) started in a daemon thread; wait() collects the outcome."""
+
+    def __init__(self, fn, *args, **kwargs):
+        self._value = self._error = None
+        self._thread = threading.Thread(target=self._run, args=(fn, args, kwargs), daemon=True,
+                                        name=f"lab-monitor-{getattr(fn, '__module__', 'task')}")
+        self._thread.start()
+
+    def _run(self, fn, args, kwargs):
+        try:
+            self._value = fn(*args, **kwargs)
+        except BaseException as e:      # a ctypes fault surfaces as OSError on Windows
+            self._error = e
+
+    def wait(self, timeout: float):
+        """('ok', value) | ('timeout', None) | ('error', exception). A thread still running is abandoned."""
+        self._thread.join(max(0.0, timeout))
+        if self._thread.is_alive():
+            return 'timeout', None
+        if self._error is not None:
+            return 'error', self._error
+        return 'ok', self._value
+
+
+def _run_bounded(fn, budget_s: float, *args, **kwargs):
+    """
+    fn(*args, **kwargs) in a daemon thread, waited for at most budget_s
+    seconds: ('ok', value), ('timeout', None) or ('error', exception). A
+    hang or an exception costs only that one feature; a thread that overruns
+    is abandoned (daemon threads end with the process).
+    """
+    return _Bounded(fn, *args, **kwargs).wait(budget_s)
+
+
+def _optional_module(kind: str, logger: logging.Logger):
+    """lib.<kind>, or None when this collector doesn't have it (or it can't be loaded)."""
+    try:
+        return importlib.import_module(f'lib.{kind}')
+    except ModuleNotFoundError as e:
+        if e.name == f'lib.{kind}':
+            logger.debug(f"lib/{kind}.py is not part of this collector; skipping {kind}")
+            return None
+        logger.warning(f"Cannot load lib/{kind}.py ({e}); skipping {kind} this run")
+    except Exception as e:
+        logger.warning(f"Cannot load lib/{kind}.py ({e}); skipping {kind} this run", exc_info=True)
+    return None
+
+
+def _failed_sessions_payload(module, config: dict, status: str) -> dict:
+    try:
+        return module.failure_payload(config, status)
+    except Exception:
+        return {'data_type': 'sessions', '_schema': 1, '_unit': 'count', '_sources': {'tcp': status},
+                '_list_state': 'none', '_list_hash': None, 'clients_total': None, 'users_total': None}
+
+
+def _optional_collectors(config: dict, name: str, logger: logging.Logger,
+                         kinds=OPTIONAL_COLLECTORS, force_health: bool = False) -> list:
+    """
+    Run the optional collectors (see the interface above) in parallel daemon
+    threads, each within its budget, and return their _OptionalResult's: the
+    payload to record (or None) and the state to commit afterwards (only
+    what a finished thread returned, never an abandoned one's). A sessions
+    run that fails or overruns still gives a 'sessions' message with null
+    counts, so the Dashboard shows the list as unavailable instead of a stale
+    one, and the state _SESSIONS_FAILED_STATE.
+    """
+    try:
+        data_dir = get_data_dir(config, create=False)
+    except OSError:
+        return []
+    started = []
+    for kind in kinds:
+        enabled = settings.value(config, f'{kind}.enabled', logger)
+        if not enabled and not (kind == 'storage_health' and force_health):
+            continue
+        module = _optional_module(kind, logger)
+        if module is None:
+            continue
+        if kind == 'sessions':
+            budget = settings.value(config, 'sessions.timeout_seconds', logger)
+            task = _Bounded(module.collect, config, data_dir, name, logger=logger)
+        else:
+            budget = settings.value(config, 'storage_health.timeout_seconds', logger) + HEALTH_BUDGET_MARGIN_SECONDS
+            task = _Bounded(module.maybe_collect, config, data_dir, name, force=force_health, logger=logger)
+        started.append((kind, module, task, time.monotonic() + budget, budget))
+
+    results = []
+    for kind, module, task, deadline, budget in started:
+        status, value = task.wait(deadline - time.monotonic())
+        payload = state = None
+        if status == 'ok':
+            if isinstance(value, tuple) and len(value) == 2 and all(
+                    v is None or isinstance(v, dict) for v in value):
+                payload, state = value
+            else:
+                logger.warning(f"{kind}: unexpected result {type(value).__name__}; nothing sent")
+                status = 'error'
+        elif status == 'timeout':
+            logger.warning(f"{kind} took longer than its {budget:.0f}s budget; left running in the background "
+                           f"and its result discarded")
+        else:
+            logger.warning(f"{kind} failed: {value}", exc_info=(type(value), value, value.__traceback__))
+        if status != 'ok' and kind == 'sessions':
+            payload = _failed_sessions_payload(module, config, status)
+            state = dict(_SESSIONS_FAILED_STATE)
+        if payload is not None:
+            payload = {**payload, 'data_type': kind}
+        state_file = getattr(module, 'STATE_FILE', f'{kind}_state.json')
+        results.append(_OptionalResult(kind, payload, os.path.join(data_dir, name, state_file), state, status))
+    return results
+
+
+def _commit_state(results: list, logger: logging.Logger) -> None:
+    """Write the optional collectors' new state files (only after their messages were recorded)."""
+    for r in results:
+        if r.state is None:
+            continue
+        try:
+            local_queue.atomic_write_json(r.state_path, r.state)
+        except Exception as e:
+            logger.warning(f"Could not write {r.state_path} ({e}); {r.kind} starts afresh next run")
+
+
+def collect_health(config: dict, logger: logging.Logger, dry_run: bool = False) -> bool:
+    """--mode health: a full storage-health collection (trigger 'manual'), recorded and sent now."""
+    logger.info("=== STORAGE HEALTH CHECK ===")
+    ident = _identity(config, logger)
+    if ident is None:
+        return False
+    name, system_id, device_type = ident
+    results = _optional_collectors(config, name, logger, kinds=('storage_health',), force_health=True)
+    if not results:
+        logger.error("Storage health is not available in this collector (lib/storage_health.py is missing "
+                     "or could not be loaded)")
+        return False
+    result = results[0]
+    if result.status != 'ok' or result.payload is None:
+        logger.error("Storage health check produced no message")
+        return False
+    entries = [{'header': build_header(name, system_id, device_type), 'data': result.payload}]
+    if dry_run:
+        _print_messages(entries)
+        return True
+    if not _record(config, name, entries, logger):
+        return False
+    _commit_state(results, logger)
+    return _sync(config, name, system_id, logger)
 
 
 class _BatchOutcome:
@@ -1044,10 +1645,17 @@ def _read_proc_stat_cpu() -> tuple:
 
 def fallback_cpu_percent(interval: float = 1.0) -> Optional[float]:
     """
-    CPU usage without psutil: two /proc/stat samples `interval` seconds apart
-    (the same window psutil.cpu_percent(interval=1) uses). Returns None where
-    /proc/stat isn't available (e.g. Windows without psutil).
+    CPU usage without psutil: two samples `interval` seconds apart (the same
+    window psutil.cpu_percent(interval=1) uses) of /proc/stat, or on Windows
+    of GetSystemTimes. Returns None where neither is available.
     """
+    if sys.platform == 'win32':
+        first = perf_counters.read_cpu_counters()
+        if first is None:
+            return None
+        time.sleep(interval)
+        values = perf_counters.cpu_metrics(first, perf_counters.read_cpu_counters())
+        return values['cpu_percent'] if values else None
     try:
         total1, idle1 = _read_proc_stat_cpu()
         time.sleep(interval)
@@ -1141,19 +1749,8 @@ def fallback_total_ram_bytes() -> Optional[int]:
 
 
 def _build_exclude_patterns(config: dict) -> list:
-    """Build the combined list of username exclusion glob patterns."""
-    import fnmatch  # noqa — imported here so callers don't need it
-    default_excludes = [
-        'UMFD-*',              # User Mode Driver Framework (Windows service)
-        'NT AUTHORITY\\*',     # Windows system accounts
-        'NT SERVICE\\*',       # Windows service accounts
-        'Window Manager\\*',   # Windows display driver
-        'Font Driver Host\\*', # Windows font driver
-        'DWM.EXE',             # Desktop Window Manager
-        'System',              # Windows system process
-        'Idle',                # Idle process
-    ]
-    return default_excludes + config.get('exclude_users', [])
+    """Build the combined list of username exclusion glob patterns (lib/settings.py, shared with sessions)."""
+    return settings.exclude_user_patterns(config)
 
 
 # Linux accounts. UID_MIN (first UID of a regular login account) comes from
@@ -1190,14 +1787,12 @@ def _real_uid(uids) -> Optional[int]:
     return real if isinstance(real, int) and not isinstance(real, bool) else None
 
 
-def _seed_user_processes(config: dict) -> list:
+def _user_filter(config: dict, uid_of: Optional[dict] = None):
     """
-    First pass: iterate all user processes, call cpu_percent() once (returns 0 —
-    that is expected and intentional), and return the list of process dicts.
-
-    The caller must wait at least ~1 second before calling get_per_user_stats()
-    so that psutil can accumulate a meaningful CPU delta between the seed call
-    and the real measurement call.
+    keep(pid, username, uid=None) -> bool: whether a process is counted for
+    its user in per-user metrics (CPU and RAM on every path, and per-user
+    GPU), so all user_metrics rows follow the same rules. uid: the real UID
+    (POSIX), looked up in uid_of ({pid: uid}) when not given.
 
     Not counted, besides exclude_users and the Windows defaults:
       - the collector itself: its own process, and on Linux every process of
@@ -1212,40 +1807,69 @@ def _seed_user_processes(config: dict) -> list:
         ... - the counterpart of the NT AUTHORITY\\* / NT SERVICE\\* defaults.
         root stays visible: docker containers and sudo jobs, real workloads on
         a GPU server, run as root. A UID without an account here (psutil
-        reports it as the number, e.g. a container's own user) is shown too.
+        reports it as the number, e.g. a container's own user, or the procfs
+        path as 'uid:<n>') is shown too.
+    """
+    import fnmatch
+
+    exclude_patterns = [p.lower() for p in _build_exclude_patterns(config)]
+    own_pid = os.getpid()
+    posix = not sys.platform.startswith('win')
+    hide_system = skip_uid = uid_min = None
+    if posix:
+        uid_min = _uid_min()
+        hide_system = _cfg_bool(config, 'exclude_system_accounts', get_platform(config) == 'linux')
+        own_uid = os.getuid() if hasattr(os, 'getuid') else None
+        if own_uid is not None and _is_system_uid(own_uid, uid_min):
+            skip_uid = own_uid
+    uid_of = uid_of or {}
+    excluded_names = {}     # username -> matches exclude_users (cached for the run)
+
+    def keep(pid, username, uid=None) -> bool:
+        if pid == own_pid or not username:
+            return False
+        if posix:
+            if uid is None:
+                uid = uid_of.get(pid)
+            if uid is not None and (
+                    uid == skip_uid
+                    or (hide_system and _is_system_uid(uid, uid_min)
+                        and username not in (str(uid), f'uid:{uid}'))):
+                return False
+        excluded = excluded_names.get(username)
+        if excluded is None:
+            lower = username.lower()
+            excluded = excluded_names[username] = any(fnmatch.fnmatch(lower, p) for p in exclude_patterns)
+        return not excluded
+    return keep
+
+
+def _seed_user_processes(config: dict) -> list:
+    """
+    The "perf_counters": false path. First pass: iterate all user processes,
+    call cpu_percent() once (returns 0 — that is expected and intentional),
+    and return the list of process dicts.
+
+    The caller must wait at least ~1 second before calling get_per_user_stats()
+    so that psutil can accumulate a meaningful CPU delta between the seed call
+    and the real measurement call.
+
+    Which processes count: see _user_filter.
     """
     try:
         import psutil
-        import fnmatch
 
-        exclude_patterns = _build_exclude_patterns(config)
-        own_pid = os.getpid()
+        keep = _user_filter(config)
         posix = not sys.platform.startswith('win')
         attrs = ['pid', 'username', 'memory_info']
-        hide_system = skip_uid = None
         if posix:
             attrs.append('uids')        # not a valid attribute name on Windows
-            uid_min = _uid_min()
-            hide_system = _cfg_bool(config, 'exclude_system_accounts', get_platform(config) == 'linux')
-            own_uid = os.getuid() if hasattr(os, 'getuid') else None
-            if own_uid is not None and _is_system_uid(own_uid, uid_min):
-                skip_uid = own_uid
         seeded = []
         for proc in psutil.process_iter(attrs):
             try:
-                if proc.info.get('pid', getattr(proc, 'pid', None)) == own_pid:
-                    continue
                 username = proc.info.get('username') or ''
-                if not username:
-                    continue
-                if posix:
-                    uid = _real_uid(proc.info.get('uids'))
-                    if uid is not None and (
-                            uid == skip_uid
-                            or (hide_system and _is_system_uid(uid, uid_min) and username != str(uid))):
-                        continue
-                username_lower = username.lower()
-                if any(fnmatch.fnmatch(username_lower, p.lower()) for p in exclude_patterns):
+                uid = _real_uid(proc.info.get('uids')) if posix else None
+                if not keep(proc.info.get('pid', getattr(proc, 'pid', None)), username, uid):
                     continue
                 proc.cpu_percent(interval=None)   # seed — always 0, intentionally discarded
                 seeded.append({
@@ -1264,7 +1888,9 @@ def get_per_user_stats(config: dict, logger: logging.Logger,
                        seeded_procs: list = None) -> list:
     """
     Aggregate CPU% and RAM (bytes) by user account across all processes.
-    Returns a list sorted by cpu_percent descending.
+    Returns a list sorted by cpu_percent descending. This is the
+    "perf_counters": false path; by default per-user CPU comes from
+    measure_counters() (CPU-seconds over the whole interval).
 
     seeded_procs: list returned by _seed_user_processes(), called at least
     ~1 second earlier.  If None, falls back to a fresh (unseeded) pass which
@@ -1333,135 +1959,14 @@ def get_per_user_stats(config: dict, logger: logging.Logger,
         return []
 
 
-# NVML return codes (nvml.h) that get a specific explanation in the log
-_NVML_ERROR_NOT_SUPPORTED     = 3
-_NVML_ERROR_NO_PERMISSION     = 4
-_NVML_ERROR_DRIVER_NOT_LOADED = 9
-_NVML_ERROR_LIBRARY_NOT_FOUND = 12
-_NVML_ERROR_GPU_IS_LOST       = 15
-_NVML_ERROR_VERSION_MISMATCH  = 18   # NVML_ERROR_LIB_RM_VERSION_MISMATCH
-
-_NVML_INIT_HINTS = {
-    _NVML_ERROR_LIBRARY_NOT_FOUND:
-        "The NVIDIA driver's NVML library (libnvidia-ml.so.1 / nvml.dll) was not found: "
-        "is the NVIDIA driver installed?",
-    _NVML_ERROR_DRIVER_NOT_LOADED:
-        "The NVIDIA kernel driver is not loaded, or /dev/nvidiactl cannot be opened "
-        "(device permissions, or a service sandbox: see 'GPU servers' in the collector README).",
-    _NVML_ERROR_NO_PERMISSION:
-        "No permission to open the NVIDIA devices (/dev/nvidia*): see 'GPU servers' in the "
-        "collector README.",
-    _NVML_ERROR_VERSION_MISMATCH:
-        "The NVIDIA kernel module and the NVML library are different versions, usually after "
-        "a driver upgrade without a reboot: reboot.",
-}
-
-
-def _nvml_error_text(e: Exception) -> str:
-    """'Insufficient Permissions (NVML error 4)' for an NVMLError, str(e) otherwise."""
-    try:
-        text = str(e)
-    except Exception:
-        text = type(e).__name__
-    code = getattr(e, 'value', None)
-    return f"{text} (NVML error {code})" if isinstance(code, int) else text
-
-
-def _nvml_or_none(fn, *args, problems: Optional[list] = None, what: str = ''):
-    """
-    Call an NVML query; None if this GPU/driver can't answer it. A failure
-    other than "not supported" (normal for e.g. power on some GPUs) is added
-    to `problems` as "what: error" so the caller can log it.
-    """
-    try:
-        return fn(*args)
-    except Exception as e:
-        if getattr(e, 'value', None) == _NVML_ERROR_NOT_SUPPORTED:
-            logger.debug(f"NVML {what or getattr(fn, '__name__', fn)}: not supported")
-        elif problems is not None:
-            problems.append(f"{what}: {_nvml_error_text(e)}")
-        return None
-
-
 def get_gpu_stats() -> list:
     """
-    Collect per-GPU utilisation stats via nvidia-ml-py (NVIDIA only).
-    Returns an empty list if nvidia-ml-py is not installed, no NVIDIA driver is
-    present, or no GPUs are found — callers should treat an empty list as
-    "GPU data unavailable" rather than an error.
-
-    Each entry:
-        index, name, gpu_percent, vram_used_bytes, vram_total_bytes,
-        vram_used_formatted, vram_total_formatted, temperature_c, power_watts
-    Any value the GPU/driver doesn't report is None (never 0).
-
-    nvidia-ml-py is only installed where an NVIDIA driver was found, so an NVML
-    that can't start is logged as a warning, with the likely cause, and so is
-    a query that fails for another reason than "not supported" (NVML errors
-    show up in the collector log / journal, not only as missing values).
+    Per-GPU stats via nvidia-ml-py (NVIDIA only): the 'gpus' list of
+    system_metrics (see lib/gpu.collect, which collect_metrics calls with the
+    process owners for the per-user part). An empty list means "GPU data
+    unavailable" (no nvidia-ml-py, no driver, no GPUs), not an error.
     """
-    try:
-        import pynvml
-    except ImportError:
-        return []   # nvidia-ml-py not installed: not a GPU host
-
-    try:
-        pynvml.nvmlInit()
-    except Exception as e:
-        hint = _NVML_INIT_HINTS.get(getattr(e, 'value', None), '')
-        logger.warning(f"NVIDIA GPU stats unavailable: NVML could not start "
-                       f"({_nvml_error_text(e)}). {hint}".rstrip())
-        return []
-
-    gpus = []
-    problems = []
-    try:
-        count = pynvml.nvmlDeviceGetCount()
-        for i in range(count):
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            except Exception as e:
-                problems.append(f"GPU {i}: {_nvml_error_text(e)}; GPU left out")
-                continue   # skip individual GPU on error
-
-            def query(fn, *args, what):
-                return _nvml_or_none(fn, handle, *args, problems=problems, what=f"GPU {i} {what}")
-
-            raw_name = query(pynvml.nvmlDeviceGetName, what='name')
-            name = raw_name.decode('utf-8', 'replace') if isinstance(raw_name, bytes) else raw_name
-
-            util = query(pynvml.nvmlDeviceGetUtilizationRates, what='utilization')
-            mem  = query(pynvml.nvmlDeviceGetMemoryInfo, what='memory')
-            temp = query(pynvml.nvmlDeviceGetTemperature, pynvml.NVML_TEMPERATURE_GPU,
-                         what='temperature')
-            power_mw = query(pynvml.nvmlDeviceGetPowerUsage, what='power')
-
-            vram_used  = mem.used if mem is not None else None
-            vram_total = mem.total if mem is not None else None
-            gpus.append({
-                'index':                i,
-                'name':                 name,
-                'gpu_percent':          util.gpu if util is not None else None,
-                'vram_used_bytes':      vram_used,
-                'vram_total_bytes':     vram_total,
-                'vram_used_formatted':  format_bytes(vram_used) if vram_used is not None else None,
-                'vram_total_formatted': format_bytes(vram_total) if vram_total is not None else None,
-                'temperature_c':        temp,
-                'power_watts':          round(power_mw / 1000.0, 1) if power_mw is not None else None,
-            })
-    except Exception as e:
-        problems.append(f"listing the GPUs: {_nvml_error_text(e)}")
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-
-    if problems:
-        hint = (" A GPU that is lost needs a reset or reboot." if any(
-            f"(NVML error {_NVML_ERROR_GPU_IS_LOST})" in p for p in problems) else "")
-        logger.warning(f"NVML errors (values sent as null): {'; '.join(problems)}.{hint}")
-    return gpus
+    return gpu.collect({}, None, None, logger).devices
 
 
 def fallback_ram_percent() -> Optional[float]:
@@ -1533,12 +2038,9 @@ def format_uptime(seconds: Optional[int]) -> Optional[str]:
         return f"{days}d {hours}h"
 
 
-def get_network_snapshot_path(config: dict, nas_name: str) -> str:
+def get_network_snapshot_path(config: dict, nas_name: str, create: bool = True) -> str:
     """Get path to network snapshot file"""
-    data_dir = get_data_dir(config)
-    nas_dir = os.path.join(data_dir, nas_name)
-    os.makedirs(nas_dir, exist_ok=True)
-    return os.path.join(nas_dir, "network_snapshot.json")
+    return os.path.join(_device_dir(config, nas_name, create), "network_snapshot.json")
 
 
 def read_network_snapshot(snapshot_path: str) -> dict:
@@ -1723,10 +2225,11 @@ def _counters_went_backwards(previous: Optional[dict], bytes_in: int, bytes_out:
         return False
 
 
-def get_network_stats(config: dict, nas_name: str) -> dict:
+def get_network_stats(config: dict, nas_name: str, persist: bool = True) -> dict:
     """
     Network traffic: cumulative OS counters plus average bandwidth since the
-    previous run. Anything that can't be measured is None (never 0):
+    previous run (persist=False, for --dry-run: the snapshot is read but not
+    written). Anything that can't be measured is None (never 0):
       - counters unreadable → all four values None, and the snapshot file is
         left untouched so the next good run still has a valid baseline;
       - first run, unreadable previous snapshot, or a counter that went
@@ -1742,7 +2245,7 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
     }
     try:
         # Read previous snapshot
-        snapshot_path = get_network_snapshot_path(config, nas_name)
+        snapshot_path = get_network_snapshot_path(config, nas_name, create=persist)
         previous = read_network_snapshot(snapshot_path)
         if not isinstance(previous, dict):
             previous = None
@@ -1793,13 +2296,14 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
                 pass  # unusable previous snapshot → bandwidth unmeasured this run
         
         # Save current snapshot for next run
-        write_network_snapshot(snapshot_path, {
-            'timestamp': current_timestamp,
-            'bytes_in': current_bytes_in,
-            'bytes_out': current_bytes_out,
-            'loopback': 'included' if include_loopback else 'excluded',
-            'virtual': 'included' if include_virtual else 'excluded',
-        })
+        if persist:
+            write_network_snapshot(snapshot_path, {
+                'timestamp': current_timestamp,
+                'bytes_in': current_bytes_in,
+                'bytes_out': current_bytes_out,
+                'loopback': 'included' if include_loopback else 'excluded',
+                'virtual': 'included' if include_virtual else 'excluded',
+            })
         
         return {
             'bytes_in': current_bytes_in,
@@ -1815,7 +2319,10 @@ def get_network_stats(config: dict, nas_name: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description='Lab Monitor Collector')
     parser.add_argument('--config', required=True, help='Config file')
-    parser.add_argument('--mode', choices=['disk', 'metrics'], default='disk', help='Collection mode')
+    parser.add_argument('--mode', choices=['disk', 'metrics', 'health'], default='disk',
+                        help='Collection mode (health: a full storage-health check, sent now)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Print the messages as JSON on stdout; archive, queue, send and save nothing')
     
     args = parser.parse_args()
     
@@ -1834,12 +2341,14 @@ def main():
         sys.exit(1)
     
     logger = setup_logging(config.get('log_file'), config.get('log_level', 'INFO'))
-    logger.info(f"Starting collector ({args.mode} mode)")
+    logger.info(f"Starting collector ({args.mode} mode{', dry run' if args.dry_run else ''})")
     
     if args.mode == 'disk':
-        success = collect_disk_usage(config, logger)
+        success = collect_disk_usage(config, logger, dry_run=args.dry_run)
+    elif args.mode == 'health':
+        success = collect_health(config, logger, dry_run=args.dry_run)
     else:
-        success = collect_metrics(config, logger)
+        success = collect_metrics(config, logger, dry_run=args.dry_run)
     
     sys.exit(0 if success else 1)
 

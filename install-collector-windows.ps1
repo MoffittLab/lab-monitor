@@ -382,6 +382,22 @@ if ($HasNvidia) {
         Write-Warn "Could not install nvidia-ml-py - GPU stats will be unavailable"
         Write-Host ($gpuOut | Out-String) -ForegroundColor Gray
     }
+    # For the owner's information: per-user GPU memory is only reported under
+    # the TCC driver model (WDDM gives GPU held time and process counts)
+    $Smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if ($Smi) {
+        try {
+            $DriverModels = & $Smi.Source '--query-gpu=index,name,driver_model.current' '--format=csv,noheader' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $DriverModels) {
+                Write-Host "GPU driver model (per-user GPU memory needs TCC; under WDDM it is not reported):" -ForegroundColor Cyan
+                foreach ($Line in @($DriverModels)) {
+                    Write-Host "  $Line" -ForegroundColor Gray
+                }
+            }
+        } catch {
+            Write-Host "  (nvidia-smi could not report the driver model)" -ForegroundColor Gray
+        }
+    }
 }
 
 # ==============================================================================
@@ -555,7 +571,31 @@ if (-not (Test-Path $ConfigFile)) {
         request_timeout_seconds = 30
         max_batch_messages      = 100
         max_queue_messages      = 50000
-    } | ConvertTo-Json -Depth 3
+        # Interval counters, per-user CPU and GPU, who is connected, storage
+        # health and the storage breakdown, with their defaults
+        # (collector\lib\settings.py, config.windows.example.json)
+        perf_counters              = $true
+        counter_max_window_seconds = 86400
+        user_metrics               = "auto"
+        user_metrics_min_cores     = 0.02
+        user_metrics_min_ram_bytes = 1073741824
+        disk_io                    = $true
+        disk_io_exclude            = @()
+        gpu_per_user               = "auto"
+        metrics_interval_seconds   = 300
+        sessions = @{
+            enabled = $true; detail = "full"; history = "changes"; list_heartbeat_seconds = 3600
+            max_entries = 200; ports = $null; extra_ports = @{}; exclude_clients = @(); timeout_seconds = 20
+        }
+        storage_health = @{
+            enabled = $true; interval_seconds = 3600; timeout_seconds = 90
+            temperature_c = @{ hdd = @(50, 60); ssd = @(70, 80) }; ignore = @()
+        }
+        storage_breakdown = @{
+            enabled = $true; top_owners = 10; device_top_owners = 25; max_rows = 5000
+            cold_days = @(365, 1095); max_timeout_fraction = 0.6
+        }
+    } | ConvertTo-Json -Depth 6
 
     # $LocalDir is restricted to SYSTEM + Administrators (Step 3b); /reset makes
     # sure the new file carries only that inherited ACL.

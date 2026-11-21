@@ -167,6 +167,50 @@ def test_synology_installer_defaults_scan_paths_to_volume_globs(tmp_path):
     assert json.loads(path.read_text())['scan_paths'] == ['/volume1/*']
 
 
+def test_synology_installer_spells_out_the_new_keys_like_the_example(collector, tmp_path):
+    from lib import settings
+    path = tmp_path / 'config.json'
+    env = dict(os.environ, LM_CONFIG_FILE=str(path), LM_NAME='n', LM_ID='i', LM_DEVICE_TYPE='NAS',
+               LM_MANAGER_URL='http://m', LM_MANAGER_TOKEN='t', LM_VOLUMES='/volume1\n',
+               LM_SCAN_PATHS_INPUT='', LM_DATA_DIR='/d', LM_LOG_FILE='/l')
+    subprocess.run([sys.executable, '-'], input=_installer_config_writer(), env=env,
+                   capture_output=True, text=True, check=True)
+    config = json.loads(path.read_text())
+    with open(os.path.join(COLLECTOR_DIR, 'config.synology.example.json')) as f:
+        example = json.load(f)
+    for key in settings.SCHEMA:
+        assert settings.raw_value(config, key) == settings.raw_value(example, key), key
+    assert 'gpu_per_user' not in config                         # no NVIDIA on a NAS
+
+
+def test_synology_installer_has_no_privileged_steps():
+    # Owner decision: nothing extra on the NAS (no root helper, no SNMP)
+    with open(SYNOLOGY_INSTALLER) as f:
+        text = f.read()
+    assert 'snmp' not in text.lower() and 'privileged_helper_dir' not in text
+    assert 'install -o root' not in text
+    assert '--mode health --dry-run' in text                    # the non-root self-check
+
+
+def test_windows_installer_writes_the_new_keys_and_adds_no_task():
+    # No PowerShell here: checked as text (ASCII, balanced braces, the keys)
+    with open(os.path.join(REPO_DIR, 'install-collector-windows.ps1'), encoding='utf-8') as f:
+        text = f.read()
+    assert text.isascii() and text.count('{') == text.count('}')
+    config = text[text.index('$ConfigContent = @{'):text.index('ConvertTo-Json -Depth 6')]
+    for key in ('perf_counters', 'counter_max_window_seconds', 'user_metrics ', 'disk_io ', 'gpu_per_user',
+                'metrics_interval_seconds', 'sessions = @{', 'storage_health = @{', 'storage_breakdown = @{',
+                'temperature_c = @{ hdd = @(50, 60); ssd = @(70, 80) }', 'cold_days = @(365, 1095)',
+                'max_timeout_fraction = 0.6', 'exclude_clients = @()'):
+        assert key in config, key
+    assert not re.search(r'(?<![a-z_])owners\s*=', config.split('storage_breakdown = @{')[1])   # none on Windows
+    # Still the two tasks; the metrics task keeps its 10-minute limit and IgnoreNew
+    assert sorted(set(re.findall(r'-TaskName\s+"(Lab Monitor - [A-Za-z ]+)"', text))) == [
+        'Lab Monitor - Disk Collection', 'Lab Monitor - Metrics Collection']
+    assert '-ExecutionTimeLimit (New-TimeSpan -Minutes 10)' in text and 'IgnoreNew' in text
+    assert "'--query-gpu=index,name,driver_model.current'" in text          # the GPU driver model note
+
+
 def test_synology_installer_reads_versions_from_collector_requirements():
     with open(SYNOLOGY_INSTALLER) as f:
         text = f.read()
