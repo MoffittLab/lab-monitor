@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Moffitt Laboratory Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <!-- Pinned Plotly (1.58.5 is what the retired "plotly-latest" URL served) with SRI -->
+    <script src="https://cdn.plot.ly/plotly-1.58.5.min.js"
+            integrity="sha384-W7FXNbEY44RgDK8MunBe4gETSKi3Qo2bJAXX3PH8v5l3hdabFb9dbCIn3X69OFjX"
+            crossorigin="anonymous"></script>
 </head>
 <body>
     <div class="container">
@@ -18,8 +21,12 @@
             </div>
         </header>
 
+        <!-- Connection problems (Manager down / partial data) and render errors -->
+        <div class="conn-banner" id="connectionBanner" role="alert" hidden></div>
+        <div class="render-notice" id="renderNotice" role="status" hidden></div>
+
         <!-- Summary Section -->
-        <section class="summary">
+        <section class="summary" id="summarySection">
             <div class="summary-card">
                 <h3>Total Storage</h3>
                 <p class="summary-value" id="totalStorage">—</p>
@@ -27,9 +34,9 @@
             <div class="summary-card">
                 <h3>Lifetime Transfer</h3>
                 <div class="transfer-row">
-                    <span class="summary-value" id="lifetimeTransferIn">0 B <span class="transfer-label">in</span></span>
+                    <span class="summary-value" id="lifetimeTransferIn">— <span class="transfer-label">in</span></span>
                     <span class="transfer-divider">&bull;</span>
-                    <span class="summary-value" id="lifetimeTransferOut">0 B <span class="transfer-label">out</span></span>
+                    <span class="summary-value" id="lifetimeTransferOut">— <span class="transfer-label">out</span></span>
                 </div>
             </div>
         </section>
@@ -47,26 +54,26 @@
             <div class="chart-callout-content">
                 <span class="chart-close">&times;</span>
                 <h3 id="chartTitle"></h3>
-                
+
                 <!-- Time Range Controls -->
                 <div class="chart-controls">
                     <div class="control-group">
                         <span class="control-label">Time Range:</span>
-                        <button class="range-btn" onclick="setTimeRange(24)">Last 24h</button>
-                        <button class="range-btn" onclick="setTimeRange(168)">Last 7d</button>
-                        <button class="range-btn" onclick="setTimeRange(720)">Last 30d</button>
-                        <button class="range-btn" onclick="setTimeRange(null)">All Available</button>
+                        <button class="range-btn" data-range="24">Last 24h</button>
+                        <button class="range-btn" data-range="168">Last 7d</button>
+                        <button class="range-btn" data-range="720">Last 30d</button>
+                        <button class="range-btn" data-range="all">All Available</button>
                     </div>
                     <div class="control-group">
                         <span class="control-label">Custom:</span>
                         <input type="date" id="customFrom" class="date-input" />
                         <span class="date-separator">to</span>
                         <input type="date" id="customTo" class="date-input" />
-                        <button class="range-btn" onclick="applyCustomRange()">Apply</button>
+                        <button class="range-btn" data-range="custom" id="applyCustomRange">Apply</button>
                     </div>
                 </div>
-                
-                
+
+
                 <div class="chart-info" id="chartInfo"></div>
                 <div class="chart-container">
                     <div id="metricChart"></div>
@@ -77,11 +84,8 @@
 
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
     <script>
-        // Initialize dashboard with config
-        const config = {
-            refreshInterval: {{ refresh_interval }} * 1000
-        };
-        initDashboard(config);
+        // Initialize dashboard with config (refresh, stale/offline thresholds)
+        initDashboard({{ client_config|tojson }});
     </script>
 </body>
 </html>

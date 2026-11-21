@@ -2,9 +2,18 @@
   "host": "0.0.0.0",
   "port": 5001,
   "manager_url": "http://localhost:5000",
-  "manager_token": "SAME-AS-ONE-OF-MANAGER-TOKENS",
+  "manager_token": "PASTE-A-MANAGER-READ-TOKEN-HERE",
+  "auth": {
+    "username": "labadmin",
+    "password_hash": "PASTE-OUTPUT-OF: python app.py --hash-password"
+  },
   "refresh_interval_seconds": 30,
   "manager_timeout_seconds": 5,
+  "stale_minutes": 15,
+  "offline_minutes": 120,
+  "disk_stale_hours": 36,
+  "chart_max_points": 2000,
+  "threads": 8,
   "log_file": "E:\\Users\\lab-monitor\\logs\\dashboard.log",
   "log_level": "INFO",
   "debug": false
