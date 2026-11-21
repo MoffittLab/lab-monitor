@@ -4,7 +4,7 @@
   "id": "windows-atlantis",
   "device_type": "Server",
   "manager_url": "http://atlantis.med.harvard.edu:5000",
-  "manager_token": "YOUR-BEARER-TOKEN-HERE",
+  "manager_token": "YOUR-COLLECTOR-TOKEN-FOR-THIS-DEVICE",
 
   "volumes": ["E:", "F:"],
 
@@ -16,6 +16,9 @@
   "log_file": "E:\\Users\\lab-monitor\\logs\\collector.log",
   "log_level": "INFO",
   "timeout_seconds": 3600,
+  "total_timeout_seconds": 10800,
   "request_timeout_seconds": 30,
+  "max_batch_messages": 100,
+  "max_queue_messages": 50000,
   "exclude_users": ["UMFD-*", "NT AUTHORITY\\*", "NT SERVICE\\*"]
 }

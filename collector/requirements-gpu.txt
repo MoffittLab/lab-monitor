@@ -1,0 +1,3 @@
+# Optional: NVIDIA GPU stats for the collector (skipped at runtime when absent).
+# install-collector-windows.ps1 installs this when it detects an NVIDIA GPU.
+nvidia-ml-py==12.535.133

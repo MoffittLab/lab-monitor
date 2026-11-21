@@ -1,38 +1,65 @@
 """
 Disk usage measurement (cross-platform).
 
-Measures immediate subdirectories one level deep.
+Measures folder trees and volume capacity for the collector's disk mode.
 
-For volumes like /volume1 or E:/Users, discovers immediate subdirectories
-and measures their total size (including all nested contents).
+For a volume or folder like /volume1 or E:/Users, discover_folders() lists the
+immediate subdirectories; scan_folders() measures each one's total size
+(including all nested contents).
 
 Example:
-  Volume: /volume1
+  Folder:   /volume1
   Discovers: /volume1/JeffMoffitt, /volume1/OtherUser, ...
   Measures: Total size of each (all contents within)
-  Reports: [{'path': '/volume1/JeffMoffitt', 'usage_bytes': 5000000}, ...]
+  Reports:  {'sizes': {'/volume1/JeffMoffitt': 5000000, ...},
+             'timed_out': [...], 'errors': [...]}
 
 Cross-platform approach:
 - Windows: PowerShell Get-ChildItem (native Win32 batch enumeration, faster than os.scandir)
-- Linux/Synology: Python native os.scandir
+- Linux/Synology: Python native os.scandir (iterative, no recursion limit)
 - Handles permission errors gracefully
-- Timeout support for large folders (100TB+)
-- Works on Windows, Linux, and Synology NAS
+- Per-folder timeout plus an optional overall deadline for large trees (100TB+)
+- A folder that times out or fails is reported as such, never as 0 bytes
 """
 import os
 import shutil
 import logging
+import stat
 import subprocess
 import time
 import re
 import sys
 from typing import List, Dict, Tuple, Optional
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# stat.FILE_ATTRIBUTE_REPARSE_POINT only exists on Windows builds of Python
+FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
 
-def measure_folder_powershell(path: str, timeout: int = 3600) -> Tuple[int, int]:
+# How many directory entries to process between deadline checks
+_DEADLINE_CHECK_EVERY = 1000
+
+# PowerShell reads the folder from this environment variable, so the path is
+# never spliced into the script text (no quoting/injection issues).
+PS_PATH_ENV_VAR = 'LM_SCAN_PATH'
+PS_MEASURE_SCRIPT = (
+    "$r = Get-ChildItem -LiteralPath $env:" + PS_PATH_ENV_VAR + " "
+    "-Recurse -Force -File -ErrorAction SilentlyContinue "
+    "| Measure-Object -Property Length -Sum; "
+    "Write-Output ('{0} {1}' -f [int64]$r.Sum, [int64]$r.Count)"
+)
+
+
+def format_bytes(b: int) -> str:
+    """Human-readable byte string (B … PB), e.g. '1.5 GB'."""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def measure_folder_powershell(path: str, timeout: float = 3600) -> Tuple[int, int]:
     """
     Measure folder size on Windows using PowerShell Get-ChildItem.
 
@@ -41,75 +68,125 @@ def measure_folder_powershell(path: str, timeout: int = 3600) -> Tuple[int, int]
     Windows filesystems with large file counts.
 
     Args:
-        path: Folder path to measure
+        path: Folder path to measure (passed via $env:LM_SCAN_PATH)
         timeout: Max seconds to wait for PowerShell process
 
     Returns: Tuple of (total_bytes, files_counted)
-             files_counted is -1 when PowerShell returns a result (count
-             not easily available without a second pipeline step).
 
-    Raises: RuntimeError if PowerShell is unavailable or returns an error.
+    Raises: TimeoutError if PowerShell exceeds the timeout (the process is
+            killed); FileNotFoundError / PermissionError if the folder itself
+            is missing or can't be listed; RuntimeError if PowerShell is
+            unavailable or its output can't be parsed.
     """
-    # Escape single quotes in path for PowerShell string literal
-    ps_path = path.replace("'", "''")
-    ps_script = (
-        "$r = Get-ChildItem -LiteralPath '" + ps_path + "' "
-        "-Recurse -Force -ErrorAction SilentlyContinue "
-        "| Measure-Object -Property Length -Sum; "
-        "Write-Output \"$($r.Sum) $($r.Count)\""
-    )
+    env = dict(os.environ)
+    env[PS_PATH_ENV_VAR] = path
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_MEASURE_SCRIPT],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=max(timeout, 0.001),
+            env=env,
         )
-        output = result.stdout.strip()
-        if not output:
-            raise RuntimeError(f"PowerShell returned empty output for {path}")
-        parts = output.split()
-        total_bytes   = int(float(parts[0])) if parts[0] not in ('', 'None', None) else 0
-        files_counted = int(parts[1]) if len(parts) > 1 and parts[1] not in ('', 'None', None) else -1
-        return total_bytes, files_counted
     except subprocess.TimeoutExpired:
-        raise TimeoutError(f"PowerShell measurement of {path} exceeded {timeout}s")
+        raise TimeoutError(f"PowerShell measurement of {path} exceeded {timeout:.0f}s")
+    except OSError as e:
+        raise RuntimeError(f"Could not run PowerShell: {e}")
+
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError(f"PowerShell returned empty output for {path}")
+    try:
+        parts = output.split()
+        total_bytes = int(parts[0])
+        files_counted = int(parts[1]) if len(parts) > 1 else -1
     except (ValueError, IndexError) as e:
         raise RuntimeError(f"Could not parse PowerShell output for {path}: {e}")
+    if files_counted == 0:
+        # -ErrorAction SilentlyContinue makes Get-ChildItem print "0 0" for an
+        # empty folder, a missing one and one it can't list (access denied)
+        # alike. Listing it here tells them apart: the last two raise, so the
+        # folder goes in _errors instead of being reported as 0 bytes.
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Not a directory: {path}")
+        with os.scandir(path):
+            pass
+    return total_bytes, files_counted
 
 
-def measure_folder_recursive(path: str, timeout: int = 3600) -> Tuple[int, int]:
+def _is_reparse_dir(entry: os.DirEntry) -> bool:
     """
-    Measure folder size recursively (cross-platform).
+    True for Windows directory reparse points (junctions, volume mount points,
+    directory symlinks). Following them double-counts data or loops forever.
+    Reparse-point *files* (e.g. Data Deduplication, cloud placeholders) are
+    still counted by the caller; file symlinks are skipped separately.
+    """
+    is_junction = getattr(entry, 'is_junction', None)   # Python 3.12+
+    if is_junction is not None and is_junction():
+        return True
+    try:
+        attrs = getattr(entry.stat(follow_symlinks=False), 'st_file_attributes', 0)
+    except OSError:
+        return False
+    return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
     
-    Uses Python's native os.scandir for fast, reliable measurement.
-    Works on Windows, Linux, and Synology.
+
+def measure_folder_recursive(path: str, timeout: float = 3600,
+                             deadline: Optional[float] = None) -> Tuple[int, int]:
+    """
+    Measure folder size by walking the whole tree (cross-platform).
+
+    Iterative (explicit stack) so arbitrarily deep trees can't hit Python's
+    recursion limit. Hard-linked files are counted once: (st_dev, st_ino) is
+    remembered only for files with st_nlink > 1, so memory stays proportional
+    to the number of multiply-linked files, not the size of the tree.
+    (On Windows os.scandir reports st_nlink = 0, so no dedup happens there.)
     
     Args:
         path: Folder path to measure
         timeout: Max seconds to spend measuring this folder
+        deadline: Optional absolute time.monotonic() value that also ends the scan
     
     Returns: Tuple of (total_bytes, files_counted)
 
-    Raises: TimeoutError if measurement exceeds timeout
+    Raises:
+        TimeoutError if the time budget runs out (never a partial total)
+        OSError (FileNotFoundError, PermissionError, ...) if path itself
+        can't be read. Unreadable subdirectories are skipped and logged.
     """
+    limit = time.monotonic() + timeout
+    if deadline is not None:
+        limit = min(limit, deadline)
+
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Not a directory: {path}")
+
     total_bytes = 0
-    start_time = time.time()
     files_counted = 0
-    visited_inodes = set()   # track (dev, ino) to skip hard-link duplicates
+    unreadable_dirs = 0
+    entries_seen = 0
+    linked_inodes = set()     # (dev, ino) of files with st_nlink > 1
+    skip_reparse = sys.platform == 'win32'
+    stack = [path]
 
-    def _scan(dir_path: str) -> int:
-        """Recursive scan helper"""
-        nonlocal total_bytes, files_counted
-
-        # Check timeout
-        if time.time() - start_time > timeout:
-            raise TimeoutError(f"Measurement of {path} exceeded {timeout}s")
-
-        dir_size = 0
-
+    while stack:
+        if time.monotonic() > limit:
+            raise TimeoutError(f"Measurement of {path} exceeded {timeout:.0f}s")
+        dir_path = stack.pop()
         try:
-            for entry in os.scandir(dir_path):
+            it = os.scandir(dir_path)
+        except OSError as e:
+            if dir_path == path:
+                raise   # the folder itself is unreadable: an error, not 0 bytes
+            unreadable_dirs += 1
+            logger.debug(f"Cannot access {dir_path}: {e}")  # Permission denied on system folders is expected
+            continue
+
+        with it:
+            for entry in it:
+                entries_seen += 1
+                if entries_seen % _DEADLINE_CHECK_EVERY == 0 and time.monotonic() > limit:
+                    raise TimeoutError(f"Measurement of {path} exceeded {timeout:.0f}s")
                 try:
                     # Skip symlinks to avoid loops
                     if entry.is_symlink():
@@ -124,38 +201,24 @@ def measure_folder_recursive(path: str, timeout: int = 3600) -> Tuple[int, int]:
                         continue
 
                     if entry.is_file(follow_symlinks=False):
-                        try:
-                            st = entry.stat(follow_symlinks=False)
+                        st = entry.stat(follow_symlinks=False)
+                        if st.st_nlink > 1:
                             inode_key = (st.st_dev, st.st_ino)
-                            if inode_key in visited_inodes:
-                                continue   # hard-link already counted
-                            visited_inodes.add(inode_key)
-                            dir_size += st.st_size
-                            files_counted += 1
-                        except OSError:
-                            pass
+                            if inode_key in linked_inodes:
+                                continue   # hard link already counted
+                            linked_inodes.add(inode_key)
+                        total_bytes += st.st_size
+                        files_counted += 1
                     elif entry.is_dir(follow_symlinks=False):
-                        dir_size += _scan(entry.path)
-                except (OSError, PermissionError):
+                        if skip_reparse and _is_reparse_dir(entry):
+                            continue
+                        stack.append(entry.path)
+                except OSError:
                     continue
-        except (OSError, PermissionError) as e:
-            logger.debug(f"Cannot access {dir_path}: {e}")  # Permission denied on system folders is expected
 
-        return dir_size
-    
-    try:
-        if not os.path.exists(path):
-            logger.debug(f"Path does not exist: {path}")  # Non-existent scan paths are handled gracefully
-            return 0, 0  # keep tuple contract; a bare int here crashes unpacking callers
-        
-        total_bytes = _scan(path)
-        return total_bytes, files_counted
-
-    except TimeoutError:
-        raise
-    except Exception as e:
-        logger.error(f"Error measuring {path}: {e}")
-        return 0, 0
+    if unreadable_dirs:
+        logger.info(f"{path}: skipped {unreadable_dirs} unreadable subfolder(s)")
+    return total_bytes, files_counted
 
 
 def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
@@ -240,7 +303,8 @@ def is_valid_volume_path(path: str, system: str = None) -> bool:
     return True
 
 
-def discover_folders(volume_path: str, nas_type: str = "synology") -> List[str]:
+def discover_folders(volume_path: str, nas_type: str = "synology",
+                     validate_volume: bool = True, raise_errors: bool = False) -> List[str]:
     """
     Discover immediate subdirectories on a volume (one level only).
     
@@ -253,12 +317,18 @@ def discover_folders(volume_path: str, nas_type: str = "synology") -> List[str]:
     Args:
         volume_path: Root volume path (e.g., /volume1 or E:)
         nas_type: 'synology' or 'windows'
+        validate_volume: require a volume-style path (/volume*, /mnt*, X:).
+            Pass False for an explicitly configured scan_paths glob root,
+            which may legitimately live anywhere (Linux /data, UNC paths).
+        raise_errors: re-raise the OSError if volume_path itself can't be
+            listed, so the caller can report it (in _errors) instead of
+            getting an empty list that looks like "no subfolders".
     
     Returns: List of immediate subdirectory paths (one level only)
     """
     folders = []
     
-    if not is_valid_volume_path(volume_path, system=nas_type):
+    if validate_volume and not is_valid_volume_path(volume_path, system=nas_type):
         return folders
     
     try:
@@ -273,36 +343,12 @@ def discover_folders(volume_path: str, nas_type: str = "synology") -> List[str]:
                 
                 # Add this immediate subdirectory only
                 folders.append(entry.path)
-    except (OSError, PermissionError) as e:
+    except OSError as e:
+        if raise_errors:
+            raise
         logger.debug(f"Cannot read {volume_path}: {e}")
     
     return folders
-
-
-def discover_at_depth(root: str, depth: int, nas_type: str = None) -> List[str]:
-    """
-    Discover folders at exactly 'depth' levels below root.
-
-    depth=1: immediate subdirectories of root  (e.g. /volume1/SharedFolder)
-    depth=2: subdirectories of those           (e.g. /volume1/SharedFolder/Project)
-
-    Args:
-        root:     Starting path (e.g. /volume1)
-        depth:    How many levels to descend
-        nas_type: 'synology', 'windows', or None (auto-detect)
-
-    Returns: List of leaf folder paths at the requested depth
-    """
-    if nas_type is None:
-        nas_type = "windows" if sys.platform == "win32" else "synology"
-
-    if depth == 1:
-        return discover_folders(root, nas_type)
-
-    leaf_folders = []
-    for folder in discover_folders(root, nas_type):
-        leaf_folders.extend(discover_at_depth(folder, depth - 1, nas_type))
-    return leaf_folders
 
 
 def measure_volume_capacity(volume_path: str) -> dict:
@@ -362,169 +408,88 @@ def discover_volumes(nas_type: str = None) -> List[str]:
     return volumes
 
 
-def _format_bytes(b: int) -> str:
-    """Human-readable byte string for log messages."""
-    if b > 1024 ** 3:
-        return f"{b / (1024 ** 3):.2f} GB"
-    if b > 1024 ** 2:
-        return f"{b / (1024 ** 2):.2f} MB"
-    return f"{b / 1024:.2f} KB"
-
-
-def _measure_one_folder(folder_path: str, timeout: int, use_powershell: bool) -> Tuple[int, int]:
+def _measure_one_folder(folder_path: str, timeout: float, use_powershell: bool) -> Tuple[int, int]:
     """
     Measure a single folder, using PowerShell on Windows when requested.
 
-    Falls back to the Python scanner if PowerShell fails.
+    Falls back to the Python scanner (with whatever is left of the budget) if
+    PowerShell fails — but not if it timed out, which would only spend the
+    same budget again in the slower scanner, nor if the folder itself is
+    missing or unreadable.
 
     Returns: (bytes_used, files_counted)
+    Raises: TimeoutError, or OSError/RuntimeError on failure
     """
+    deadline = time.monotonic() + timeout
     if use_powershell:
         try:
             return measure_folder_powershell(folder_path, timeout=timeout)
+        except OSError:
+            raise   # TimeoutError, or the folder itself is missing / can't be listed
         except Exception as ps_err:
             logger.warning(
                 f"PowerShell measurement failed for {folder_path} ({ps_err}); "
                 f"falling back to Python scanner"
             )
-    return measure_folder_recursive(folder_path, timeout=timeout)
+    return measure_folder_recursive(folder_path, timeout=max(0.0, deadline - time.monotonic()),
+                                    deadline=deadline)
 
 
-def measure_leaf_folders(leaf_folders: List[str], timeout: int = 3600) -> List[Dict]:
+def scan_folders(folders: List[str], timeout: float = 3600,
+                 deadline: Optional[float] = None) -> Dict:
     """
-    Measure usage for a pre-discovered list of leaf folders.
+    Measure each folder in a pre-discovered list.
 
     On Windows, uses PowerShell Get-ChildItem for faster native enumeration.
     Falls back to the Python os.scandir walker if PowerShell is unavailable
     or returns an error.
 
-    Does NOT discover subdirectories — measures each folder as-is.
-    Use when you have already discovered the exact folders to measure via discover_at_depth.
-
     Args:
-        leaf_folders: List of folder paths already discovered (e.g., from discover_at_depth)
-        timeout: Max seconds per folder measurement
+        folders:  Folder paths to measure (e.g. from discover_folders)
+        timeout:  Max seconds per folder
+        deadline: Optional overall time.monotonic() deadline shared by all
+                  folders. Folders not reached before it are reported as
+                  timed out rather than silently dropped.
 
-    Returns: List of folder reports with path and usage_bytes
+    Returns: {'sizes': {path: bytes}, 'timed_out': [paths], 'errors': [paths]}
+             A timed-out or failed folder is never reported with a size.
     """
-    results = []
-    start_time = time.time()
+    sizes: Dict[str, int] = {}
+    timed_out: List[str] = []
+    errors: List[str] = []
     use_powershell = sys.platform == 'win32'
 
-    if use_powershell:
+    if use_powershell and folders:
         logger.info("Windows detected — using PowerShell for folder size measurement")
 
-    for folder_path in leaf_folders:
-        if not os.path.exists(folder_path):
-            logger.warning(f"Folder does not exist: {folder_path}")
-            continue
+    for i, folder_path in enumerate(folders):
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            remaining = list(folders[i:])
+            logger.warning(
+                f"Overall disk-scan time budget exhausted: {len(remaining)} folder(s) not "
+                f"measured, reported as timed out: {remaining}"
+            )
+            timed_out.extend(remaining)
+            break
+        folder_timeout = timeout if deadline is None else min(timeout, deadline - now)
 
+        logger.info(f"Measuring ... {folder_path}")
+        folder_start = time.monotonic()
         try:
-            # Check overall timeout
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                logger.warning(f"Overall timeout ({timeout}s) reached, stopping measurements")
-                break
-
-            logger.info(f"Measuring ... {folder_path}")
-            folder_start = time.time()
-
-            bytes_used, files_counted = _measure_one_folder(folder_path, timeout, use_powershell)
-
-            results.append({
-                'path': folder_path,
-                'usage_bytes': bytes_used
-            })
-
-            folder_elapsed = time.time() - folder_start
-            count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
-            logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {_format_bytes(bytes_used)} ({count_str})")
-
+            bytes_used, files_counted = _measure_one_folder(folder_path, folder_timeout, use_powershell)
+        except TimeoutError as e:
+            logger.warning(f"Timed out measuring {folder_path}: {e} (reported as timed out, not 0)")
+            timed_out.append(folder_path)
+            continue
         except Exception as e:
             logger.error(f"Failed to measure {folder_path}: {e}")
+            errors.append(folder_path)
             continue
 
-    return results
+        sizes[folder_path] = bytes_used
+        folder_elapsed = time.monotonic() - folder_start
+        count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
+        logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {format_bytes(bytes_used)} ({count_str})")
 
-
-def measure_all_folders(volumes: List[str], timeout: int = 3600) -> List[Dict]:
-    """
-    Measure usage for all immediate subdirectories on given volumes.
-    
-    For each volume, discovers immediate subdirectories (one level only),
-    then measures the size of each subdirectory including all nested contents.
-    
-    Args:
-        volumes: List of volume paths (e.g., ['/volume1', '/volume2'])
-        timeout: Max seconds per folder measurement
-    
-    Returns: List of folder reports with path and usage_bytes
-        Example: [{'path': '/volume1/JeffMoffitt', 'usage_bytes': 5000000},
-                  {'path': '/volume1/OtherUser', 'usage_bytes': 3000000}]
-    """
-    results = []
-    start_time = time.time()
-    use_powershell = sys.platform == 'win32'
-
-    if use_powershell:
-        logger.info("Windows detected — using PowerShell for folder size measurement")
-
-    for volume in volumes:
-        if not os.path.exists(volume):
-            logger.warning(f"Volume does not exist: {volume}")
-            continue
-
-        # Log progress
-        elapsed = time.time() - start_time
-        logger.info(f"Measuring volume {volume} (elapsed {elapsed:.1f}s)")
-        
-        # Discover immediate subdirectories on this volume (one level only)
-        try:
-            folders = discover_folders(volume, nas_type="synology" if not sys.platform.startswith('win') else "windows")
-        except Exception as e:
-            logger.error(f"Failed to discover folders on {volume}: {e}")
-            continue
-        
-        logger.info(f"Found {len(folders)} subdirectories on {volume}")
-        
-        # Measure each folder
-        for folder_path in folders:
-            try:
-                # Check overall timeout
-                elapsed = time.time() - start_time
-                if elapsed > timeout:
-                    logger.warning(f"Overall timeout ({timeout}s) reached, stopping measurements")
-                    break
-                
-                # Announce before starting — lets you see what's in progress
-                logger.info(f"Measuring ... {folder_path}")
-                folder_start = time.time()
-
-                # Measure this subdirectory (including all nested contents)
-                bytes_used, files_counted = _measure_one_folder(folder_path, timeout, use_powershell)
-
-                results.append({
-                    'path': folder_path,
-                    'usage_bytes': bytes_used
-                })
-
-                folder_elapsed = time.time() - folder_start
-                count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
-                logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {_format_bytes(bytes_used)} ({count_str})")
-            
-            except TimeoutError as e:
-                logger.warning(f"Timeout measuring {folder_path}: {e}")
-                results.append({
-                    'path': folder_path,
-                    'usage_bytes': 0,
-                    'timeout': True
-                })
-            except Exception as e:
-                logger.error(f"Failed to measure {folder_path}: {e}")
-    
-    # Log summary
-    total_time = time.time() - start_time
-    total_bytes = sum(r.get('usage_bytes', 0) for r in results)
-    logger.info(f"Measurement complete: {len(results)} subdirectories, {_format_bytes(total_bytes)} total, {total_time:.1f}s")
-    
-    return results
+    return {'sizes': sizes, 'timed_out': timed_out, 'errors': errors}
