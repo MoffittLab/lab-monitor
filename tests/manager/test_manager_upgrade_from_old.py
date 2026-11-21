@@ -652,3 +652,33 @@ def test_new_machine_with_an_alike_name_gets_its_own_row(make_client, data_dir):
     t = client.get('/api/totals', headers=auth(READ)).get_json()['devices']
     assert 'LAB-A' not in t
     assert t['lab-a']['total_bytes_in'] == 5900 and t['lab_a']['total_bytes_in'] == 800
+
+
+def test_tables_of_a_later_manager_are_left_alone(make_client, data_dir):
+    # A later Manager adds _rollup_* and storage_breakdown_* tables to data.db.
+    # Running this one again on such a database must not list them, treat
+    # them as old tables (backup on every start) or fail on them.
+    client = make_client()
+    post_queue(client, [make_msg('system_metrics', metrics_payload(), ts='2026-08-05T00:00:00Z')])
+    db = os.path.join(data_dir, 'triton', 'data.db')
+    con = sqlite3.connect(db)
+    try:
+        con.execute('CREATE TABLE _rollup_hourly (bucket TEXT, n INTEGER)')
+        con.execute('CREATE TABLE storage_breakdown_msgs (id INTEGER PRIMARY KEY, ts TEXT)')
+        con.execute('CREATE TABLE storage_breakdown_rows (msg INTEGER, owner TEXT)')
+        con.commit()
+    finally:
+        con.close()
+
+    client = make_client()
+    make_client()
+    assert not _backups(db)
+    assert 'msg_id' not in _columns(db, '_rollup_hourly')
+    resp = client.get('/api/data/Triton', headers=auth(READ))
+    assert resp.status_code == 200
+    assert not [t for t in resp.get_json()['data_types'] if t.startswith(('_', 'storage_breakdown_'))]
+    assert _statuses(post_queue(client, [
+        make_msg('system_metrics', metrics_payload(), ts='2026-08-05T00:05:00Z'),
+        make_msg('storage_breakdown', {'x': 1}, ts='2026-08-05T00:05:00Z'),
+        make_msg('storage_breakdown_x', {'x': 1}, ts='2026-08-05T00:05:00Z'),
+    ])) == ['stored', 'stored', 'rejected']

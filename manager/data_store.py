@@ -100,10 +100,15 @@ _FU_LEGACY = 'folder_usage_legacy'
 
 # data_type labels: letter first, then letters/digits/_/-, max 64 chars.
 _DATA_TYPE_RE = re.compile(r'[A-Za-z][A-Za-z0-9_-]{0,63}')
-# Table-name prefixes reserved for SQLite and for the folder_usage layout
-_RESERVED_PREFIXES = ('sqlite_', 'folder_usage_')
+# Table-name prefixes reserved for SQLite, for the folder_usage layout, and
+# for tables a later Manager adds (storage_breakdown_*, _rollup_* ...).  They
+# are reserved now so that running this Manager again on a database a later
+# one has written neither lists those tables nor "migrates" (and backs up)
+# them as old tables on every start.
+_RESERVED_PREFIXES = ('sqlite_', 'folder_usage_', 'storage_breakdown_', '_')
 # The tables that really are internal (never listed or read as a data_type)
-_INTERNAL_TABLE_RE = re.compile(r'sqlite_.*|folder_usage_(?:msgs|items|legacy(?:_\d+)?)')
+_INTERNAL_TABLE_RE = re.compile(
+    r'sqlite_.*|folder_usage_(?:msgs|items|legacy(?:_\d+)?)|storage_breakdown_.*|_.*')
 
 # SQLite's default SQLITE_MAX_COLUMN is 2000; leave headroom.
 _MAX_COLUMNS = 1900
