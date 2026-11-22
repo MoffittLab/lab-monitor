@@ -875,3 +875,34 @@ def test_static_assets_present():
     backdrop = static / 'img' / 'backdrop.jpg'
     assert backdrop.exists() and backdrop.stat().st_size < 300 * 1024
     assert 'backdrop.jpg' in (static / 'css' / 'style.css').read_text()
+
+
+# ---------------------------------------------------------------------------
+# Static files: content types don't depend on the system (Windows registry)
+# ---------------------------------------------------------------------------
+
+def test_static_files_have_the_types_browsers_require_under_nosniff(make_client):
+    import mimetypes
+    # What a Windows registry often says; nosniff then makes browsers refuse the script
+    mimetypes.add_type('text/plain', '.js')
+    mimetypes.add_type('application/octet-stream', '.css')
+    dash.register_static_types()
+
+    client, _ = make_client()
+    static = REPO / 'dashboard' / 'static'
+    files = [p for p in static.rglob('*') if p.is_file()]
+    assert any(p.suffix == '.js' for p in files) and any(p.suffix == '.css' for p in files)
+    for path in files:
+        assert path.suffix.lower() in dash.STATIC_TYPES, f'add {path.suffix} to STATIC_TYPES'
+        resp = client.get('/static/' + path.relative_to(static).as_posix())
+        assert resp.status_code == 200
+        assert resp.headers['Content-Type'].split(';')[0] == dash.STATIC_TYPES[path.suffix.lower()], path.name
+        assert resp.headers['X-Content-Type-Options'] == 'nosniff'
+        resp.close()
+
+
+def test_page_loads_its_script_and_stylesheet_from_static(make_client):
+    client, _ = make_client()
+    page = client.get('/').get_data(as_text=True)
+    assert '/static/js/dashboard.js' in page and '/static/css/style.css' in page
+    assert client.get('/static/js/dashboard.js').headers['Content-Type'].startswith('text/javascript')
