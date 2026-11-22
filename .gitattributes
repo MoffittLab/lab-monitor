@@ -1,0 +1,5 @@
+# Files that run on Linux / Synology DSM keep LF line endings even in a Windows
+# checkout (git core.autocrlf=true), so a copy taken from the Windows server
+# still runs under bash and systemd.
+*.sh                text eol=lf
+collector/systemd/* text eol=lf
