@@ -50,6 +50,10 @@ logs/
 
 # Deployment credentials — never commit
 tools/collectors.csv
+# Encrypted inventory (tools/inventory_crypt.py) and its backup/temp files
+*.csv.enc
+*.csv.enc.bak
+*.csv.enc.tmp
 
 # Runtime PID files written by manager.py / dashboard/app.py
 .pids/
