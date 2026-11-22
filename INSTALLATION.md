@@ -348,6 +348,10 @@ Temperature should match within a degree or two and power within a few watts. Ut
 VRAM used can differ by the driver-reserved amount. Causes and fixes:
 [collector/README.md](collector/README.md#gpu-servers).
 
+**Fleet tools:** to update, run, pause or archive this collector from `tools/` like the others, add it to
+`collectors.csv` with `platform` = `linux` and add the sudoers rule in
+[tools/README.md](tools/README.md#linux-collectors-platform--linux).
+
 **Uninstall:** `sudo /opt/lab-monitor/install-collector-linux.sh --uninstall` (keeps config, data and logs;
 add `--purge` to delete them and the `labmon` user).
 

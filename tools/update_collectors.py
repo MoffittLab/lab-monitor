@@ -30,6 +30,10 @@ Fields:
                 (only needed with --upgrade-pip)
     key_filename  Optional private key file to offer first
     port        Optional SSH port (default 22)
+    platform    Optional: linux for an install-collector-linux.sh install. git_path is
+                then the checkout the installer ran from; the update is git pull there,
+                then sudo -n <git_path>/install-collector-linux.sh --non-interactive
+                (sudoers rule: tools/README.md, "Linux collectors")
 
 Usage:
     python3 update_collectors.py --csv collectors.csv
@@ -122,6 +126,16 @@ def build_commands(row: dict, skip_pip: bool,
     """
     git_path    = _ssh.row_value(row, 'git_path')
     python_path = _ssh.row_value(row, 'python_path')
+
+    if _ssh.is_linux_install(row):
+        # The installed copy in /opt/lab-monitor isn't a git checkout: update the
+        # administrator's checkout, then let its installer refresh code, venv
+        # (requirements included, so --upgrade-pip adds nothing) and units. It
+        # keeps /etc/lab-monitor/collector.json, including 'active'.
+        gp = git_path.rstrip('/')
+        return [('git pull', f'git -C {shlex.quote(gp)} pull origin main'),
+                ('install', f'{_ssh.SUDO} {shlex.quote(_ssh.linux_installer_path(row))} --non-interactive')]
+
     windows     = is_windows_path(git_path) or is_windows_path(python_path)
 
     if windows:
@@ -224,6 +238,7 @@ def update_system(row: dict, dry_run: bool, skip_pip: bool, timeout: int,
                     step['status'] = 'error'
                     if not step['error']:
                         step['error'] = f'exit code {code}'
+                    step['error'] += _ssh.sudo_hint(step['error'])
                 result['steps'].append(step)
                 if code != 0:
                     break   # stop on first failure
