@@ -8,7 +8,7 @@ question: "after the upgrade, is every piece of data the old Manager stored
 still readable, unchanged, through the new Manager and Dashboard?"
 
     python tools\verify_upgrade.py --manager-config manager\config.json --report verify.json
-    python tools\verify_upgrade.py --data-dir E:\Users\lab-monitor\data --work-dir F:\verify ^
+    python tools\verify_upgrade.py --data-dir E:\Users\lab-monitor\manager-data --work-dir F:\verify ^
                                    --with-dashboard --keep-work --report verify.json
 
 The live data_dir is NEVER written to:
@@ -25,9 +25,9 @@ Everything else happens on two copies under --work-dir:
   copy B  served by the NEW Manager (this checkout, or --new-code DIR), which
           migrates it on first start exactly as it will migrate production.
 The OLD code is the code the live Manager runs: f086e7e, or the review-fix
-release (fb6498c) once that is deployed.  Which one is detected from the old
-code (--old-version overrides it), and the data_dir must be in the layout that
-code writes.  With the review-fix release as the old side every check keeps
+release (160da09; fb6498c writes the same databases) once that is deployed.
+Which one is detected from the old code (--old-version overrides it), and
+the data_dir must be in the layout that code writes.  With the review-fix release as the old side every check keeps
 its name, with that release's expectations (tools/README.md, section 8): rows
 are compared with their msg_id, folder_usage is the data type it serves from
 its narrow tables (folder_usage_msgs / _items / _legacy are storage, checked
@@ -275,7 +275,7 @@ INTENDED = OrderedDict([
 ])
 
 # The old sides each intended difference is accepted for: 'old' (f086e7e) and
-# 'current' (the review-fix release, fb6498c).  With the review-fix release as
+# 'current' (the review-fix release, 160da09 / fb6498c).  With the review-fix release as
 # the old side, the differences that release made itself (msg_id on rows,
 # narrow folder rows, scaled formatted sizes, the counters of
 # /api/metrics/all, ...) are not normalized: the OLD and NEW answers must
@@ -292,7 +292,8 @@ INTENDED_SIDES = {
 # What the old code is (detect_old_version, or --old-version)
 OLD_VERSIONS = OrderedDict([
     ('old', 'f086e7e or older: wide folder_usage tables, no msg_id'),
-    ('current', 'the review-fix release (fb6498c): narrow folder_usage tables, msg_id, dead_letter'),
+    ('current', 'the review-fix release (160da09; fb6498c writes the same databases): narrow '
+                'folder_usage tables, msg_id, dead_letter'),
 ])
 # manager/data_store.py _INTERNAL_TABLE_RE of the review-fix release (the new
 # Manager keeps it): storage tables that are never listed or read as a data type
@@ -301,6 +302,23 @@ CURRENT_INTERNAL_TABLE_RE = re.compile(
 # manager/storage_util.py INSTANCE_LOCK_NAME: the running Manager's lock file
 # (not data; on Windows its locked byte can't even be read)
 INSTANCE_LOCK_NAME = 'manager.lock'
+# manager/snapshot.py STAGING_DIR and STATUS_FILE (review-fix release 160da09
+# and later): the live Manager's snapshot scratch folder, whose files appear,
+# grow and vanish while a snapshot runs (or stay, half written, after a
+# Manager was killed mid-snapshot), and its snapshot status file.  Neither
+# holds data: neither is copied, and changes to them are the live Manager's.
+SNAPSHOT_STAGING = '.snapshot-staging'
+SNAPSHOT_STATUS = 'snapshot-status.json'
+
+
+def is_snapshot_scratch(rel):
+    """The live Manager's snapshot staging folder or anything in it (relative path with '/')."""
+    return rel == SNAPSHOT_STAGING or rel.startswith(SNAPSHOT_STAGING + '/')
+
+
+def is_manager_status(rel):
+    """The live Manager's snapshot status file (and its temporary file while it is replaced)."""
+    return rel in (SNAPSHOT_STATUS, SNAPSHOT_STATUS + '.tmp')
 
 
 def is_lock_file(rel):
@@ -978,7 +996,10 @@ def fingerprint(root):
     {'files': {rel: {size, mtime_ns, sha256}}, 'dirs': [rel]} for every file
     under root.  Lock files (is_lock_file: manager.lock, a collector's
     *.json.lock) get size and mtime only: on Windows a held lock's byte can't
-    be read.
+    be read.  So do the files in the live Manager's snapshot staging folder
+    (is_snapshot_scratch: temporary copies, possibly as large as the
+    databases, that the Manager may remove while they are read); one that
+    vanishes while this runs is left out instead of being reported unreadable.
     """
     files, dirs = {}, []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -989,10 +1010,14 @@ def fingerprint(root):
         for fn in sorted(filenames):
             p = os.path.join(dirpath, fn)
             rel = os.path.relpath(p, root).replace(os.sep, '/')
+            scratch = is_snapshot_scratch(rel)
             try:
                 st = os.stat(p)
                 files[rel] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns,
-                              'sha256': None if is_lock_file(rel) else sha256_file(p)}
+                              'sha256': None if is_lock_file(rel) or scratch else sha256_file(p)}
+            except FileNotFoundError as e:
+                if not scratch:
+                    files[rel] = {'error': '%s: %s' % (type(e).__name__, e)}
             except OSError as e:
                 files[rel] = {'error': '%s: %s' % (type(e).__name__, e)}
     return {'files': files, 'dirs': dirs}
@@ -1087,13 +1112,19 @@ def copy_data_dir(src, dst, staging):
     Copy src -> dst: databases via the backup API, other files with
     shutil.copy2.  Lock files (is_lock_file) are not copied: they hold no
     data, each Manager and collector writes its own, and on Windows a held
-    lock's byte can't be read.
+    lock's byte can't be read.  Neither are the live Manager's snapshot
+    staging folder (is_snapshot_scratch: temporary copies a running snapshot
+    writes and removes, or a killed one left half written with a hot
+    journal) and its snapshot status file (is_manager_status).
     """
     copied = []
     os.makedirs(dst, exist_ok=True)
     for dirpath, dirnames, filenames in os.walk(src):
-        dirnames.sort()
         rel_dir = os.path.relpath(dirpath, src)
+        if rel_dir == '.' and SNAPSHOT_STAGING in dirnames:
+            dirnames.remove(SNAPSHOT_STAGING)
+            copied.append({'file': SNAPSHOT_STAGING, 'kind': 'scratch', 'method': 'not copied'})
+        dirnames.sort()
         target_dir = dst if rel_dir == '.' else os.path.join(dst, rel_dir)
         os.makedirs(target_dir, exist_ok=True)
         names = set(filenames)
@@ -1107,6 +1138,9 @@ def copy_data_dir(src, dst, staging):
             if is_lock_file(rel):
                 copied.append({'file': rel, 'kind': 'lock', 'method': 'not copied'})
                 continue
+            if is_manager_status(rel):
+                copied.append({'file': rel, 'kind': 'status', 'method': 'not copied'})
+                continue
             t = os.path.join(target_dir, fn)
             if is_sqlite(p):
                 method = backup_sqlite(p, t, staging)
@@ -1116,11 +1150,17 @@ def copy_data_dir(src, dst, staging):
                 # whether that backup is still current, so the copy must look like the original.
                 try:
                     times = [os.stat(x).st_mtime_ns for x in (p, p + '-wal') if os.path.exists(x)]
-                    os.utime(t, ns=(max(times), max(times)))
+                    if times:
+                        os.utime(t, ns=(max(times), max(times)))
                 except OSError:
                     pass
             else:
-                shutil.copy2(p, t)
+                try:
+                    shutil.copy2(p, t)
+                except FileNotFoundError:
+                    # removed meanwhile (a live process); the source check reports it
+                    copied.append({'file': rel, 'kind': 'vanished', 'method': 'not copied'})
+                    continue
                 copied.append({'file': rel, 'kind': 'file'})
     return copied
 
@@ -1749,7 +1789,8 @@ class Verifier:
         self.read_token = 'verify-read-' + uuid.uuid4().hex
 
     def space_check(self, fp):
-        total = sum(f.get('size', 0) for f in fp['files'].values())
+        # the live Manager's snapshot staging files are not copied
+        total = sum(f.get('size', 0) for rel, f in fp['files'].items() if not is_snapshot_scratch(rel))
         dbs = sum(f.get('size', 0) for rel, f in fp['files'].items() if rel.endswith('.db'))
         # copy A + copy B + B's pre-upgrade backups + narrow folder tables + the rollback's restored copies
         # (with the review-fix release as the old side: its copy C of the migrated databases instead)
@@ -1862,7 +1903,7 @@ class Verifier:
             raise SetupError(
                 'the data_dir was written by the review-fix release or a later one (%s), but the old code is '
                 'f086e7e or older: pass --old-ref <the commit the live Manager runs> (git -C <its checkout> '
-                'rev-parse HEAD; e.g. fb6498c), see tools/README.md' % ', '.join(evidence[:3]))
+                'rev-parse HEAD; e.g. 160da09), see tools/README.md' % ', '.join(evidence[:3]))
         if layout == 'old' and self.old_version == 'current':
             raise SetupError(
                 'the data_dir is still in the layout the f086e7e Manager wrote, but the old code is the '
@@ -4237,13 +4278,21 @@ class Verifier:
         if not touched:
             self.check('source', 'PASS', 'data_dir unchanged: %d files, %.2f GB (size, mtime, sha256)' % (n, size / 1e9))
             return
+        # What a running Manager writes itself: its databases and their side files, its lock
+        # file, and (160da09 and later) its snapshot staging folder and snapshot status file
         db_like = re.compile(r'(\.db(-wal|-shm|-journal)?|^%s)$' % re.escape(INSTANCE_LOCK_NAME))
-        only_db = all(db_like.search(f) for f in cmp_['added'] + cmp_['removed'] +
-                      [c['file'] for c in cmp_['changed']]) and not cmp_['dirs_added']
+
+        def manager_written(rel):
+            return bool(db_like.search(rel)) or is_snapshot_scratch(rel) or is_manager_status(rel)
+        files = cmp_['added'] + cmp_['removed'] + [c['file'] for c in cmp_['changed']]
+        only_db = all(manager_written(f) for f in files) and \
+            all(is_snapshot_scratch(d) for d in cmp_['dirs_added'])
+        snapshot_ran = any(is_snapshot_scratch(p) or is_manager_status(p) for p in files + cmp_['dirs_added'])
         if only_db and self.live_manager:
             self.check('source', 'WARN', 'database files in the data_dir changed during the run while the live '
-                       'Manager is running (it keeps storing collector data); this tool only opens them '
-                       'read-only. Stop the Manager task for a strict byte-identical check.', changes=cmp_)
+                       'Manager is running (it keeps storing collector data%s); this tool only opens them '
+                       'read-only. Stop the Manager task for a strict byte-identical check.'
+                       % (', and its snapshot ran' if snapshot_ran else ''), changes=cmp_)
         else:
             self.check('source', 'FAIL', 'the data_dir changed during the run: %s' % short(cmp_, 400), changes=cmp_)
 
@@ -4361,7 +4410,7 @@ def parse_args(argv=None):
     g.add_argument('--old-code', help='an extracted OLD checkout instead of git archive')
     ap.add_argument('--old-version', choices=('auto',) + tuple(OLD_VERSIONS), default='auto',
                     help='what the OLD code is: "old" (f086e7e or older) or "current" (the review-fix release, '
-                         'fb6498c); default: detected from the old code. Each has its own expectations '
+                         '160da09 or fb6498c); default: detected from the old code. Each has its own expectations '
                          '(tools/README.md)')
     ap.add_argument('--new-code', help='NEW checkout to test (default: the checkout this tool is in)')
     ap.add_argument('--repo', help='git repository for --old-ref (default: the checkout this tool is in)')

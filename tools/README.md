@@ -466,7 +466,9 @@ device registry and snapshots) is still readable, unchanged, through the new Man
 Dashboard. It runs the OLD Manager and the NEW Manager side by side on two copies of your real
 `data_dir` and compares them. **The live `data_dir` is only read, never written.**
 
-**Where to run it:** on the server that holds the databases (e.g. `E:\Users\lab-monitor\data`),
+**Where to run it:** on the server that holds the databases (the Manager's `data_dir`: e.g.
+`E:\Users\lab-monitor\manager-data`, or before docs/UPGRADE.md Step 3b moved it, often
+`E:\Users\lab-monitor\data` or a share),
 with the same Python environment as the Manager and git installed. Run it from a **separate
 checkout of the new code**, so the running Manager keeps its code:
 
@@ -487,8 +489,8 @@ in (`--new-code DIR` to test another one). Both are copied into the work directo
 and logs never touch the installed copies.
 
 The OLD code is always **the code the live Manager runs**: `f086e7e` for the review-fix upgrade,
-and the review-fix release (`fb6498c`, or the merge of it that is deployed) for the usage-metrics
-upgrade. The tool tells which from the old code itself (`OLD side:` line, report
+and the review-fix release (`160da09`, or the merge of it that is deployed; `fb6498c` writes the
+same databases) for the usage-metrics upgrade. The tool tells which from the old code itself (`OLD side:` line, report
 `code.old.version`; `--old-version` overrides it) and applies that side's expectations: see
 [With the review-fix release as the old side](#with-the-review-fix-release-as-the-old-side-the-usage-metrics-upgrade).
 It refuses to run (exit 2) when the `data_dir` is not in the layout that old code writes, e.g.
@@ -526,13 +528,21 @@ It refuses to run (exit 2) when the `data_dir` is not in the layout that old cod
 - While the live Manager keeps running, its database files change during the run; that is
   reported as `WARN source` (the tool only reads them). For a strict byte-identical check, stop
   the "Lab Monitor Manager" task while it runs; collectors keep queueing in the meantime.
+- A review-fix (`160da09`) or later Manager also writes `<data_dir>\snapshot-status.json` and
+  `<data_dir>\.snapshot-staging\` when it takes a snapshot (at `snapshot.time`, 10 minutes after a
+  start if one was missed, or on `POST /api/snapshot`). Neither holds data, so neither is copied:
+  the staging folder can hold half-written copies (a snapshot killed mid-run leaves them, with a hot
+  journal) that SQLite could not even open read-only. Its files are fingerprinted by size and mtime
+  only. Changes to either count like the database files: `WARN source` while a live Manager answers
+  `/health` on the configured port, `FAIL` otherwise. For a strict PASS, run away from
+  `snapshot.time`, check that `GET /api/snapshot` shows `"running": false`, or stop the Manager.
 
 **What it checks** (each line of the summary is PASS / WARN / FAIL):
 
 | Check | Meaning |
 |-------|---------|
-| `source` | the live data_dir is unchanged |
-| `copies` | every database copied and passes `PRAGMA quick_check` (the running Manager's `manager.lock` is not copied or read: it is no data, and on Windows its locked byte can't be read) |
+| `source` | the live data_dir is unchanged (WARN if only what a live Manager writes changed while it answered `/health`: its database files, and from 160da09 on its `snapshot-status.json` and `.snapshot-staging\`) |
+| `copies` | every database copied and passes `PRAGMA quick_check` (the running Manager's `manager.lock` is not copied or read: it is no data, and on Windows its locked byte can't be read; neither are its `snapshot-status.json` and `.snapshot-staging\` folder) |
 | `config` | the NEW Manager accepts your config (FAIL if it would refuse it: the upgraded Manager would not start) |
 | `storage` | in copy B after migration and after the restart: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value; a wide `storage_breakdown` table (a usage-metrics collector reported to the old Manager) is kept as `storage_breakdown_legacy` with identical content. Once more after the `ingest` and `legacy-resend` checks (both Managers stopped): in every table ingest only appends to (every history table, the narrow folder tables, `user_metrics_history`, `dead_letter`), the first rows in insertion order, as many as there were, still hash exactly as the original rows did, and a `*_legacy` table got no rows. So a new message or a re-send that rewrites a stored row FAILs |
 | `endpoints` | every read endpoint the Dashboard and tools use, OLD vs NEW, for every system: `/api/devices`, `/api/systems`, `/api/metrics/all`, `/api/usage/all`, `/api/totals`, `/api/user_metrics/*`, `/api/data/*` (every row of every table over the full time range), `/api/usage/*`, `/api/history/*` for every field and the sampled folders (tail query, full range, and the Dashboard's own "All Available" query) |
@@ -591,7 +601,7 @@ REM git ls-remote origin feature/usage-metrics must print a line; if it prints n
 git worktree add ..\lab-monitor-usage origin/feature/usage-metrics
 cd ..\lab-monitor-usage
 git -C ..\lab-monitor rev-parse HEAD
-REM -> the commit the server runs (fb6498c, or the merge of it that is deployed)
+REM -> the commit the server runs (160da09, or the merge of it that is deployed)
 python tools\verify_upgrade.py --manager-config ..\lab-monitor\manager\config.json --old-ref <that commit> ^
        --work-dir F:\verify-usage --with-dashboard --report F:\verify-usage\report.json
 ```
@@ -631,13 +641,16 @@ old side).
 it migrated to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` first; this restores those copies so the
 OLD code serves exactly the data it had. Standard library only; nothing is deleted.
 
-**Not for going back from the usage-metrics release to the review-fix release (`fb6498c`).** That needs
+**Not for going back from the usage-metrics release to the review-fix release (`160da09`, or `fb6498c`).** That needs
 no rollback: start the review-fix code on the same `data_dir` ([docs/UPGRADE.md](../docs/UPGRADE.md#going-back-from-the-usage-metrics-release-to-current)).
 This tool restores the layout the OLD (`f086e7e`) code reads; after OLD → review-fix → usage-metrics that
 means the copies taken before the review-fix upgrade, and everything stored since would be moved aside to
 `*.post-upgrade-*` files. When it finds that case (the usage-metrics release has run on the `data_dir` and a
 database has a newer backup in the review-fix layout than the one it would restore), the plan says so and
-`--apply` is refused (exit 2, nothing changed) unless `--past-review-fix` is given.
+`--apply` is refused (exit 2, nothing changed) unless `--past-review-fix` is given. That check also sees
+tables a killed Manager (Task Scheduler's End, `Stop-Process -Force`) left only in a `-wal` file: it copies
+such a database and its `-wal` to the TEMP folder and reads the copy there, so nothing is written next to the
+live files (if that copy can't be read, it assumes the usage-metrics release ran and refuses).
 
 ```bat
 REM 1. stop the Manager (and Dashboard): Task Scheduler -> End "Lab Monitor Manager", "Lab Monitor Dashboard"

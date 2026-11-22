@@ -2,7 +2,7 @@
 Spec section 18 with real processes: the collector, Manager and Dashboard of
 different releases talking HTTP on 127.0.0.1, as during a staged rollout.
 
-  NEW collector -> OLD (f086e7e) and CURRENT (fb6498c) Manager: every run's
+  NEW collector -> OLD (f086e7e) and CURRENT (160da09) Manager: every run's
       batch is acknowledged (the OLD Manager sends no per-message results,
       only stored == len(batch)), the queue drains and every archived message
       is stored exactly once.

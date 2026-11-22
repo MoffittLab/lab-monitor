@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Build a realistic CURRENT-format Manager data_dir: what the review-fix
-release (fb6498c) leaves on a server after it upgraded an OLD installation
+release (160da09, or fb6498c) leaves on a server after it upgraded an OLD installation
 and ran for a while.  It is the data_dir the next upgrade (CURRENT -> the
 usage-metrics release) starts from.
 
@@ -37,7 +37,12 @@ the original is not changed) and lets the CURRENT code itself do the rest:
   4. --real-collector TREE (Linux): the CURRENT manager.py as a real process
      on 127.0.0.1 (it takes data_dir/manager.lock, as on the server) and the
      CURRENT collector.py run twice in metrics mode and once in disk mode on
-     this host for one more device, "cur-linux", scanning TREE.
+     this host for one more device, "cur-linux", scanning TREE;
+  5. when the CURRENT code has nightly snapshots (manager/snapshot.py, 160da09
+     and later): one snapshot run by its own code to <out>-snapshots, which
+     leaves snapshot-status.json and an empty .snapshot-staging/ in the
+     data_dir, then what a snapshot killed while it staged atlantis/data.db
+     leaves (.snapshot-staging/<stamp>/atlantis/data.db with a hot -journal).
 
 Usage:
     python make_current_fixture.py --current-code CURRENT_CHECKOUT --old-data OLD_DATA_DIR
@@ -192,6 +197,24 @@ def real_collector_phase(cur, out, state, tree, summary):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(30)
+
+
+def snapshot_phase(cur, out, summary):
+    """Step 5 of the module docstring (nothing for a CURRENT without snapshots, such as fb6498c)."""
+    if not (cur / 'manager' / 'snapshot.py').is_file():
+        return
+    from compat_helpers import leave_killed_staging
+    snap = _load_module('current_snapshot', cur / 'manager' / 'snapshot.py')
+    dest = Path(str(out) + '-snapshots')
+    settings = snap.settings_from_config({'data_dir': str(out),
+                                          'snapshot': {'enabled': True, 'dest_dir': str(dest)}})
+    res = snap.SnapshotRunner(str(out), settings, logging.getLogger('current-snapshot')).run('fixture')
+    if res.get('status') != 'ok':
+        raise SystemExit('fixture: the CURRENT snapshot failed: %s' % res)
+    staged = out / snap.STAGING_DIR / '20261122T033000Z' / 'atlantis' / 'data.db'
+    leave_killed_staging(out / 'atlantis' / 'data.db', staged)
+    summary['snapshot'] = {'path': res['path'], 'files': res['files'],
+                           'killed_staging': staged.relative_to(out).as_posix()}
 
 
 def main(argv=None):
@@ -459,6 +482,7 @@ def main(argv=None):
     }
     if args.real_collector:
         real_collector_phase(cur, out, state, Path(args.real_collector).resolve(), summary)
+    snapshot_phase(cur, out, summary)
     if args.summary:
         Path(args.summary).write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(json.dumps(summary))

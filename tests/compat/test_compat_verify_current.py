@@ -1,6 +1,7 @@
 """
 Upgrade compatibility: tools/verify_upgrade.py for the next real upgrade,
-CURRENT (the review-fix release, fb6498c) -> NEW (this checkout).
+CURRENT (the review-fix release, 160da09) -> NEW (this checkout).
+fb6498c, which writes the same databases, is covered too (SAME_FORMAT_REFS).
 
 The fixture is the data_dir a server has after the CURRENT release upgraded
 its OLD data and ran for a while (make_current_fixture.py: the CURRENT
@@ -21,12 +22,15 @@ backup counts as a change, and an old side that does not match the
 data_dir's layout is refused.
 OLD -> NEW stays covered by test_compat_verify_upgrade.py.
 """
+import io
 import json
 import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
+import tarfile
 import types
 from pathlib import Path
 
@@ -36,7 +40,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from compat_helpers import REPO, build_current_fixture, run_verify, snapshot  # noqa: E402
+from compat_helpers import (CURRENT_REF, REPO, SAME_FORMAT_REFS, build_current_fixture,  # noqa: E402
+                            leave_killed_staging, run_verify, snapshot)
 
 QUICK = ['--window-cells', '5000', '--max-folders', '30']
 EXPECTED_CHECKS = ('copies', 'storage', 'devices', 'totals', 'endpoints', 'dashboard', 'restart', 'ingest',
@@ -115,6 +120,19 @@ def test_current_fixture_is_what_the_review_fix_release_leaves(current_data_dir)
         assert (d / 'manager.lock').is_file() and (d / 'cur_linux' / 'data.db').is_file()
 
 
+def test_current_fixture_has_what_the_snapshots_leave(current_data_dir, current_code):
+    """160da09's nightly snapshot ran on it, and another one was killed while it staged a database."""
+    if not (current_code / 'manager' / 'snapshot.py').is_file():
+        pytest.skip('this CURRENT has no snapshots')
+    d = current_data_dir
+    status = json.loads((d / 'snapshot-status.json').read_text(encoding='utf-8'))
+    assert status['last_success'] and Path(status['last_snapshot']).is_dir()
+    staged = d / '.snapshot-staging' / '20261122T033000Z' / 'atlantis' / 'data.db'
+    assert staged.is_file() and Path(str(staged) + '-journal').stat().st_size > 0
+    with open(staged, 'rb') as f:
+        assert f.read(16) == b'SQLite format 3\x00'
+
+
 # --------------------------------------------------------------------------- #
 # CURRENT -> NEW end to end                                                   #
 # --------------------------------------------------------------------------- #
@@ -128,6 +146,13 @@ def test_verify_current_to_new_passes(verified_current):
     for cid in EXPECTED_CHECKS:
         assert report['checks'][cid]['status'] in ('PASS', 'WARN'), (cid, report['checks'][cid])
     assert verified_current['before'] == verified_current['after']
+    # the live Manager's snapshot scratch space and status are neither copied nor data
+    copies = {c['file']: c for c in report['copies']}
+    if (verified_current['before'].get('snapshot-status.json')):
+        assert copies['.snapshot-staging'] == {'file': '.snapshot-staging', 'kind': 'scratch',
+                                               'method': 'not copied'}
+        assert copies['snapshot-status.json']['kind'] == 'status'
+        assert not [f for f in copies if f.startswith('.snapshot-staging/')]
 
 
 def test_verify_current_compares_every_current_endpoint(verified_current):
@@ -647,3 +672,147 @@ def test_n22_accepts_only_storage_breakdown_runs_that_are_no_longer_shown():
     assert v._not_shown_breakdown(rec(tail, 'tail', 'storage_breakdown'), resp({'data': []}))
     assert not v._not_shown_breakdown(rec(tail, 'tail', 'storage_breakdown'),
                                       resp({'data': [{'timestamp': '2026-08-01T00:00:00Z', 'value': 1}]}))
+
+
+# --------------------------------------------------------------------------- #
+# The review-fix release as deployed (160da09) and fb6498c write one format   #
+# --------------------------------------------------------------------------- #
+
+# What may differ between the review-fix commits without changing what is stored
+_NOT_STORAGE = ('manager/manager.py', 'manager/snapshot.py', 'manager/README.md',
+                'manager/config.example.json', 'manager/config.windows.json')
+
+
+@pytest.mark.parametrize('ref', SAME_FORMAT_REFS)
+def test_the_review_fix_commits_store_data_the_same_way(ref):
+    """
+    CURRENT_REF (160da09) is fb6498c plus nightly snapshots and the manager-data layout.
+    Every collector, Dashboard and storage module is identical, so the CURRENT fixtures
+    (written by 160da09) are fb6498c-format data; manager.py differs only outside storage
+    (checked by the end-to-end run below with fb6498c as the old side).
+    """
+    paths = ['collector', 'dashboard', 'manager'] + [':(exclude)%s' % p for p in _NOT_STORAGE]
+    r = subprocess.run(['git', '-C', str(REPO), 'diff', '--stat', ref, CURRENT_REF, '--'] + paths,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        pytest.skip('git diff %s %s: %s' % (ref, CURRENT_REF, r.stderr.decode('utf-8', 'replace')[:300]))
+    assert r.stdout.decode('utf-8') == '', 'storage code differs between %s and %s:\n%s' % (
+        ref, CURRENT_REF, r.stdout.decode('utf-8'))
+
+
+def _extract(ref, dest):
+    try:
+        tar = subprocess.run(['git', '-C', str(REPO), 'archive', '--format=tar', ref, 'collector', 'manager',
+                              'dashboard'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        pytest.skip('cannot extract %s with git archive: %s' % (ref, e))
+    kw = {'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}
+    with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
+        for m in tf.getmembers():
+            if m.isfile() or m.isdir():
+                tf.extract(m, str(dest), **kw)
+    return dest
+
+
+@pytest.mark.parametrize('ref', SAME_FORMAT_REFS)
+def test_verify_passes_on_data_written_by_an_earlier_review_fix_commit(ref, old_data_for_current, compat_dir):
+    """A data_dir written by fb6498c itself, verified with fb6498c as the old side (and the way back)."""
+    import verify_upgrade as vu
+    code = _extract(ref, compat_dir / ('code-' + ref))
+    assert vu.detect_old_version(code) == 'current'
+    data = compat_dir / ('fixture-' + ref) / 'data'
+    summary = build_current_fixture(code, old_data_for_current, data, '--days', '1')
+    assert 'snapshot' not in summary and not (data / 'snapshot-status.json').exists()
+    work = compat_dir / ('work-' + ref)
+    work.mkdir()
+    report = compat_dir / ('verify-report-%s.json' % ref)
+    before = snapshot(data)
+    rc, rep, text = run_verify('--data-dir', data, '--old-code', code, '--work-dir', work, '--report', report,
+                               *QUICK)
+    assert snapshot(data) == before
+    assert rep is not None, text[-4000:]
+    assert rc == 0 and rep['result'] == 'PASS', _summary(text)
+    assert rep['code']['old']['version']['name'] == 'current'
+    assert rep['checks']['rollback']['status'] == 'PASS'
+
+
+# --------------------------------------------------------------------------- #
+# The live Manager's snapshots (160da09 and later) during a verify run        #
+# --------------------------------------------------------------------------- #
+
+def _snapshot_layout(root):
+    """A data_dir as a 160da09 Manager with snapshots leaves it: status file, staging leftovers."""
+    src = root / 'data'
+    (src / 'atlantis').mkdir(parents=True)
+    for db in (src / 'metrics.db', src / 'atlantis' / 'data.db'):
+        conn = sqlite3.connect(str(db))
+        conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+        conn.executemany('INSERT INTO t (v) VALUES (?)', [('x' * 300,) for _ in range(3000)])
+        conn.commit()
+        conn.close()
+    (src / 'snapshot-status.json').write_text('{"last_success": "2026-11-22T03:30:41Z"}', encoding='utf-8')
+    staged = src / '.snapshot-staging' / '20261122T033000Z' / 'atlantis' / 'data.db'
+    leave_killed_staging(src / 'atlantis' / 'data.db', staged)
+    return src, staged
+
+
+def test_a_killed_snapshots_staging_files_are_never_copied(tmp_path):
+    """
+    A Manager killed while it staged a database leaves the half-written copy with a hot
+    journal; a read-only connection can't roll that back ("attempt to write a readonly
+    database"), so copying it made the whole run fail.  It is the Manager's scratch
+    space, not data: never copied, never hashed (it can be as large as the databases).
+    """
+    import verify_upgrade as vu
+    src, staged = _snapshot_layout(tmp_path)
+    (tmp_path / 'staging').mkdir()
+    copied = vu.copy_data_dir(str(src), str(tmp_path / 'copy'), str(tmp_path / 'staging'))
+    assert {'file': '.snapshot-staging', 'kind': 'scratch', 'method': 'not copied'} in copied
+    assert {'file': 'snapshot-status.json', 'kind': 'status', 'method': 'not copied'} in copied
+    assert sorted(os.listdir(str(tmp_path / 'copy'))) == ['atlantis', 'metrics.db']
+    assert vu.quick_check(str(tmp_path / 'copy' / 'atlantis' / 'data.db')) == 'ok'
+    # the leftover is untouched (its hot journal is still there), and only its size and mtime are recorded
+    assert Path(str(staged) + '-journal').stat().st_size > 0
+    fp = vu.fingerprint(str(src))
+    rel = staged.relative_to(src).as_posix()
+    assert fp['files'][rel]['sha256'] is None and fp['files'][rel + '-journal']['sha256'] is None
+    assert fp['files']['snapshot-status.json']['sha256']
+    # ... and not counted in the space the copies need
+    v = vu.Verifier(types.SimpleNamespace(ignore_space=True))
+    v.work = tmp_path
+    v.space_check(fp)
+    scratch = sum(f['size'] for k, f in fp['files'].items() if k.startswith('.snapshot-staging/'))
+    assert scratch > 0
+    assert v.report['space']['source_bytes'] == sum(f['size'] for f in fp['files'].values()) - scratch
+
+
+@pytest.mark.parametrize('live', [True, False])
+def test_a_snapshot_the_live_manager_takes_during_the_run(tmp_path, live):
+    """
+    The live Manager's snapshot (03:30, a catch-up after a restart, POST /api/snapshot)
+    rewrites snapshot-status.json and creates and removes staging files.  That is the
+    Manager's own writing, like its databases: WARN while it answers /health, and still
+    FAIL when nothing should be running.  Anything else changed is always a FAIL.
+    """
+    import verify_upgrade as vu
+    src, staged = _snapshot_layout(tmp_path)
+    (src / 'Vault-2').mkdir()
+    (src / 'Vault-2' / 'usage.jsonl').write_text('{"legacy": 1}\n', encoding='utf-8')
+    before = vu.fingerprint(str(src))
+    shutil.rmtree(str(src / '.snapshot-staging' / '20261122T033000Z'))       # a new run clears it ...
+    (src / '.snapshot-staging' / '20261122T100000Z' / 'metrics.db').parent.mkdir(parents=True)
+    (src / '.snapshot-staging' / '20261122T100000Z' / 'metrics.db').write_bytes(b'x' * 100)  # ... stages
+    (src / 'snapshot-status.json').write_text('{"last_success": "2026-11-22T10:00:09Z"}', encoding='utf-8')
+    (src / 'snapshot-status.json.tmp').write_text('{}', encoding='utf-8')
+    v = vu.Verifier(types.SimpleNamespace())
+    v.fp_before, v.fp_after, v.live_manager = before, vu.fingerprint(str(src)), live
+    v.check_source_unchanged()
+    assert v.checks['source']['status'] == ('WARN' if live else 'FAIL'), v.checks['source']
+    if live:
+        assert 'its snapshot ran' in v.checks['source']['summary']
+    # a file the Manager does not write changed as well: FAIL either way
+    (src / 'Vault-2' / 'usage.jsonl').write_text('{"legacy": 2}\n', encoding='utf-8')
+    v = vu.Verifier(types.SimpleNamespace())
+    v.fp_before, v.fp_after, v.live_manager = before, vu.fingerprint(str(src)), live
+    v.check_source_unchanged()
+    assert v.checks['source']['status'] == 'FAIL'

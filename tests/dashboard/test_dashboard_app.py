@@ -3,7 +3,7 @@ Dashboard server tests: Manager outage / partial failure handling, /api/data
 cache, optional basic auth, folder_usage parsing, history proxy validation and
 max_points pass-through; the usage-metrics sections (sessions, storage health,
 storage owners, usage totals) against a NEW Manager and against CURRENT
-(fb6498c) and OLD (f086e7e) Managers that don't have them.  The Manager is
+(160da09) and OLD (f086e7e) Managers that don't have them.  The Manager is
 mocked by patching requests.Session.get, so no network is used.
 """
 import base64
@@ -1092,10 +1092,10 @@ def test_breakdown_proxy_passes_404_and_hides_errors(make_client):
 
 
 # ---------------------------------------------------------------------------
-# Unchanged against the CURRENT (fb6498c) and OLD (f086e7e) Managers
+# Unchanged against the CURRENT (160da09) and OLD (f086e7e) Managers
 # ---------------------------------------------------------------------------
 
-CURRENT_COMMIT = 'fb6498c'
+CURRENT_COMMIT = '160da09'
 
 
 def _load_current_dashboard(tmp_path):

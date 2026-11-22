@@ -3,7 +3,7 @@ B11, the R5 gate: what a NEW collector sends (spec Appendix A) against the
 Managers already deployed, and the NEW Manager on what they stored.
 
   - The OLD Manager (f086e7e: the old_code fixture) and the CURRENT one
-    (fb6498c: tests/manager/current_manager.py) store every message of a NEW
+    (160da09: tests/manager/current_manager.py) store every message of a NEW
     collector's batch: OLD answers stored == len(batch) (otherwise the
     collector would re-send the whole batch on every run), CURRENT "stored"
     for each message.  The shapes obey R1 / R5 (key names, key count, size).

@@ -13,7 +13,7 @@ Run it ON THE MANAGER SERVER with the Manager STOPPED (Task Scheduler: end
 
     python tools\rollback_upgrade.py --manager-config manager\config.json             (dry run: the plan)
     python tools\rollback_upgrade.py --manager-config manager\config.json --apply
-    python tools\rollback_upgrade.py --data-dir E:\Users\lab-monitor\data --apply
+    python tools\rollback_upgrade.py --data-dir E:\Users\lab-monitor\manager-data --apply
 
 For metrics.db and every <system>\data.db with a pre-upgrade backup:
   1. the backup is checked (PRAGMA quick_check); if any backup fails the
@@ -40,14 +40,19 @@ would not show the folder history in it.  If no backup has the old layout the
 newest is used, with a warning.  --use-oldest picks the oldest instead.
 
 Not for going back from the usage-metrics release to the review-fix release
-(fb6498c): that needs no restore, the review-fix code is started on the same
-data_dir (docs/UPGRADE.md, "Going back from the usage-metrics release to
-CURRENT").  After f086e7e -> review-fix -> usage-metrics, the backups with the
-old layout are the ones taken before the review-fix upgrade, so restoring them
-sets aside everything stored since then.  When the usage-metrics release has
-run on the data_dir (its _rollup_* tables) and a newer backup in the
-review-fix layout exists, the plan says so and --apply is refused unless
---past-review-fix is given.
+(160da09, or fb6498c): that needs no restore, the review-fix code is started
+on the same data_dir (docs/UPGRADE.md, "Going back from the usage-metrics
+release to CURRENT").  After f086e7e -> review-fix -> usage-metrics, the
+backups with the old layout are the ones taken before the review-fix upgrade,
+so restoring them sets aside everything stored since then.  When the
+usage-metrics release has run on the data_dir (its _rollup_* tables) and a
+newer backup in the review-fix layout exists, the plan says so and --apply is
+refused unless --past-review-fix is given.  A Manager that was killed (Task
+Scheduler's End, Stop-Process -Force) may hold those tables only in a -wal
+file: such a database and its -wal are copied to a private temporary folder
+(the system's TEMP) and read there, so nothing is written next to the live
+files.  If that copy can't be read, the tool assumes the usage-metrics release
+ran (refused without --past-review-fix).
 
 Databases WITHOUT a backup are left as they are and listed: databases the
 new Manager created after the upgrade (systems first seen since), or ones it
@@ -78,6 +83,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -166,26 +172,66 @@ def has_old_layout(path, central):
         return None
 
 
+def _tables(uri):
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def _tables_with_wal(db):
+    """
+    The tables of `db` including what only its -wal holds (a Manager that
+    was killed, not stopped, checkpoints nothing), read from a private copy
+    of the database and its -wal in a temporary folder: immutable=1 ignores
+    the -wal, and a plain read-only open of the live file could write its
+    -shm.  Raises OSError / sqlite3.Error.
+    """
+    tmp = tempfile.mkdtemp(prefix='lab-monitor-rollback-check-')
+    try:
+        copy = os.path.join(tmp, 'check.db')
+        shutil.copyfile(db, copy)
+        shutil.copyfile(db + '-wal', copy + '-wal')
+        return _tables(Path(copy).as_uri())        # SQLite replays the -wal into this copy only
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _has_usage_metrics_tables(tables):
+    return any(t.startswith('_rollup_') for t in tables) or 'device_session_snapshot' in tables
+
+
 def usage_metrics_ran(data_dir):
     """
     True if the usage-metrics release (or a later one) has opened this
     data_dir: a <system>/data.db has its _rollup_* tables, or metrics.db its
-    device_session_snapshot table.  Unreadable databases count as no.
+    device_session_snapshot table, committed to the database file or only to
+    its -wal.  None if that can't be told: a database's -wal could not be
+    read (callers treat that as True).  A database that can't be read at all
+    counts as no.
     """
+    unknown = False
     for db in find_databases(data_dir):
         if not os.path.isfile(db):
             continue
         try:
-            conn = sqlite3.connect(_ro_uri(db), uri=True)
-            try:
-                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            finally:
-                conn.close()
+            if _has_usage_metrics_tables(_tables(_ro_uri(db))):
+                return True
         except (OSError, sqlite3.Error):
             continue
-        if any(t.startswith('_rollup_') for t in tables) or 'device_session_snapshot' in tables:
-            return True
-    return False
+        try:
+            has_wal = os.path.getsize(db + '-wal') > 0
+        except OSError:
+            has_wal = False
+        if not has_wal:
+            continue
+        try:
+            if _has_usage_metrics_tables(_tables_with_wal(db)):
+                return True
+        except (OSError, sqlite3.Error):
+            unknown = True
+    return None if unknown else False
 
 
 def choose_backup(db_path, backups, use_oldest=False):
@@ -313,7 +359,9 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say, past_review_fix=F
     if not todo:
         out('No pre-upgrade backups (*%s*.bak) found under %s: nothing to roll back.' % (BACKUP_INFIX, data_dir))
         return 2, items
-    twice = usage_metrics_ran(data_dir) and any(i['newer_new_layout'] for i in todo)
+    # usage_metrics_ran is only asked when it matters (it may copy a database to read its -wal)
+    ran = usage_metrics_ran(data_dir) if any(i['newer_new_layout'] for i in todo) else False
+    twice = ran is not False
     out('Databases to restore (%d):' % len(todo))
     for i in todo:
         others = len(i['backups']) - 1
@@ -337,6 +385,10 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say, past_review_fix=F
     if twice:
         n = sum(1 for i in todo if i['newer_new_layout'])
         out('')
+        if ran is None:
+            out('NOTE: a database has a -wal file (the Manager was killed, not stopped) that could not be read, '
+                'so it is not known whether the usage-metrics release ran; it is assumed it did. A copy of the '
+                'database is read in the TEMP folder: check its free space and run this again.')
         out('WARNING: the usage-metrics release has run on this data_dir, and %d database(s) have a newer backup '
             'than the one chosen, in the layout the review-fix release writes. After f086e7e -> review-fix -> '
             'usage-metrics, restoring goes back past the review-fix release to what the f086e7e Manager reads: '

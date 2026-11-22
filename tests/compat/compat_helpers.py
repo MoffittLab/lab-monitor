@@ -11,7 +11,12 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 TOOLS = REPO / 'tools'
 OLD_REF = 'f086e7e'
-CURRENT_REF = 'fb6498c'                                  # the release before this one
+# The release before this one: the review-fix release as it will be deployed
+# (fix/review-findings: fb6498c plus nightly snapshots and the manager-data
+# layout).  Its database code is fb6498c's, so what it writes is fb6498c-format
+# data (test_compat_verify_current.py checks both: SAME_FORMAT_REFS).
+CURRENT_REF = '160da09'
+SAME_FORMAT_REFS = ('fb6498c',)
 OLD_TOKEN = 'fixture-old-auth-token-0123456789abcdef'   # make_old_fixture.TOKEN
 
 
@@ -43,6 +48,35 @@ def build_current_fixture(current_code, old_data, out, *extra):
         env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
     assert r.returncode == 0, r.stderr.decode('utf-8', 'replace')[-4000:]
     return json.loads(r.stdout.decode('utf-8').strip().splitlines()[-1])
+
+
+# A process that dies (os._exit, like a kill) inside a write transaction of
+# `staged`, a complete copy of `src`: what a Manager killed while it staged a
+# database for its nightly snapshot leaves in <data_dir>/.snapshot-staging/
+# (a copy whose changed pages are in the file, with a hot rollback journal
+# that a read-only connection can't roll back).
+_KILLED_STAGING = r'''
+import os, sqlite3, sys
+from pathlib import Path
+src, dst = sys.argv[1], sys.argv[2]
+s = sqlite3.connect(Path(os.path.abspath(src)).as_uri() + '?mode=ro&immutable=1', uri=True)
+d = sqlite3.connect(dst, isolation_level=None)
+s.backup(d)
+d.execute('PRAGMA journal_mode=DELETE')
+d.execute('PRAGMA cache_size=5')
+d.execute('BEGIN')
+for (t,) in d.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+    d.execute('DELETE FROM "%s"' % t.replace('"', '""'))
+os._exit(0)
+'''
+
+
+def leave_killed_staging(src_db, staged):
+    """Leave a killed snapshot's staged copy of src_db (with its hot -journal) at `staged`."""
+    os.makedirs(os.path.dirname(str(staged)), exist_ok=True)
+    subprocess.run([sys.executable, '-c', _KILLED_STAGING, str(src_db), str(staged)], check=True, timeout=300)
+    if not os.path.getsize(str(staged) + '-journal'):
+        raise RuntimeError('no hot journal next to %s' % staged)
 
 
 def snapshot(root):

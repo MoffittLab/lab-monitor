@@ -9,6 +9,7 @@ import hashlib
 import http.server
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import threading
@@ -284,3 +285,94 @@ def test_going_back_from_usage_metrics_straight_to_f086e7e_needs_no_flag(tmp_pat
     assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 0
     assert _rows(atl) == ['atl-f086e7e']
     assert 'past the review-fix release' not in capsys.readouterr().out
+
+
+def _killed_after(path, sql):
+    """`path` in WAL mode with `sql` committed to its -wal only: a Manager killed before its next checkpoint."""
+    live = os.path.join(os.path.dirname(path), 'live-' + os.path.basename(path))
+    shutil.copyfile(path, live)
+    con = sqlite3.connect(live)
+    con.execute('PRAGMA journal_mode=WAL')
+    con.execute('PRAGMA wal_autocheckpoint=0')
+    con.execute(sql)
+    con.commit()
+    for suffix in ('', '-wal'):
+        shutil.copyfile(live + suffix, path + suffix)
+    con.close()
+    for suffix in ('', '-wal', '-shm'):
+        if os.path.exists(live + suffix):
+            os.remove(live + suffix)
+
+
+@pytest.fixture
+def twice_upgraded_then_killed(tmp_path):
+    """As twice_upgraded, but the usage-metrics Manager was killed right after its first start."""
+    d = tmp_path / 'data'
+    central = str(d / 'metrics.db')
+    _db(central + '.pre-upgrade-20261101T100000Z.bak', ['central-f086e7e'])
+    _review_fix_layout(central + '.pre-upgrade-20261201T100000Z.bak', ['central-review-fix'], central=True)
+    _review_fix_layout(central, ['central-usage-metrics'], central=True)
+    _killed_after(central, 'CREATE TABLE device_session_snapshot (name TEXT)')
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-review-fix'])
+    _review_fix_layout(atl, ['atl-usage-metrics'])
+    _killed_after(atl, 'CREATE TABLE _rollup_series (id INTEGER PRIMARY KEY)')
+    return d
+
+
+def test_the_guard_sees_tables_that_are_only_in_the_wal(twice_upgraded_then_killed, capsys):
+    """
+    Stop-ScheduledTask and Stop-Process -Force kill the Manager: its new tables can be in
+    the -wal only.  immutable=1 ignores the -wal, so the guard reads a private copy of
+    database + -wal; nothing is written next to the live files.
+    """
+    d = twice_upgraded_then_killed
+    for db, new_table in ((d / 'metrics.db', 'device_session_snapshot'), (d / 'atlantis' / 'data.db', '_rollup_series')):
+        con = sqlite3.connect('file:%s?mode=ro&immutable=1' % db, uri=True)
+        try:
+            # what immutable=1 sees: the new table is not there
+            assert new_table not in {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+        finally:
+            con.close()
+        assert os.path.getsize(str(db) + '-wal') > 0
+    before = _tree(d)
+    assert rb.usage_metrics_ran(str(d)) is True
+    assert rb.main(['--data-dir', str(d)]) == 0
+    out = capsys.readouterr().out
+    assert 'the review-fix layout, copied by the usage-metrics release' in out and 'do NOT run this tool' in out
+    assert 'a copy of a partly migrated database' not in out
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 2
+    assert 'Refused: nothing was changed' in capsys.readouterr().out
+    assert _tree(d) == before
+
+
+def test_a_wal_that_cannot_be_read_counts_as_the_usage_metrics_release(twice_upgraded_then_killed, capsys,
+                                                                       monkeypatch):
+    d = twice_upgraded_then_killed
+
+    def no_space(*a, **kw):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(rb, '_tables_with_wal', lambda db: no_space())
+    assert rb.usage_metrics_ran(str(d)) is None
+    before = _tree(d)
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 2
+    out = capsys.readouterr().out
+    assert 'could not be read' in out and 'Refused: nothing was changed' in out
+    assert _tree(d) == before
+    # restoring anyway still works, on request
+    assert rb.main(['--data-dir', str(d), '--apply', '--force', '--past-review-fix']) == 0
+    assert _rows(str(d / 'atlantis' / 'data.db')) == ['atl-f086e7e']
+
+
+def test_a_wal_without_the_new_tables_is_not_the_usage_metrics_release(tmp_path):
+    """A review-fix Manager killed with data in its -wal: read through the copy, no new tables, no refusal."""
+    d = tmp_path / 'data'
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-partly'])
+    _review_fix_layout(atl, ['atl-review-fix'])
+    _killed_after(atl, "INSERT INTO t VALUES ('only-in-wal')")
+    assert rb.usage_metrics_ran(str(d)) is False
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 0
+    assert _rows(atl) == ['atl-f086e7e']
