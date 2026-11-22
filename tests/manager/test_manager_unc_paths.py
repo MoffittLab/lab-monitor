@@ -23,6 +23,7 @@ from pathlib import PureWindowsPath
 import pytest
 
 import rollups
+import manager as mgr
 import snapshot
 import storage_util
 from manager_helpers import COLL_TRITON, make_msg, metrics_payload, post_queue
@@ -105,6 +106,14 @@ def test_sqlite_still_checks_each_copy_on_a_share(client, data_dir, scratch, unc
 def test_a_snapshot_run_with_data_dir_on_a_share(client, data_dir, scratch, unc):
     """Staging opens each live database by URI (mode=rw): a data_dir on a share must work too."""
     _seed(client)
+    if os.name == 'nt':
+        # Here the share is this machine's own \\localhost\<drive>$, and the test's
+        # Manager still has the same files open through the local path.  A WAL
+        # database open both ways at once never finishes closing on Windows (the
+        # process can't even be killed), a state no real Manager is in: with its
+        # data_dir on a share it opens every database through that share.  So the
+        # Manager lets go of them first, and only the snapshot opens them.
+        mgr._close_stores()
     res = snapshot.SnapshotRunner(unc(data_dir), _settings(os.path.join(scratch, 'snaps'))).run()
     assert res['status'] == 'ok', res
     assert not res['failed'] and res['files'] == 2

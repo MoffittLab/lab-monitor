@@ -687,9 +687,17 @@ if ($LASTEXITCODE -eq 0) {
     Show-CommandOutput $PipOut -Color Yellow
 }
 
-# Full path of the environment's python.exe, used by the launchers
-$PythonExe = (conda run -n $CondaEnv python -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
-if ($PythonExe) { $PythonExe = $PythonExe.Trim() }
+# Full path of the environment's python.exe, used by the launchers. They must not
+# rely on "conda activate" in a .bat: under Task Scheduler it can leave the base
+# Python first on PATH, which lacks this environment's packages (flask_cors).
+# conda run on Windows can end its output with an empty line: take the last line
+# that holds a path.
+$PythonExe = (conda run -n $CondaEnv python -c "import sys; print(sys.executable)" 2>$null |
+    ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[A-Za-z]:\\.*python(w)?\.exe$' } | Select-Object -Last 1)
+if (-not $PythonExe -and $env:CONDA_PREFIX -and (Split-Path $env:CONDA_PREFIX -Leaf) -eq $CondaEnv -and
+    (Test-Path (Join-Path $env:CONDA_PREFIX 'python.exe'))) {
+    $PythonExe = Join-Path $env:CONDA_PREFIX 'python.exe'     # the prompt the installer runs in
+}
 if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
     Write-Host "[WARNING] Could not resolve the environment's python.exe; launchers will use 'python.exe' from PATH" -ForegroundColor Yellow
     $PythonExe = "python.exe"
@@ -1117,10 +1125,10 @@ if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "po
     $DashPort = [string]$FinalDashboard.port
 }
 if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "auth") -and $FinalDashboard.auth) {
-    Write-Host "   Login: enabled (basic auth, user '$($FinalDashboard.auth.username)')"
+    Write-Host "   Sign-in: enabled (one password; each browser stays signed in after its first sign-in)"
 } else {
-    Write-Host "   Login: NOT enabled. The Dashboard listens on ${DashHost}:$DashPort, so anyone who can" -ForegroundColor Yellow
-    Write-Host "   reach that port sees host names, user names and folder paths. To require a login:" -ForegroundColor Yellow
+    Write-Host "   Sign-in: NOT enabled. The Dashboard listens on ${DashHost}:$DashPort, so anyone who can" -ForegroundColor Yellow
+    Write-Host "   reach that port sees host names, user names and folder paths. To require a password:" -ForegroundColor Yellow
     Write-Host "     conda activate $CondaEnv"
     Write-Host "     cd $RepoDir\dashboard"
     Write-Host "     python app.py --hash-password"

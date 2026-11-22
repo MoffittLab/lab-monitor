@@ -66,65 +66,57 @@ def run_remote(client, command: str, timeout: float) -> tuple:
 # Config management via config_tool.py
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, python_path: str, timeout: int) -> tuple:
-    """
-    Fetch full config via config_tool.py list --json.
-    Returns (config_dict, None) on success, (None, error_str) on failure.
-    """
+def config_tool_command(row: dict, args: str) -> str:
+    """The remote config_tool.py command for this system's collector config."""
+    if _ssh.is_linux_install(row):
+        return _ssh.linux_config_tool_command(args)
+    git_path = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path')
     # Normalize Windows paths
-    if is_windows_path(git_path):
+    if is_windows_path(git_path) or is_windows_path(python_path):
         git_path = git_path.replace('\\', '/')
-    if is_windows_path(python_path):
         python_path = python_path.replace('\\', '/')
-    
     config_tool_path = f"{git_path}/collector/config_tool.py"
     config_path = f"{git_path}/collector/local/config.json"
-    vprint(f"Fetching config from {config_path}")
-    command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" list --json'
+    return f'"{python_path}" "{config_tool_path}" --config "{config_path}" {args}'
+
+
+def _config_tool(client, row: dict, args: str, timeout) -> tuple:
+    """Run config_tool.py with --json output. Returns (result dict, None) or (None, error_str)."""
+    command = config_tool_command(row, args)
+    vprint(f"Running: {command}")
     try:
         stdout, stderr, exit_code = run_remote(client, command, timeout)
-        if exit_code != 0:
-            return None, f'exit {exit_code} | stderr: {stderr!r} | stdout: {stdout!r}'
-        try:
-            result = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None, f'JSON parse error | stdout: {stdout!r}'
-        if result.get('status') == 'ok':
-            return result.get('config', {}), None
-        return None, f'config_tool error: {result.get("error", "unknown")}'
     except Exception as e:
         return None, f'exception: {e}'
+    if exit_code != 0:
+        return None, f'exit {exit_code} | stderr: {stderr!r} | stdout: {stdout!r}' + _ssh.sudo_hint(stderr)
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None, f'JSON parse error | stdout: {stdout!r}'
+    if result.get('status') == 'ok':
+        return result, None
+    return None, f'config_tool error: {result.get("error", "unknown")}'
 
 
-def set_active(client, git_path: str, python_path: str, value: bool, timeout: int) -> tuple:
+def get_config(client, row: dict, timeout: int) -> tuple:
+    """
+    Fetch the full config (secrets masked) via config_tool.py list --json.
+    Returns (config_dict, None) on success, (None, error_str) on failure.
+    """
+    result, err = _config_tool(client, row, 'list --json', timeout)
+    return (result.get('config', {}), None) if result else (None, err)
+
+
+def set_active(client, row: dict, value: bool, timeout: int) -> tuple:
     """
     Set active field via config_tool.py set.
     Returns (True, None) on success, (False, error_str) on failure.
     """
-    # Normalize Windows paths
-    if is_windows_path(git_path):
-        git_path = git_path.replace('\\', '/')
-    if is_windows_path(python_path):
-        python_path = python_path.replace('\\', '/')
-    
-    config_tool_path = f"{git_path}/collector/config_tool.py"
-    config_path = f"{git_path}/collector/local/config.json"
-    vprint(f"Setting active={value} on {config_path}")
     value_str = 'true' if value else 'false'
-    command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" set active {value_str} --json'
-    try:
-        stdout, stderr, exit_code = run_remote(client, command, timeout)
-        if exit_code != 0:
-            return False, f'exit {exit_code} | stderr: {stderr!r} | stdout: {stdout!r}'
-        try:
-            result = json.loads(stdout)
-        except json.JSONDecodeError:
-            return False, f'JSON parse error | stdout: {stdout!r}'
-        if result.get('status') == 'ok':
-            return True, None
-        return False, f'config_tool error: {result.get("error", "unknown")}'
-    except Exception as e:
-        return False, f'exception: {e}'
+    result, err = _config_tool(client, row, f'set active {value_str} --json', timeout)
+    return (True, None) if result else (False, err)
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +132,6 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int,
     timeout bounds the SSH connect; command_timeout each config_tool.py call.
     """
     ip          = _ssh.row_value(row, 'ip')
-    git_path    = _ssh.row_value(row, 'git_path')
-    python_path = _ssh.row_value(row, 'python_path')
 
     result = {
         'ip': ip,
@@ -166,7 +156,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int,
         client = _ssh.connect_row(row, timeout=timeout, log=vprint)
         try:
             # Get before-state
-            config_before, err = get_config(client, git_path, python_path, command_timeout)
+            config_before, err = get_config(client, row, command_timeout)
             if config_before is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config before change: {err}'
@@ -176,7 +166,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int,
             result['config_before'] = config_before
 
             # Set active field
-            ok, err = set_active(client, git_path, python_path, target_value, command_timeout)
+            ok, err = set_active(client, row, target_value, command_timeout)
             if not ok:
                 result['status'] = 'failed'
                 result['error'] = f'Could not set active field: {err}'
@@ -184,7 +174,7 @@ def toggle_system(row: dict, mode: str, dry_run: bool, timeout: int,
                 return result
 
             # Get after-state
-            config_after, err = get_config(client, git_path, python_path, command_timeout)
+            config_after, err = get_config(client, row, command_timeout)
             if config_after is None:
                 result['status'] = 'failed'
                 result['error'] = f'Could not fetch config after change: {err}'

@@ -594,6 +594,10 @@ then the rest.
 [tools/README.md](../tools/README.md)):
 
 ```bash
+# One collector first (--only: its ip column, or the first part of its host name)
+python3 tools/update_collectors.py --csv tools/collectors.csv --only <first> --dry-run
+python3 tools/update_collectors.py --csv tools/collectors.csv --only <first> --upgrade-pip
+# A few runs later, the rest (the first one's git pull then finds nothing new)
 python3 tools/update_collectors.py --csv tools/collectors.csv --dry-run
 python3 tools/update_collectors.py --csv tools/collectors.csv --upgrade-pip
 python3 tools/run_collectors.py --csv tools/collectors.csv --mode metrics
@@ -667,8 +671,9 @@ back: the old Manager knows only that key.
 won't roll back. `DELETE /api/system/<name>` does not remove them. `folder_usage_legacy` can also be
 dropped by hand then, but costs only disk space.
 
-**Optional:** turn on the Dashboard login (`python app.py --hash-password` in `dashboard\`, paste
-the printed `auth` block into `dashboard\config.json`, restart the Dashboard); set
+**Optional:** turn on the Dashboard sign-in (`python app.py --hash-password` in `dashboard\`, paste
+the printed `auth` block into `dashboard\config.json`, restart the Dashboard; each browser then asks
+for the password once and stays signed in for 180 days); set
 `"cors_origins": []` (the Dashboard calls the Manager server-side and needs no CORS; old configs
 list two origins, which is harmless).
 

@@ -721,7 +721,7 @@ def test_killed_backfill_and_a_concurrent_process_never_double_count(data_dir):
         if cur and cur >= 3000:
             break
         time.sleep(0.02)
-    proc.send_signal(signal.SIGKILL)
+    proc.kill()          # SIGKILL on POSIX, TerminateProcess on Windows: no cleanup either way
     proc.wait(10)
     cur = _probe_cursor(path)
     assert cur is not None and 0 < cur < 30000, cur
@@ -1105,7 +1105,9 @@ def test_deleting_a_system_with_a_pending_backfill(make_client, data_dir, caplog
     finally:
         mgr._data_store.run_rollup_backfill = real
     assert not os.path.exists(path)
-    assert not [r for r in caplog.records if r.name == 'rollups']
+    # No rollup error (the startup's INFO "queued for the rollup backfill" line is
+    # captured too when an earlier test left logging at INFO)
+    assert not [r for r in caplog.records if r.name == 'rollups' and r.levelno >= logging.ERROR]
     assert client.get('/api/rollups/status', headers=auth(READ)).get_json() == {}
 
 

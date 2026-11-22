@@ -629,6 +629,7 @@ def metrics(hosts, collector):
     return runs
 
 
+@posix_only
 @pytest.mark.parametrize('run', [0, 1], ids=['first-run', 'second-run'])
 def test_system_metrics_have_the_same_keys_types_and_units(metrics, run):
     win = _by_type(metrics['windows'][run], 'system_metrics')
@@ -661,6 +662,7 @@ GPU0_USERS = [{'username': 'alice', 'vram_bytes': 10 * GiB, 'util_percent': 27.8
               {'username': 'bob', 'vram_bytes': 1 * GiB, 'util_percent': 9.2, 'processes': 1}]
 
 
+@posix_only
 def test_gpu_fields_are_identical_on_windows_and_linux(metrics):
     def gpu_fields(platform):
         data = _by_type(metrics[platform][1], 'system_metrics')[0]['data']
@@ -704,6 +706,7 @@ def test_gpu_fields_are_identical_on_windows_and_linux(metrics):
     }
 
 
+@posix_only
 def test_system_values_match_for_the_same_machine_state(metrics):
     def data(platform, run=1):
         return _by_type(metrics[platform][run], 'system_metrics')[0]['data']
@@ -741,6 +744,7 @@ USER_KEYS = {'data_type', 'username', 'cpu_percent', 'ram_bytes', 'ram_formatted
              'gpu_processes'}
 
 
+@posix_only
 def test_user_metrics_have_the_same_shape_and_values(metrics):
     for run in (0, 1):
         win = _by_type(metrics['windows'][run], 'user_metrics')
@@ -791,6 +795,7 @@ def test_user_metrics_have_the_same_shape_and_values(metrics):
             assert m['data']['interval_s'] is None and m['data']['ram_bytes'] > 0
 
 
+@posix_only
 def test_windows_wddm_differs_only_in_per_process_vram(hosts, collector):
     runs = _two_runs(hosts, collector, nvml=lambda: make_fake_pynvml(driver_model='wddm'))
 
@@ -810,6 +815,7 @@ def test_windows_wddm_differs_only_in_per_process_vram(hosts, collector):
     assert win_gpus[0]['util_split'] == 'process_samples'
 
 
+@posix_only
 def test_nvml_is_shut_down_after_every_run(hosts, collector):
     for platform in ('windows', 'linux'):
         nvml = make_fake_pynvml()
@@ -822,6 +828,7 @@ def test_nvml_is_shut_down_after_every_run(hosts, collector):
     (12, 'NVML library'),
     (18, 'reboot'),
 ])
+@posix_only
 def test_nvml_that_cannot_start_is_logged_the_same_on_both(hosts, collector, caplog, code, hint):
     for platform in ('windows', 'linux'):
         caplog.clear()
@@ -836,6 +843,7 @@ def test_nvml_that_cannot_start_is_logged_the_same_on_both(hosts, collector, cap
         assert f'(NVML error {code})' in warning and hint in warning, warning
 
 
+@posix_only
 def test_failing_nvml_queries_are_logged_but_not_supported_ones_are_not(hosts, collector, caplog):
     with caplog.at_level(logging.WARNING):
         hosts.run('linux', collector.collect_metrics)
@@ -843,6 +851,7 @@ def test_failing_nvml_queries_are_logged_but_not_supported_ones_are_not(hosts, c
     assert warnings == ['NVML errors (values sent as null): GPU 1 utilization: Unknown Error (NVML error 999).']
 
 
+@posix_only
 def test_without_nvidia_ml_py_there_are_no_gpu_fields_and_no_warning(hosts, collector, caplog):
     for platform in ('windows', 'linux'):
         with caplog.at_level(logging.WARNING):
@@ -958,6 +967,7 @@ def _second_run(metrics, platform, data_type):
     return found[0]['data']
 
 
+@posix_only
 def test_sessions_count_clients_the_same_way(metrics):
     win, lin = (_by_type(metrics[p][0], 'sessions')[0]['data'] for p in ('windows', 'linux'))
     counts = {k: v for k, v in lin.items() if k == 'clients_total' or k.endswith('_clients')}
@@ -986,6 +996,7 @@ def test_sessions_count_clients_the_same_way(metrics):
         assert second['_list_hash'] == first['_list_hash'] and second['clients_total'] == 3
 
 
+@posix_only
 def test_storage_health_has_the_same_message_keys(metrics):
     first = {p: _by_type(metrics[p][0], 'storage_health') for p in ('windows', 'linux')}
     assert all(len(found) == 1 for found in first.values())

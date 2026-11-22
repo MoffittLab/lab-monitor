@@ -399,10 +399,16 @@ def _sync(config: dict, name: str, system_id: str, logger: logging.Logger) -> bo
 
 
 def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
-                     logger: logging.Logger) -> bool:
-    """_record() the messages, then _sync() the queue (disk mode)."""
+                     logger: logging.Logger, sync: bool = True) -> bool:
+    """
+    _record() the messages, then _sync() the queue (disk mode). sync=False
+    (--no-sync) only records them: the next metrics run sends the queue.
+    """
     if not _record(config, name, entries, logger):
         return False
+    if not sync:
+        logger.info("Not sending now (--no-sync): the next metrics run sends the queue to the Manager")
+        return True
     return _sync(config, name, system_id, logger)
 
 
@@ -635,9 +641,11 @@ def _scan_policy(config: dict, nas_type: str):
                                  include_network=include_network)
 
 
-def collect_disk_usage(config: dict, logger: logging.Logger, dry_run: bool = False) -> bool:
+def collect_disk_usage(config: dict, logger: logging.Logger, dry_run: bool = False,
+                       sync: bool = True) -> bool:
     """
-    Collect disk usage (daily mode).
+    Collect disk usage (daily mode). sync=False only archives and queues the
+    result (the Linux disk unit, which has no network, runs it that way).
 
     Legacy scan_depth parameter in config is silently ignored; use scan_paths instead.
     dry_run: print the message instead of recording and sending it.
@@ -750,7 +758,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger, dry_run: bool = Fal
     if dry_run:
         _print_messages(entries)
         return True
-    sent = _record_and_sync(config, name, system_id, entries, logger)
+    sent = _record_and_sync(config, name, system_id, entries, logger, sync=sync)
     if breakdown is not None:
         _save_breakdown_state(breakdown.state_path, scan.get('folder_seconds') or {}, logger)
     return sent
@@ -2323,6 +2331,9 @@ def main():
                         help='Collection mode (health: a full storage-health check, sent now)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print the messages as JSON on stdout; archive, queue, send and save nothing')
+    parser.add_argument('--no-sync', action='store_true',
+                        help='disk mode: archive and queue the result without sending it; the next '
+                             'metrics run sends it (the Linux disk unit runs without network access)')
     
     args = parser.parse_args()
     
@@ -2344,7 +2355,7 @@ def main():
     logger.info(f"Starting collector ({args.mode} mode{', dry run' if args.dry_run else ''})")
     
     if args.mode == 'disk':
-        success = collect_disk_usage(config, logger, dry_run=args.dry_run)
+        success = collect_disk_usage(config, logger, dry_run=args.dry_run, sync=not args.no_sync)
     elif args.mode == 'health':
         success = collect_health(config, logger, dry_run=args.dry_run)
     else:

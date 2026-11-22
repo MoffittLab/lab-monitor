@@ -87,10 +87,12 @@ to roll back, because the previous Manager knows only that key.
 **Dashboard**
 - `manager_token` should be a **read** token, so a compromised Dashboard host can't send data or
   delete systems.
-- `auth`: optional HTTP basic auth for every page and API route (except `GET /health`). Create the
-  block with `python app.py --hash-password` (it prints `{"auth": {"username", "password_hash"}}`).
-  The Dashboard refuses to start with an incomplete `auth` block or a password that is not a hash,
-  and warns at startup when it listens on a non-loopback address without `auth`.
+- `auth`: optional sign-in for every page and API route (except `GET /health` and the static files):
+  one shared password, after which the browser stays signed in for `remember_days` (default 180,
+  counted from its last visit). Create the block with `python app.py --hash-password` (it prints
+  `{"auth": {"password_hash", "remember_days"}}`). The Dashboard refuses to start with an incomplete
+  `auth` block or a password that is not a hash, and warns at startup when it listens on a
+  non-loopback address without `auth`. See [dashboard/README.md](dashboard/README.md#security).
 - The browser never sees the Manager token or URL.
 - Everyone who can open the Dashboard sees the per-user data (user names, client IPs, per-user CPU, GPU
   and storage); `auth` is the access control. What is recorded and how to record less:

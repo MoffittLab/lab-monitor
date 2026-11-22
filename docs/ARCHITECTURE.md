@@ -28,7 +28,7 @@ Dashboard is a web page whose server reads that API.
                        │  REST API (read token)
               ┌────────▼────────┐
               │   Dashboard     │  Flask + waitress, port 5001
-              │ server + page   │  (optional basic auth)
+              │ server + page   │  (optional sign-in)
               └─────────────────┘
 ```
 
@@ -330,10 +330,11 @@ The Dashboard owns no data. All state lives in the Manager.
   legacy `auth_tokens` keep full rights with a deprecation warning. Constant-time comparison. The
   Manager refuses to start with placeholder or short tokens. See [CONFIG.md](../CONFIG.md).
 - **CORS is off** unless `cors_origins` is set; the Dashboard doesn't need it.
-- **Dashboard:** optional HTTP basic auth on every route except `/health`; all values are
+- **Dashboard:** optional sign-in (one password, then a signed cookie that keeps the browser
+  signed in) on every route except `/health` and the static files; all values are
   HTML-escaped; Plotly is pinned with a Subresource Integrity hash.
 - **Per-user data** (user names, client IPs, per-user CPU, GPU and storage) is shown to everyone who
-  can open the Dashboard; the optional basic auth is the access control. What is recorded and how
+  can open the Dashboard; the optional sign-in is the access control. What is recorded and how
   to turn it off: [PRIVACY.md](PRIVACY.md).
 - **Transport: plain HTTP.** Neither the Manager nor the Dashboard terminates TLS, so tokens and
   the Dashboard password travel unencrypted. This assumes a trusted lab network. Otherwise put a

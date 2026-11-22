@@ -1,6 +1,6 @@
 """
 Dashboard server tests: Manager outage / partial failure handling, /api/data
-cache, optional basic auth, folder_usage parsing, history proxy validation and
+cache, optional sign-in, folder_usage parsing, history proxy validation and
 max_points pass-through; the usage-metrics sections (sessions, storage health,
 storage owners, usage totals) against a NEW Manager and against CURRENT
 (e5cd699) and OLD (f086e7e) Managers that don't have them.  The Manager is
@@ -335,62 +335,311 @@ def test_cache_shared_across_threads(make_client):
 
 
 # ---------------------------------------------------------------------------
-# Basic auth
+# Sign-in: one password, then a cookie that keeps the browser signed in
 # ---------------------------------------------------------------------------
 
-def _basic(user, password):
-    return {'Authorization': 'Basic ' + base64.b64encode(f'{user}:{password}'.encode()).decode()}
+PASSWORD = 'correct horse'
+PASSWORD_HASH = generate_password_hash(PASSWORD)
+DAY = 86400
+
+
+@pytest.fixture
+def auth_cfg(tmp_path):
+    """An "auth" block whose key file lives in the test's own folder."""
+    return {'password_hash': PASSWORD_HASH, 'session_key_file': str(tmp_path / 'session_key')}
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Controls the wall clock (cookie ages) and the monotonic clock (lockouts)."""
+    class Clock:
+        now = 1_800_000_000.0
+        mono = 5000.0
+
+        def advance(self, seconds):
+            self.now += seconds
+            self.mono += seconds
+    c = Clock()
+    monkeypatch.setattr(dash, '_now', lambda: c.now)
+    monkeypatch.setattr(dash, '_monotonic', lambda: c.mono)
+    return c
+
+
+def _sign_in(client, password=PASSWORD, **kw):
+    return client.post('/login', data={'password': password, **kw.pop('data', {})}, **kw)
+
+
+def _session_cookies(resp):
+    return [h for h in resp.headers.getlist('Set-Cookie') if h.startswith(dash.SESSION_COOKIE + '=')]
 
 
 def test_no_auth_configured_is_open(make_client):
     client, _ = make_client()
     assert client.get('/').status_code == 200
     assert client.get('/api/data').status_code == 200
+    assert b'Sign out' not in client.get('/').data
+    assert client.get('/login').headers['Location'] == '/'      # nothing to sign in to
 
 
-def test_basic_auth_enforced_when_configured(make_client):
-    auth = {'username': 'labadmin', 'password_hash': generate_password_hash('correct horse')}
-    client, fake = make_client({'auth': auth})
+def test_not_signed_in_sees_only_the_sign_in_page(make_client, auth_cfg):
+    client, fake = make_client({'auth': auth_cfg})
 
     resp = client.get('/')
+    assert resp.status_code == 302 and resp.headers['Location'] == '/login'
+    resp = client.get('/anything/else?x=1&y=2')
+    assert resp.status_code == 302
+    assert resp.headers['Location'] == '/login?next=%2Fanything%2Felse%3Fx%3D1%26y%3D2'
+
+    # The page's script gets JSON it can act on, not a redirect to HTML
+    resp = client.get('/api/data')
     assert resp.status_code == 401
-    assert resp.headers['WWW-Authenticate'].startswith('Basic realm=')
-    assert client.get('/api/data').status_code == 401
-    assert client.get('/static/js/dashboard.js').status_code == 401
-    assert client.get('/', headers=_basic('labadmin', 'wrong')).status_code == 401
-    assert client.get('/', headers=_basic('someone', 'correct horse')).status_code == 401
-    assert client.get('/', headers={'Authorization': 'Bearer ' + TOKEN}).status_code == 401
+    assert resp.get_json() == {'success': False, 'error': 'Sign-in required', 'login': '/login'}
+    assert client.get('/api/history/Atlas/system_metrics/cpu_percent').status_code == 401
+
+    # No other credential is accepted
+    basic = 'Basic ' + base64.b64encode(f'labadmin:{PASSWORD}'.encode()).decode()
+    assert client.get('/', headers={'Authorization': basic}).status_code == 302
+    assert client.get('/api/data', headers={'Authorization': 'Bearer ' + TOKEN}).status_code == 401
     assert fake.count() == 0      # nothing reached the Manager
 
-    assert client.get('/', headers=_basic('labadmin', 'correct horse')).status_code == 200
-    # second request is served from the verified-credentials cache
-    assert client.get('/api/data', headers=_basic('labadmin', 'correct horse')).status_code == 200
+    # The sign-in page and what it needs are served; they hold no system data
+    page = client.get('/login')
+    assert page.status_code == 200 and page.headers['Cache-Control'] == 'no-store'
+    assert b'type="password"' in page.data and b'180 days' in page.data
+    assert client.get('/static/css/style.css').status_code == 200
 
 
-def test_health_is_open_even_with_auth(make_client):
-    auth = {'username': 'labadmin', 'password_hash': generate_password_hash('correct horse')}
-    client, fake = make_client({'auth': auth})
+def test_sign_in_sets_a_long_lived_cookie(make_client, auth_cfg, clock):
+    client, fake = make_client({'auth': auth_cfg})
+
+    resp = _sign_in(client, 'wrong password')
+    assert resp.status_code == 401 and b'Wrong password.' in resp.data
+    assert _session_cookies(resp) == [] and client.get('/').status_code == 302
+
+    resp = _sign_in(client, data={'next': '/?range=7d'})
+    assert resp.status_code == 302 and resp.headers['Location'] == '/?range=7d'
+    (cookie,) = _session_cookies(resp)
+    attrs = [a.strip() for a in cookie.split(';')[1:]]
+    assert f'Max-Age={180 * DAY}' in attrs and 'HttpOnly' in attrs and 'SameSite=Lax' in attrs
+    assert 'Path=/' in attrs and 'Secure' not in attrs          # plain http
+    assert PASSWORD not in cookie and PASSWORD_HASH not in cookie
+
+    page = client.get('/')
+    assert page.status_code == 200 and b'Sign out' in page.data
+    assert client.get('/api/data').status_code == 200 and fake.count('/api/devices') == 1
+    assert client.get('/login').headers['Location'] == '/'      # already signed in
+
+
+def test_cookie_is_marked_secure_behind_https(make_client, auth_cfg):
+    client, _ = make_client({'auth': dict(auth_cfg, cookie_secure=True)})
+    assert 'Secure' in [a.strip() for a in _session_cookies(_sign_in(client))[0].split(';')]
+    client, _ = make_client({'auth': auth_cfg})
+    resp = _sign_in(client, base_url='https://dashboard.test')
+    assert 'Secure' in [a.strip() for a in _session_cookies(resp)[0].split(';')]
+
+
+def test_browser_is_remembered_for_180_days_from_its_last_visit(make_client, auth_cfg, clock):
+    client, _ = make_client({'auth': auth_cfg})
+    _sign_in(client)
+
+    # Used again the same day: still signed in, no new cookie
+    clock.advance(3600)
+    resp = client.get('/')
+    assert resp.status_code == 200 and _session_cookies(resp) == []
+
+    # Back after 100 days: still signed in, and the 180 days start again
+    clock.advance(100 * DAY)
+    resp = client.get('/api/data')
+    assert resp.status_code == 200 and len(_session_cookies(resp)) == 1
+    clock.advance(170 * DAY)
+    assert client.get('/').status_code == 200
+
+    # Not used for more than 180 days: asked again
+    clock.advance(181 * DAY)
+    assert client.get('/').status_code == 302
+    assert client.get('/api/data').status_code == 401
+
+
+def test_remember_days_is_configurable(make_client, auth_cfg, clock):
+    client, _ = make_client({'auth': dict(auth_cfg, remember_days=7)})
+    resp = _sign_in(client)
+    assert f'Max-Age={7 * DAY}' in _session_cookies(resp)[0]
+    assert b'7 days' in dash.app.test_client().get('/login').data
+    clock.advance(8 * DAY)
+    assert client.get('/').status_code == 302
+
+
+def test_restart_keeps_browsers_signed_in_but_a_new_password_does_not(make_client, auth_cfg, tmp_path):
+    client, _ = make_client({'auth': auth_cfg})
+    _sign_in(client)
+    token = client.get_cookie(dash.SESSION_COOKIE).value
+    key_file = tmp_path / 'session_key'
+    assert len(key_file.read_bytes().strip()) >= 32
+
+    def status_after_restart(auth):
+        restarted, _ = make_client({'auth': auth})
+        restarted.set_cookie(dash.SESSION_COOKIE, token)
+        return restarted.get('/').status_code
+
+    assert status_after_restart(auth_cfg) == 200                                    # same key file, same password
+    assert status_after_restart(dict(auth_cfg, password_hash=generate_password_hash('new password'))) == 302
+    key_file.unlink()                                                              # "sign everyone out"
+    assert status_after_restart(auth_cfg) == 302
+
+
+def test_forged_and_damaged_cookies_are_refused(make_client, auth_cfg, clock):
+    client, _ = make_client({'auth': auth_cfg})
+    _sign_in(client)
+    token = client.get_cookie(dash.SESSION_COOKIE).value
+    version, issued, nonce, mac = token.split('.')
+
+    def status_with(value):
+        c = dash.app.test_client()
+        c.set_cookie(dash.SESSION_COOKIE, value)
+        return c.get('/').status_code
+
+    assert status_with(token) == 200
+    later = str(int(issued) + 1000 * DAY)
+    for bad in ('', 'x', token[:-2], f'{version}.{later}.{nonce}.{mac}',       # issue time changed
+                f'v2.{issued}.{nonce}.{mac}', f'{version}.{issued}.other.{mac}',
+                f'{version}.{issued}.{nonce}.', token + '.extra', 'é' * 20, 'a' * 300):
+        assert status_with(bad) == 302, bad
+    # A correctly signed cookie from the future (clock set back) is refused too
+    clock.advance(-3600)
+    assert status_with(token) == 302
+
+
+def test_wrong_passwords_lock_that_address_out_for_a_while(make_client, auth_cfg, clock):
+    client, _ = make_client({'auth': auth_cfg})
+    for _ in range(dash.LOGIN_MAX_FAILURES - 1):
+        assert _sign_in(client, 'guess').status_code == 401
+    resp = _sign_in(client, 'guess')
+    assert resp.status_code == 429 and b'Too many wrong passwords' in resp.data
+
+    # Locked: even the right password is refused, without being checked
+    checked = []
+    real = dash._check_password
+    dash._check_password = lambda p: checked.append(p) or real(p)
+    try:
+        assert _sign_in(client).status_code == 429 and checked == []
+        # Another address is not affected
+        other = _sign_in(client, environ_base={'REMOTE_ADDR': '10.9.8.7'})
+        assert other.status_code == 302 and checked == [PASSWORD]
+    finally:
+        dash._check_password = real
+
+    clock.advance(dash.LOGIN_LOCK_SECONDS + 1)
+    assert _sign_in(client).status_code == 302
+
+
+def test_a_correct_password_clears_the_failure_count(make_client, auth_cfg, clock):
+    client, _ = make_client({'auth': auth_cfg})
+    for _ in range(dash.LOGIN_MAX_FAILURES - 1):
+        _sign_in(client, 'guess')
+    assert _sign_in(client).status_code == 302
+    for _ in range(dash.LOGIN_MAX_FAILURES - 1):
+        assert _sign_in(client, 'guess').status_code == 401     # counting starts again
+    # Old failures are forgotten after the window
+    clock.advance(dash.LOGIN_WINDOW_SECONDS + 1)
+    assert _sign_in(client, 'guess').status_code == 401
+
+
+def test_overlong_password_is_refused_without_hashing(make_client, auth_cfg):
+    client, _ = make_client({'auth': auth_cfg})
+    assert _sign_in(client, 'x' * (dash.MAX_PASSWORD_LEN + 1)).status_code == 401
+    assert _sign_in(client, '').status_code == 401
+
+
+@pytest.mark.parametrize('target', ['//evil.example/', 'https://evil.example/', '/\\evil.example',
+                                    'evil', '/login', '/logout?x=1', '/a\nb', ''])
+def test_sign_in_never_redirects_off_site(make_client, auth_cfg, target):
+    client, _ = make_client({'auth': auth_cfg})
+    resp = _sign_in(client, data={'next': target})
+    assert resp.status_code == 302 and resp.headers['Location'] == '/'
+
+
+def test_cross_site_form_posts_are_refused(make_client, auth_cfg):
+    client, _ = make_client({'auth': auth_cfg})
+    resp = _sign_in(client, headers={'Origin': 'http://evil.example'})
+    assert resp.status_code == 400 and _session_cookies(resp) == []
+    assert _sign_in(client, headers={'Origin': 'null'}).status_code == 400
+    assert _sign_in(client, headers={'Origin': 'http://localhost'}).status_code == 302
+
+    resp = client.post('/logout', headers={'Origin': 'http://evil.example'})
+    assert resp.status_code == 400 and client.get('/').status_code == 200          # still signed in
+
+
+def test_sign_out(make_client, auth_cfg):
+    client, _ = make_client({'auth': auth_cfg})
+    _sign_in(client)
+    assert client.get('/logout').status_code == 405             # a link or image can't sign you out
+    resp = client.post('/logout')
+    assert resp.status_code == 302 and resp.headers['Location'] == '/login'
+    assert client.get('/').status_code == 302 and client.get('/api/data').status_code == 401
+
+
+def test_health_is_open_even_with_auth(make_client, auth_cfg):
+    client, fake = make_client({'auth': auth_cfg})
     resp = client.get('/health')
     assert resp.status_code == 200
     assert resp.get_json() == {'status': 'ok'}     # no system data
     assert fake.count() == 0                       # liveness only: no Manager call
     # The exemption is exact: nothing else is opened up
-    assert client.get('/health/x').status_code == 401
-    assert client.get('/healthz').status_code == 401
+    assert client.get('/health/x').status_code == 302
+    assert client.get('/healthz').status_code == 302
     assert client.get('/api/data').status_code == 401
 
     client, _ = make_client()
     assert client.get('/health').status_code == 200
 
 
+def test_unwritable_key_file_still_lets_people_sign_in(make_client, tmp_path, caplog):
+    auth = {'password_hash': PASSWORD_HASH, 'session_key_file': str(tmp_path / 'no-such-folder' / 'key')}
+    with caplog.at_level(logging.WARNING, logger='test-dashboard'):
+        client, _ = make_client({'auth': auth})
+    assert any('after every Dashboard restart' in r.getMessage() for r in caplog.records)
+    assert _sign_in(client).status_code == 302 and client.get('/').status_code == 200
+
+
+def test_responses_carry_basic_security_headers(make_client, auth_cfg):
+    client, _ = make_client({'auth': auth_cfg})
+    for path in ('/login', '/health'):
+        headers = client.get(path).headers
+        assert headers['X-Frame-Options'] == 'DENY' and headers['X-Content-Type-Options'] == 'nosniff'
+
+
 @pytest.mark.parametrize('auth', [
     {},
     {'username': 'labadmin'},
-    {'username': 'labadmin', 'password_hash': 'plaintext-password'},
+    {'password_hash': 'plaintext-password'},
+    {'password_hash': PASSWORD_HASH, 'remember_days': 0},
+    {'password_hash': PASSWORD_HASH, 'remember_days': 'forever'},
+    {'password_hash': PASSWORD_HASH, 'remember_days': True},
+    {'password_hash': PASSWORD_HASH, 'remember_days': 100000},
 ])
 def test_invalid_auth_config_refuses_to_start(auth):
     with pytest.raises(ValueError):
         dash.init_app({'manager_token': TOKEN, 'auth': auth}, logging.getLogger('test-dashboard'))
+
+
+def test_old_username_setting_is_ignored_with_a_warning(make_client, auth_cfg):
+    auth = dict(auth_cfg, username='labadmin')
+    warnings = dash.validate_config({'manager_token': TOKEN, 'host': '127.0.0.1', 'auth': auth})
+    assert len(warnings) == 1 and 'username is no longer used' in warnings[0]
+    client, _ = make_client({'auth': auth})
+    assert _sign_in(client).status_code == 302
+
+
+def test_hash_password_prints_an_auth_block_without_a_user_name(monkeypatch, capsys):
+    monkeypatch.setattr(dash.getpass, 'getpass', lambda prompt='': 'a long lab password')
+    assert dash.hash_password_cli() == 0
+    out = capsys.readouterr().out
+    block = json.loads(out[out.index('{'):out.rindex('}') + 1])
+    assert set(block['auth']) == {'password_hash', 'remember_days'} and block['auth']['remember_days'] == 180
+    assert dash.check_password_hash(block['auth']['password_hash'], 'a long lab password')
+    dash.validate_config({'manager_token': TOKEN, 'host': '127.0.0.1', 'auth': block['auth']})
+    monkeypatch.setattr(dash.getpass, 'getpass', lambda prompt='': 'short')
+    assert dash.hash_password_cli() == 1
 
 
 def test_config_warnings():
@@ -1153,3 +1402,55 @@ def test_older_manager_gives_the_same_data_as_the_current_dashboard(make_client,
     resp = client.get('/api/history/Atlas/system_metrics/cpu_percent?from=2026-11-01')
     assert resp.status_code == 200
     assert resp.get_json()['data'] == [{'timestamp': '2026-11-21T00:00:00Z', 'value': 1.0}]
+
+
+# ---------------------------------------------------------------------------
+# Static files: content types don't depend on the system (Windows registry)
+# ---------------------------------------------------------------------------
+
+def test_static_files_have_the_types_browsers_require_under_nosniff(make_client):
+    import mimetypes
+    # What a Windows registry often says; nosniff then makes browsers refuse the script
+    mimetypes.add_type('text/plain', '.js')
+    mimetypes.add_type('application/octet-stream', '.css')
+    dash.register_static_types()
+
+    client, _ = make_client()
+    static = REPO / 'dashboard' / 'static'
+    files = [p for p in static.rglob('*') if p.is_file()]
+    assert any(p.suffix == '.js' for p in files) and any(p.suffix == '.css' for p in files)
+    for path in files:
+        assert path.suffix.lower() in dash.STATIC_TYPES, f'add {path.suffix} to STATIC_TYPES'
+        resp = client.get('/static/' + path.relative_to(static).as_posix())
+        assert resp.status_code == 200
+        assert resp.headers['Content-Type'].split(';')[0] == dash.STATIC_TYPES[path.suffix.lower()], path.name
+        assert resp.headers['X-Content-Type-Options'] == 'nosniff'
+        resp.close()
+
+
+def test_page_loads_its_script_and_stylesheet_from_static(make_client):
+    client, _ = make_client()
+    page = client.get('/').get_data(as_text=True)
+    assert '/static/js/dashboard.js?v=' in page and '/static/css/style.css?v=' in page
+    assert client.get('/static/js/dashboard.js').headers['Content-Type'].startswith('text/javascript')
+
+
+def test_pages_use_versioned_static_urls_so_cached_copies_are_not_reused(make_client, monkeypatch):
+    import re
+    client, _ = make_client()
+    page = client.get('/').get_data(as_text=True)
+    urls = re.findall(r'(?:src|href)="(/static/[^"]+)"', page)
+    assert len(urls) == 2
+    for url in urls:
+        # A URL no browser has cached: a copy saved with a wrong Content-Type
+        # (kept through "304 Not Modified") is never used again
+        assert re.search(rf'\?v={dash.STATIC_HEADERS_VERSION}-[0-9a-f]+-[0-9a-f]+$', url), url
+        resp = client.get(url)
+        assert resp.status_code == 200
+        resp.close()
+
+    with dash.app.test_request_context():
+        before = dash.static_url('js/dashboard.js')
+        monkeypatch.setattr(dash, 'STATIC_HEADERS_VERSION', dash.STATIC_HEADERS_VERSION + 1)
+        assert dash.static_url('js/dashboard.js') != before
+        assert dash.static_url('no/such/file.js').endswith(f'?v={dash.STATIC_HEADERS_VERSION}')

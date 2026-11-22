@@ -14,6 +14,10 @@ import types
 
 import pytest
 
+posix_only = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='needs a POSIX host (os.getuid / os.sysconf / /proc / POSIX paths)')
+
+
 KEY_RE = re.compile(r'^_?[a-z][a-z0-9_]{0,62}$')
 SERVICE_RE = re.compile(r'^[a-z][a-z0-9]{0,15}$')
 STATUSES = {'ok', 'warning', 'critical', 'unknown'}
@@ -197,13 +201,14 @@ def disk_messages(collector, config, monkeypatch, tmp_path):
     deep.mkdir(parents=True)
     (deep / 'f').write_bytes(b'x' * 10)
     captured = []
-    monkeypatch.setattr(collector, '_record_and_sync', lambda c, n, i, entries, log: captured.extend(entries) or True)
+    monkeypatch.setattr(collector, '_record_and_sync', lambda c, n, i, entries, log, sync=True: captured.extend(entries) or True)
     config.update({'platform': 'linux', 'volumes': [], 'scan_paths': [str(tmp_path / 'vol') + '/*']})
     for _ in range(2):
         assert collector.collect_disk_usage(config, LOG) is True
     return captured
 
 
+@posix_only
 def test_disk_run_messages_meet_the_contract(disk_messages):
     assert [e['data']['data_type'] for e in disk_messages] == ['folder_usage', 'storage_breakdown'] * 2
     for entry in disk_messages:
@@ -248,6 +253,7 @@ APPENDIX_A = {
 }
 
 
+@posix_only
 def test_shapes_match_appendix_a(produced, disk_messages, collector):
     from lib import storage_health
     by_type = {}

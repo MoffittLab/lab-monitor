@@ -1,0 +1,18 @@
+# Development and test environment for lab-monitor (Manager, Dashboard, tools, collector).
+# Same Python minor version as the production Manager. Package versions come from the
+# pinned requirements files, so this environment matches what the installers deploy.
+#
+#   conda env create -f environment.yml
+#   conda run -n lab-monitor-dev --no-capture-output python -m pytest -p no:cacheprovider
+name: lab-monitor-dev
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
+      - -r collector/requirements.txt
+      - -r collector/requirements-gpu.txt
+      - pytest

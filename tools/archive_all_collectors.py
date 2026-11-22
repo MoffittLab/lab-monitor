@@ -118,11 +118,13 @@ def run_remote(client, command: str, timeout: float) -> tuple:
 # Config management
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, python_path: str, timeout: float) -> tuple:
+def get_config(client, git_path: str, python_path: str, timeout: float, command: str = None) -> tuple:
     """
-    Fetch collector config via config_tool.py.
+    Fetch collector config via config_tool.py (or the given command, for a Linux install).
     Returns (config_dict, None) on success, (None, error_str) on failure.
     """
+    if command:
+        return _config_from(run_remote(client, command, timeout))
     # Normalize Windows paths
     if is_windows_path(git_path) or is_windows_path(python_path):
         git_path = git_path.replace('\\', '/')
@@ -132,11 +134,15 @@ def get_config(client, git_path: str, python_path: str, timeout: float) -> tuple
     config_path = f"{git_path}/collector/local/config.json"
     vprint(f"Reading config from {config_path}")
     command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" list --json'
+    return _config_from(run_remote(client, command, timeout))
 
-    out, err, code = run_remote(client, command, timeout)
+
+def _config_from(response_parts: tuple) -> tuple:
+    """(config, None) or (None, error) from config_tool.py list --json's (stdout, stderr, exit code)."""
+    out, err, code = response_parts
 
     if code != 0:
-        return None, f"config_tool.py failed (exit {code}): {err or out}"
+        return None, f"config_tool.py failed (exit {code}): {err or out}" + _ssh.sudo_hint(err)
 
     try:
         response = json.loads(out)
@@ -344,10 +350,13 @@ def parse_queue_details(out: str) -> tuple:
 
 def archive_collector(client, git_path: str, config: dict, timeout: float,
                       include_queue: bool = False, dry_run: bool = False,
-                      python_path: str = '') -> dict:
+                      python_path: str = '', run_as: str = None) -> dict:
     """
     Move all YYYY-MM.jsonl files (and optionally queue.json) into a new
     backup folder on a remote collector.
+
+    run_as: run the (POSIX) move as this user via sudo -n, for a Linux
+    install whose data_dir belongs to the service user.
 
     Returns {'ok', 'message', 'backup_dir', 'moved', 'queue'}.
     """
@@ -370,6 +379,8 @@ def archive_collector(client, git_path: str, config: dict, timeout: float,
 
     backup_folder = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     command, backup_dir = build_archive_command(name, data_dir, backup_folder, include_queue, windows)
+    if run_as and not windows:
+        command = f'{_ssh.SUDO} -u {run_as} /bin/sh -c {shlex.quote(command)}'
     result['backup_dir'] = backup_dir
 
     what = 'Archives' + (' and queue.json' if include_queue else '')
@@ -382,7 +393,7 @@ def archive_collector(client, git_path: str, config: dict, timeout: float,
     vprint(f"Creating backup folder: {backup_dir}")
     out, err, code = run_remote(client, command, timeout)
     if code != 0:
-        result['message'] = f"Archive command failed (exit {code}): {err or out}"
+        result['message'] = f"Archive command failed (exit {code}): {err or out}" + _ssh.sudo_hint(err)
         return result
 
     moved, queue_state, error = parse_archive_output(out, include_queue)
@@ -420,14 +431,17 @@ def archive_host(row: dict, timeout: int, command_timeout: float,
     try:
         client = _ssh.connect_row(row, timeout=timeout, log=vprint)
         try:
-            config, err = get_config(client, git_path, python_path, command_timeout)
+            linux = _ssh.is_linux_install(row)
+            config, err = get_config(client, git_path, python_path, command_timeout,
+                                     command=_ssh.linux_config_tool_command('list --json') if linux else None)
             if err:
                 result['message'] = f"Config error: {err}"
                 return result
             result['name'] = config.get('name', '?')
             outcome = archive_collector(client, git_path, config, command_timeout,
                                         include_queue=include_queue, dry_run=dry_run,
-                                        python_path=python_path)
+                                        python_path=python_path,
+                                        run_as=_ssh.LINUX_SERVICE_USER if linux else None)
             result.update(ok=outcome['ok'], message=outcome['message'],
                           backup_dir=outcome['backup_dir'])
         finally:

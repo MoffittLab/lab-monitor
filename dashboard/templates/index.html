@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Moffitt Laboratory Dashboard</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ static_url('css/style.css') }}">
     <!-- Pinned Plotly (1.58.5 is what the retired "plotly-latest" URL served) with SRI -->
     <script src="https://cdn.plot.ly/plotly-1.58.5.min.js"
             integrity="sha384-W7FXNbEY44RgDK8MunBe4gETSKi3Qo2bJAXX3PH8v5l3hdabFb9dbCIn3X69OFjX"
@@ -18,6 +18,11 @@
             <div class="header-info">
                 <span class="last-update" id="lastUpdate">Last updated: --</span>
                 <span class="status" id="status">Connecting...</span>
+                {% if auth_enabled %}
+                <form method="post" action="{{ url_for('logout') }}" class="signout-form">
+                    <button type="submit" class="signout-btn" title="Sign out on this browser">Sign out</button>
+                </form>
+                {% endif %}
             </div>
         </header>
 
@@ -84,7 +89,7 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    <script src="{{ static_url('js/dashboard.js') }}"></script>
     <script>
         // Initialize dashboard with config (refresh, stale/offline thresholds)
         initDashboard({{ client_config|tojson }});

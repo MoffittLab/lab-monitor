@@ -4,8 +4,8 @@
   "manager_url": "http://localhost:5000",
   "manager_token": "PASTE-A-MANAGER-READ-TOKEN-HERE",
   "auth": {
-    "username": "labadmin",
-    "password_hash": "PASTE-OUTPUT-OF: python app.py --hash-password"
+    "password_hash": "PASTE-OUTPUT-OF: python app.py --hash-password",
+    "remember_days": 180
   },
   "refresh_interval_seconds": 30,
   "manager_timeout_seconds": 5,

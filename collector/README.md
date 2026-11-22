@@ -552,18 +552,38 @@ Installed by `install-collector-linux.sh` (Ubuntu 22.04 / 24.04, Debian 12; see
 at boot.
 
 **Sandbox.** Both services run as the system user `labmon` (no login shell) with `ProtectSystem=strict`
-(writable: only `/var/lib/lab-monitor` and `/var/log/lab-monitor`), `PrivateTmp`, `NoNewPrivileges`, a
-system-call filter (`@system-service`) and only `AF_INET`/`AF_INET6`/`AF_UNIX` sockets; the disk service
-also gets no W+X memory and no devices. The metrics service has no capabilities and no access to `/home`, but
-can reach the NVIDIA devices (see [GPU servers](#gpu-servers)); it reads `/proc` for every user's processes (per-user metrics),
-which world-readable `/proc` files allow (unless `/proc` is mounted with `hidepid=`). The disk service must
-read every file under `scan_paths` whoever owns it, so it gets exactly one capability,
-`CAP_DAC_READ_SEARCH` (skip read/search permission checks — no write access, nothing else of root), sees
-`/home` read-only, and runs at `Nice=19` with idle I/O priority. Change a setting with a drop-in
-(`sudo systemctl edit lab-monitor-disk.service`): e.g. `ReadWritePaths=` for a `data_dir` elsewhere.
+(writable: only `/var/lib/lab-monitor` and `/var/log/lab-monitor`), `PrivateTmp`, `NoNewPrivileges` and a
+system-call filter (`@system-service`); the disk service also gets no W+X memory and no devices.
+
+- **Metrics service:** no capabilities and no access to `/home`, but it can reach the NVIDIA devices (see
+  [GPU servers](#gpu-servers)); it reads `/proc` for every user's processes (per-user metrics), which
+  world-readable `/proc` files allow (unless `/proc` is mounted with `hidepid=`). **Network: the Manager
+  only.** The unit denies every IP address but loopback (`IPAddressDeny=any`); the installer's drop-in
+  `/etc/systemd/system/lab-monitor-metrics.service.d/50-network.conf` allows the addresses `manager_url`
+  resolves to when the installer runs, plus the name servers in `/etc/resolv.conf`. If the Manager's address
+  changes, the collector logs network errors and keeps its data queued: re-run the installer.
+  `--no-network-limit` lifts the limit. This service also sends the disk service's results.
+- **Disk service:** it must list and `stat` every folder under `scan_paths` whoever owns it (Ubuntu's home
+  folders are `0750`), without being root. Linux has no permission for "list and stat, but don't open
+  files", so it gets the smallest one that does it, `CAP_DAC_READ_SEARCH`: it skips read and search
+  permission checks, which also allows reading file contents (no write access, nothing else of root). The
+  scanner never opens a file it measures (`scandir` + `lstat`), but the capability can't enforce that, so
+  the service is contained instead:
+  - **no network at all** (`PrivateNetwork=yes`, only `AF_UNIX` sockets, `IPAddressDeny=any`): it runs with
+    `--no-sync`, which archives and queues the result, and the next metrics run (within 5 minutes) sends it;
+  - the system's own secrets are hidden from it (`/root`, `/etc/shadow`, `/etc/gshadow`, `/etc/ssh`, sudo's
+    rules);
+  - `/home` is read-only, and it runs at `Nice=19` with idle I/O priority.
+
+  These limits protect against a bug or a compromised Python package in the collector. They don't protect
+  against a malicious change to this repository: the installer, which runs as root, writes the units.
+  Review what an update changes before running the installer.
+
+Change a setting with a drop-in (`sudo systemctl edit lab-monitor-disk.service`): e.g. `ReadWritePaths=`
+for a `data_dir` elsewhere.
 
 **Time budget.** The disk service's `TimeoutStartSec` is the collector's overall scan budget
-(`total_timeout_seconds`, 3 h in the installer's config) + 1 h for volume capacity and the upload. The
+(`total_timeout_seconds`, 3 h in the installer's config) + 1 h for volume capacity. The
 installer writes it to `/etc/systemd/system/lab-monitor-disk.service.d/50-timeout.conf` from the config;
 re-run it after changing `scan_paths`, `timeout_seconds` or `total_timeout_seconds`. The metrics service
 gets 4 minutes, below its 5-minute interval.

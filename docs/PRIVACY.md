@@ -11,12 +11,13 @@ The wire-level rule is item R9 of [PROTOCOL.md](PROTOCOL.md#10-compatibility-rul
 names, client IP addresses and host names, per-user CPU, memory and GPU use, and storage per owner.
 There is no per-user or per-group view restriction.
 
-- The access control is the Dashboard's optional login (HTTP basic auth, `auth` in
+- The access control is the Dashboard's optional sign-in (one shared password, `auth` in
   `dashboard/config.json`; see [dashboard/README.md](../dashboard/README.md#security)). Without it,
-  anyone who can reach port 5001 sees everything. With it, everyone who has the Dashboard password
-  sees everything.
-- Basic auth sends the password with every request, and the Dashboard serves plain HTTP: on an
-  untrusted network put it behind a TLS reverse proxy ([CONFIG.md](../CONFIG.md#other-security-settings)).
+  anyone who can reach port 5001 sees everything. With it, everyone who has the Dashboard password,
+  and every browser that has signed in with it (for 180 days after its last visit), sees everything.
+- The Dashboard serves plain HTTP: the password crosses the network once per sign-in, the sign-in
+  cookie with every request. On an untrusted network put it behind a TLS reverse proxy
+  ([CONFIG.md](../CONFIG.md#other-security-settings)).
 - The Manager API returns the same data to any **read** or **admin** token
   ([CONFIG.md](../CONFIG.md#manager-tokens)). Collector tokens can't read.
 - Anyone with file access to the Manager's `data_dir`, to a collector's `data_dir`, or to their

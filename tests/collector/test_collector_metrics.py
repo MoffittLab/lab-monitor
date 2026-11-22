@@ -328,7 +328,8 @@ def test_cpu_psutil_failure_is_null(collector, monkeypatch):
 
 
 def test_cpu_no_longer_uses_loadavg(collector, fake_proc, no_psutil, monkeypatch):
-    monkeypatch.setattr(os, 'getloadavg', lambda: pytest.fail('loadavg must not be used'))
+    # raising=False: Windows has no os.getloadavg
+    monkeypatch.setattr(os, 'getloadavg', lambda: pytest.fail('loadavg must not be used'), raising=False)
     fake_proc['/proc/stat'] = [_stat(0, 100), _stat(50, 150)]
     monkeypatch.setattr(collector.time, 'sleep', lambda s: None)
     assert collector.get_cpu_percent() == 50.0
@@ -733,10 +734,12 @@ def test_cli_accepts_health_and_dry_run(collector, config, monkeypatch, tmp_path
     monkeypatch.setattr(collector, 'setup_logging', lambda *a: logging.getLogger('test'))
     monkeypatch.setattr(collector, 'collect_health', lambda c, l, dry_run=False: called.append(('health', dry_run)) or True)
     monkeypatch.setattr(collector, 'collect_metrics', lambda c, l, dry_run=False: called.append(('metrics', dry_run)) or True)
-    monkeypatch.setattr(collector, 'collect_disk_usage', lambda c, l, dry_run=False: called.append(('disk', dry_run)) or True)
-    for argv in (['--mode', 'health'], ['--mode', 'metrics', '--dry-run'], ['--dry-run']):
+    monkeypatch.setattr(collector, 'collect_disk_usage',
+                        lambda c, l, dry_run=False, sync=True: called.append(('disk', dry_run, sync)) or True)
+    for argv in (['--mode', 'health'], ['--mode', 'metrics', '--dry-run'], ['--dry-run'],
+                 ['--mode', 'disk', '--no-sync']):
         monkeypatch.setattr(sys, 'argv', ['collector.py', '--config', str(path)] + argv)
         with pytest.raises(SystemExit) as exit_info:
             collector.main()
         assert exit_info.value.code == 0
-    assert called == [('health', False), ('metrics', True), ('disk', True)]
+    assert called == [('health', False), ('metrics', True), ('disk', True, True), ('disk', False, False)]

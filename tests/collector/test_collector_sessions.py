@@ -10,6 +10,10 @@ import sys
 
 import pytest
 
+posix_only = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='needs a POSIX host (os.getuid / os.sysconf / /proc / POSIX paths)')
+
+
 LOG = logging.getLogger('test')
 
 
@@ -194,6 +198,7 @@ def test_truncated_or_missing_utmp_is_unavailable(sessions, tmp_path):
 # logind
 # ---------------------------------------------------------------------------
 
+@posix_only
 def test_logind_session_files(sessions, tmp_path):
     d = tmp_path / 'sessions'
     d.mkdir()

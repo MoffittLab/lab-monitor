@@ -5,7 +5,13 @@ import os
 import shutil
 import subprocess
 
+import sys
+
 import pytest
+
+posix_only = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='needs a POSIX host (os.getuid / os.sysconf / /proc / POSIX paths)')
+
 
 LOG = logging.getLogger('test')
 
@@ -239,6 +245,7 @@ def test_hwmon_without_drive_sensors(health, tree):
     assert health.read_hwmon() == ('unavailable', {})
 
 
+@posix_only
 def test_read_only_volumes(health, tree, tmp_path):
     tree.mounts('/dev/md2 /volume1 btrfs ro,relatime 0 0\n/dev/md3 /volume2 ext4 rw 0 0\n'
                 '/dev/sdq1 /volumeUSB1/usbshare vfat rw 0 0\n')
@@ -450,6 +457,7 @@ console.log(JSON.stringify([...out.matchAll(/data-metric="([^"]*)"/g)].map(m => 
 """
 
 
+@posix_only
 @pytest.mark.skipif(shutil.which('node') is None, reason='node not installed')
 def test_dashboard_links_exactly_the_disk_temperatures_the_collector_keeps(health):
     """dashboard.js offers a temperature chart only for the keys flatten() stores: cap, collisions, sid rules."""
@@ -502,6 +510,7 @@ def run(health, tree, tmp_path, monkeypatch):
     return collect
 
 
+@posix_only
 def test_sending_rules(run):
     first = run()
     assert first['trigger'] == 'change' and first['overall_status'] == 'ok' and first['overall_status_code'] == 0
@@ -550,6 +559,7 @@ def test_hwmon_only_on_the_hourly_cadence(run):
     assert run.calls['hwmon'] == 2 and hot['disks'][0]['temperature_c'] == 65.0 and hot['overall_status'] == 'critical'
 
 
+@posix_only
 def test_ignore_and_no_smart_or_snmp(run):
     payload = run(ignore=['/'])
     assert payload['volumes'] == [] and 'smart' not in payload['sources'] and 'snmp' not in payload['sources']

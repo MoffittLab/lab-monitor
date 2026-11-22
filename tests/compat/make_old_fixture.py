@@ -80,6 +80,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import random
 import shutil
 import sqlite3
@@ -410,12 +411,18 @@ def main(argv=None):
         d = Sim.current
         return p in d.roots or p in d.singles or p in d.volumes
 
+    # POSIX path rules on every platform, as on the NAS the old collector ran on:
+    # on Windows, ntpath.normpath would turn the simulated '/volume1/homes/*' into
+    # '\\volume1\\homes', which the device model doesn't know, and the old data_dir
+    # would come out without its folders.  posixpath handles the Windows paths of
+    # the fixture's own state files too (join with '/', dirname, exists).
     fake_path = types.ModuleType('os.path')
-    fake_path.__dict__.update(os.path.__dict__)
+    fake_path.__dict__.update(posixpath.__dict__)
     fake_path.isdir = lambda p: is_known_dir(p) or os.path.isdir(p)
     fake_os = types.ModuleType('os')
     fake_os.__dict__.update(os.__dict__)
     fake_os.path = fake_path
+    fake_os.sep = '/'
     collector.os = fake_os
     collector.discover_volumes = lambda nas_type=None: list(Sim.current.volumes)
     collector.measure_volume_capacity = lambda vol: (

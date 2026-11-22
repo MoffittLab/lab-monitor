@@ -48,6 +48,7 @@ def tree(tmp_path):
 # The walker
 # ---------------------------------------------------------------------------
 
+@posix_only
 def test_cold_buckets_by_mtime(disk_usage, tree):
     cut1, cut3 = _cuts()
     total, files, acc = disk_usage.measure_folder_recursive_breakdown(str(tree), 60, None, cut1, cut3, owners=True)
@@ -123,7 +124,9 @@ def test_per_owner_records(disk_usage, tree, monkeypatch):
 def test_a_timeout_gives_no_partial_result(disk_usage, tree, monkeypatch):
     monkeypatch.setattr(disk_usage, '_DEADLINE_CHECK_EVERY', 1)
     with pytest.raises(TimeoutError):
-        disk_usage.measure_folder_recursive_breakdown(str(tree), 0, None, *_cuts(), owners=True)
+        # A budget already used up: with 0 the clock (16 ms steps on Windows) may not
+        # have moved on by the first check
+        disk_usage.measure_folder_recursive_breakdown(str(tree), -1, None, *_cuts(), owners=True)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +137,7 @@ def _options(disk_usage, previous, max_fraction=0.6):
     return disk_usage.BreakdownOptions(*_cuts(), owners=True, previous=previous, max_fraction=max_fraction)
 
 
+@posix_only
 def test_time_guard(disk_usage, tmp_path):
     folders = []
     for name in ('fast', 'slow', 'timed_out', 'new'):
@@ -400,7 +404,7 @@ def test_options_and_state(breakdown, tmp_path):
 @pytest.fixture
 def disk_run(collector, config, tree, monkeypatch, tmp_path):
     captured = []
-    monkeypatch.setattr(collector, '_record_and_sync', lambda cfg, n, i, entries, log: captured.extend(entries) or True)
+    monkeypatch.setattr(collector, '_record_and_sync', lambda cfg, n, i, entries, log, sync=True: captured.extend(entries) or True)
     config.update({'platform': 'linux', 'volumes': [], 'scan_paths': [str(tree), str(tmp_path / 'missing')]})
 
     def run(**changes):
@@ -411,6 +415,7 @@ def disk_run(collector, config, tree, monkeypatch, tmp_path):
     return run
 
 
+@posix_only
 def test_disk_run_sends_breakdown_from_the_second_run(disk_run, tree):
     first = disk_run()
     assert [m['data_type'] for m in first] == ['folder_usage', 'storage_breakdown']

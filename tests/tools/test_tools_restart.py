@@ -187,7 +187,8 @@ def test_http_answering_rules():
     assert restart.http_answering(MANAGER, 200)
     assert not restart.http_answering(MANAGER, 401)
     assert not restart.http_answering(MANAGER, None)
-    assert restart.http_answering(DASHBOARD, 401)       # Basic auth enabled: still up
+    assert restart.http_answering(DASHBOARD, 401)       # sign-in enabled: still up
+    assert restart.http_answering(DASHBOARD, 302)       # ... its pages redirect to /login
     assert not restart.http_answering(DASHBOARD, 502)
     assert not restart.http_answering(DASHBOARD, None)
 

@@ -2,7 +2,13 @@
 import logging
 import os
 
+import sys
+
 import pytest
+
+posix_only = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='needs a POSIX host (os.getuid / os.sysconf / /proc / POSIX paths)')
+
 
 LOG = logging.getLogger('test')
 HZ = 100.0
@@ -70,11 +76,13 @@ def test_uid_names_are_cached_per_run(pa, monkeypatch):
     assert calls == [1000, 77]
 
 
+@posix_only
 def test_unknown_uid_is_uid_n_with_the_real_pwd(pa):
     assert pa.user_name(2 ** 31 - 7, {}) == f'uid:{2 ** 31 - 7}'     # no such account here
     assert pa.user_name(os.getuid(), {}) not in ('', None)
 
 
+@posix_only
 def test_exited_process_is_skipped(pa, procfs, monkeypatch):
     procfs.passwd = {1000: 'alice'}
     procfs.proc_entry(10, 1000, cpu=5)
@@ -107,11 +115,13 @@ def test_hidepid_skips_per_user_data(pa, procfs, caplog):
     ('rw,hidepid=2', True), ('rw,hidepid=noaccess', True),
     ('rw,hidepid=2,gid={gid}', False),                    # this account is in the mount's gid= group
 ])
+@posix_only
 def test_hidepid_options(pa, options, hides):
     text = f"proc /proc proc {options.format(gid=os.getegid())} 0 0\n"
     assert pa.hidepid_hides(text) is (hides and os.geteuid() != 0)
 
 
+@posix_only
 def test_too_many_unreadable_pids_skip_per_user_data(pa, procfs, caplog):
     procfs.passwd = {1000: 'alice'}
     for pid in range(10, 15):
@@ -222,6 +232,7 @@ def test_excluded_users_still_count_toward_coverage(pa):
     assert _cpu(users) == {'alice': 4.0} and coverage == 100.0
 
 
+@posix_only
 def test_collector_filter_applies_to_the_procfs_rows(collector, config, procfs, monkeypatch):
     # The same rules as the psutil path: not the collector's own process, not
     # its system account, not daemon accounts with a name, exclude_users

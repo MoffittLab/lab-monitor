@@ -138,7 +138,8 @@ Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 20
 Get-Content E:\Users\lab-monitor\logs\manager-console.log -Tail 20
 ```
 
-**Dashboard login** (recommended when port 5001 is reachable from the network):
+**Dashboard sign-in** (recommended when port 5001 is reachable from the network): one shared
+password; a browser that has signed in stays signed in for 180 days after its last visit.
 ```powershell
 conda activate lab-monitor
 cd E:\Users\lab-monitor\scripts\lab-monitor\dashboard
@@ -146,6 +147,7 @@ python app.py --hash-password
 # paste the printed "auth" block into dashboard\config.json, then:
 Stop-ScheduledTask "Lab Monitor Dashboard"; Start-ScheduledTask "Lab Monitor Dashboard"
 ```
+To change the password, do the same again: replacing the hash signs every browser out.
 
 **Restart a service** (ending the task stops the launcher loop; the PID check makes sure the Python
 process is gone too):
@@ -364,6 +366,11 @@ acknowledged it. On a server with an NVIDIA driver it also installs nvidia-ml-py
 `labmon` ([GPU servers](collector/README.md#gpu-servers)). Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
 they name). Details: [collector/README.md](collector/README.md#linux--ubuntu).
 
+**Network and file access:** the metrics service may only reach the Manager (the addresses `manager_url`
+resolves to when the installer runs, and the name servers): re-run the installer if the Manager's address
+changes. The disk service can read every folder it measures but has no network at all; the next metrics run
+sends its results. Details: [collector/README.md](collector/README.md#linux--ubuntu) ("Sandbox").
+
 **Shared storage:** folders on NFS/SMB or cluster filesystems (Lustre, GPFS, ...) are not scanned by
 default, so a server whose `/home` is an NFS mount reports `/home` in the disk scan's errors instead of
 walking the shared tree every night. Measure shared storage on its file server, or set
@@ -396,6 +403,10 @@ journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'CPU:|S
 ```
 Everything these features read is readable by `labmon` inside the existing sandbox; nothing new needs
 root, and SMART is not collected ([collector/README.md](collector/README.md#linux--ubuntu)).
+
+**Fleet tools:** to update, run, pause or archive this collector from `tools/` like the others, add it to
+`collectors.csv` with `platform` = `linux` and add the sudoers rule in
+[tools/README.md](tools/README.md#linux-collectors-platform--linux).
 
 **Uninstall:** `sudo /opt/lab-monitor/install-collector-linux.sh --uninstall` (keeps config, data and logs;
 add `--purge` to delete them and the `labmon` user).

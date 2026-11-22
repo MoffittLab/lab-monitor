@@ -39,11 +39,105 @@ atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/Prog
 - `python_path` — path to the Python interpreter in the collector environment
 - `key_filename` — *optional* private key file to offer first
 - `port` — *optional* SSH port (default 22)
+- `platform` — *optional*: `linux` for a system installed with `install-collector-linux.sh`
+  (see [Linux collectors](#linux-collectors-platform--linux)); empty for Synology and Windows
 
 The optional columns can be added to an existing CSV at any time; CSVs without
 them keep working unchanged. A UTF-8 BOM (Excel) is fine.
 
 **Security:** Keep `collectors.csv` out of git — it's listed in `.gitignore`.
+
+### Keeping `collectors.csv` encrypted (`inventory_crypt.py`)
+
+The CSV holds SSH logins and passwords, so keep it encrypted. Every SSH tool accepts the
+encrypted file in place of the plain one: `--csv collectors.csv.enc` asks for the passphrase at a
+hidden prompt and decrypts it in memory only. The passphrase is only ever read from that prompt
+(never from the command line, a file or an environment variable), so the tools can't run unattended
+from an encrypted file. A forgotten passphrase can't be recovered: keep it in a password manager.
+
+```powershell
+python inventory_crypt.py encrypt collectors.csv             # one time: writes collectors.csv.enc
+python inventory_crypt.py show collectors.csv.enc            # the table, passwords shown as ****
+python inventory_crypt.py edit collectors.csv.enc            # edit in Notepad (Windows only)
+python inventory_crypt.py edit collectors.csv.enc --editor code
+python inventory_crypt.py set-password collectors.csv.enc --only seahorse1   # hidden prompt
+python inventory_crypt.py passphrase collectors.csv.enc      # change the passphrase
+python inventory_crypt.py decrypt collectors.csv.enc -o plain.csv            # escape hatch, asks first
+python update_collectors.py --csv collectors.csv.enc --dry-run
+```
+
+- **`encrypt`** checks the CSV (an `ip` and `username` column, every host once, no empty `ip` or
+  `username`), asks for a new passphrase twice (at least 10 characters) and reads the result back.
+  It keeps the plain file: delete it yourself, and if it lived in Dropbox or another synced
+  folder, delete its earlier versions there too and change the passwords that were in it.
+- **`edit`** decrypts to a temporary copy in `%LOCALAPPDATA%\lab-monitor\inventory-edit\` (private
+  to you, outside any synced folder) and opens it in the editor. Save, close the editor and press
+  Enter. It checks the file (and offers to reopen it if something is wrong), lists the changes by
+  host without showing any password, and saves only after you confirm. The temporary copy is
+  overwritten and deleted however the edit ends; if a crash leaves one behind, the next `edit` finds
+  it and offers to delete it. Don't use Excel: it can change CSV files when saving.
+- **`set-password`** changes passwords at a hidden prompt, so they never appear on screen or in a
+  temporary file. An empty password leaves that host to key authentication.
+- Every save keeps the previous encrypted file as `collectors.csv.enc.bak` and replaces the file in
+  one step. After `passphrase`, the `.bak` still opens with the **old** passphrase: delete it once
+  the new one works.
+- Deleting the temporary copy is best effort: an SSD may keep the old blocks. That is why it is
+  written only to your own local profile and only for the length of an edit.
+- Encrypted files are recognized by their first bytes, whatever their name. `*.csv.enc*` is in
+  `.gitignore`. Uses the `cryptography` package (installed with paramiko): scrypt key derivation
+  and AES-256-GCM, which also detects a damaged or altered file.
+- SSH keys are still better than passwords: with a key in the `key_filename` column (or in
+  `ssh-agent`) the `password` column can stay empty.
+
+---
+
+### Linux collectors (`platform` = `linux`)
+
+`install-collector-linux.sh` installs differently from the Synology and Windows installers: the code
+is a root-owned copy in `/opt/lab-monitor` (not a git checkout), the config is
+`/etc/lab-monitor/collector.json` (`0640 root:labmon`), and systemd timers run the collector as the
+`labmon` user. Mark such a system with `platform` = `linux` and set `git_path` to the
+administrator's checkout the installer was run from; `python_path` can stay empty.
+
+```csv
+ip,username,password,git_path,python_path,key_filename,platform
+server1.example.org,admin,,/home/admin/code/lab-monitor,,~/.ssh/id_ed25519,linux
+```
+
+| Tool | On a `linux` row |
+|------|------------------|
+| `update_collectors.py` | `git pull` in `git_path`, then `sudo -n <git_path>/install-collector-linux.sh --non-interactive` (refreshes code, venv and units; keeps the config). `--upgrade-pip` adds nothing: the installer handles the venv |
+| `run_collectors.py` | `sudo -n systemctl start lab-monitor-<mode>.service`: the run gets the unit's user, sandbox and time limit, and returns when it has finished (`sudo journalctl -u lab-monitor-<mode>.service` on the host has its log). A disk run only queues its result (the disk unit has no network); the next metrics run, within 5 minutes, sends it |
+| `toggle_collectors.py` | `config_tool.py` on `/etc/lab-monitor/collector.json` as root, so `active` is kept in the config like everywhere else (an update keeps it) |
+| `archive_all_collectors.py` | reads the config as root, then moves the archives as `labmon` (`sudo -n -u labmon /bin/sh -c ...`), which owns `/var/lib/lab-monitor` |
+
+`sudo -n` never asks for a password: without a sudoers rule the step fails at once with a hint,
+instead of hanging. Add the rule on the host with `sudo visudo -f /etc/sudoers.d/lab-monitor-fleet`,
+replacing `ADMIN` with the row's `username` and `CHECKOUT` with its `git_path`:
+
+```
+# lab-monitor fleet tools (tools/*.py): commands ADMIN may run over SSH without a password
+Cmnd_Alias LABMON_RUN = /usr/bin/systemctl start lab-monitor-metrics.service, \
+                        /usr/bin/systemctl start lab-monitor-disk.service
+Cmnd_Alias LABMON_CFG = /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json list --json, \
+                        /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json set active true --json, \
+                        /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json set active false --json
+Cmnd_Alias LABMON_UPDATE = CHECKOUT/install-collector-linux.sh --non-interactive
+ADMIN ALL=(root) NOPASSWD: LABMON_RUN, LABMON_CFG, LABMON_UPDATE
+ADMIN ALL=(labmon) NOPASSWD: /bin/sh
+```
+
+Check it with `sudo -l -U ADMIN`, then `python run_collectors.py --csv ... --mode metrics --only server1`.
+
+- **What the rule allows.** `LABMON_UPDATE` runs, as root, whatever installer the checkout holds after
+  `git pull`: whoever can push to `main`, or write to `CHECKOUT`, can then run code as root on that
+  host at the next update, with no chance to read it first. It is the same code you would run by
+  hand, but unattended. To keep updates manual, leave `LABMON_UPDATE` out; the update step then
+  fails with the sudo hint and you run the installer yourself. The `(labmon) /bin/sh` line gives
+  ADMIN a shell as the service user, which can read the collector's token and data; ADMIN, a
+  sudo administrator, could do that anyway.
+- `config_tool.py` keeps the config file's owner and mode when it saves, so `labmon` can still read
+  it after a toggle run as root.
 
 ---
 
@@ -174,7 +268,14 @@ python3 update_collectors.py --csv collectors.csv --upgrade-pip
 python3 update_collectors.py --csv /path/to/collectors.csv --upgrade-pip --timeout 60 --parallel 4
 # A host that also runs the Manager/Dashboard from the same environment:
 python3 update_collectors.py --csv collectors.csv --upgrade-pip --requirements requirements.txt
+# Only some systems (repeat --only), e.g. one first during an upgrade:
+python3 update_collectors.py --csv collectors.csv --only triton2 --dry-run
+python3 update_collectors.py --csv collectors.csv --only triton2 --only 192.168.1.43 --upgrade-pip
 ```
+
+`--only HOST` selects the rows whose `ip` column is `HOST` (case ignored), or whose host name starts
+with `HOST` followed by a dot (`triton2` selects `triton2.example.org`, not `triton20.example.org`). An IP
+address only matches in full. If a value matches no row, the tool stops before contacting anyone.
 
 **What it does:**
 - For each collector, SSHes in and runs `git -C {git_path} pull origin main`
@@ -725,6 +826,42 @@ that could not be renamed), `2` refused (a Manager is running, bad arguments, no
 `verify_upgrade.py` runs this tool on its migrated copy (check `rollback`), so a PASS there means
 the rollback works on your data. With the review-fix release as the old side it does not: its
 `rollback` check starts the review-fix Manager on the migrated data instead (the way back to that release).
+
+### 10. `dedupe_history.py` — Remove Duplicate Rows the Old Manager Stored (run on the Manager server)
+
+Before the upgrade, a collector re-sent its whole queue whenever a save failed or a response timed
+out, and the old Manager stored every copy. The new Manager stores each message once, but the copies
+already stored stay until this tool removes them. A duplicate is a row stored before the upgrade
+(`msg_id` NULL) that is identical, in every column but its row id, to an earlier row of the same table;
+the earliest copy is kept. Rows that differ in any value, and everything the new Manager stored, are
+never touched; nor are `folder_usage_legacy`, the device registry, snapshots, lifetime totals or any
+backup. Standard library only; run it from the checkout with the Manager's Python.
+
+```powershell
+python tools\dedupe_history.py --manager-config manager\config.json          # report (read-only)
+Stop-ScheduledTask "Lab Monitor Manager"
+python tools\dedupe_history.py --manager-config manager\config.json --apply --vacuum
+Start-ScheduledTask "Lab Monitor Manager"
+```
+
+- **Report** (default) changes nothing and can run while the Manager runs.
+- **`--apply`** holds `<data_dir>\manager.lock`, so it refuses while a Manager runs. For each database
+  with duplicates it first writes `<db>.pre-dedupe-<stamp>.bak` (backup API, complete or absent), then
+  deletes the duplicates in **one transaction** and checks before committing: every distinct row still
+  there exactly once, rows with a `msg_id` untouched, folder scans without orphaned items,
+  `PRAGMA quick_check` ok. A failed check rolls that database back unchanged (exit code 2).
+- **`--vacuum`** compacts each changed file afterwards (the space is returned; needs free space of
+  about the largest database). `--only <system>` (repeatable; `metrics` for `metrics.db`) limits the run.
+- **Undo:** stop the Manager, delete the database's `-wal`/`-shm` files and copy its `.pre-dedupe-*.bak`
+  over it. Delete the `.bak` files once the Dashboard looks right.
+
+Measured on a copy of a 2.9 GB production `data_dir` (23 systems, about 30 % duplicates): 11 minutes,
+5.4 of them for `metrics.db`; 2.9 GB → 1.7 GB. The Manager answered identically before and after
+except for the removed repeats (same devices, totals and current metrics; every chart series and row
+list with the same distinct entries).
+
+**Exit codes:** `0` done (or nothing to do), `1` refused (Manager running, bad arguments, not enough
+space), `2` a database failed its check and was rolled back (the others were done).
 
 ---
 

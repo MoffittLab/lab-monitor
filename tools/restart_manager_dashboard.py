@@ -66,8 +66,9 @@ logger = logging.getLogger(__name__)
 
 # Services managed by this tool. port is the fallback when the service's
 # config.json on the server has no "port". The Manager's /health is
-# unauthenticated and must return 200; the Dashboard may have HTTP Basic auth
-# enabled (every route then answers 401), so any non-5xx answer proves it is up.
+# unauthenticated and must return 200; the Dashboard may have its sign-in
+# enabled (pages then redirect to /login, API routes answer 401), so any
+# non-5xx answer proves it is up.
 SERVICES = [
     {'label': 'Manager',   'pid_file': 'manager.pid',   'script': 'manager.py',
      'subdir': 'manager',   'port': 5000, 'health_paths': ['/health'], 'any_answer': False},

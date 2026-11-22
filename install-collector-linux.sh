@@ -59,6 +59,8 @@ TIMERS=(lab-monitor-metrics.timer lab-monitor-disk.timer)
 SERVICES=(lab-monitor-metrics.service lab-monitor-disk.service)
 DISK_DROPIN_DIR="$UNIT_DIR/lab-monitor-disk.service.d"
 DISK_DROPIN="$DISK_DROPIN_DIR/50-timeout.conf"
+METRICS_DROPIN_DIR="$UNIT_DIR/lab-monitor-metrics.service.d"
+METRICS_NET_DROPIN="$METRICS_DROPIN_DIR/50-network.conf"
 NAME_RE='^[A-Za-z0-9_.-]{1,64}$'
 DEVICE_TYPES="Server NAS NAS-Instrument NAS-Backup"
 REQUIRED_PYTHON="3.8"
@@ -96,6 +98,7 @@ OPT_UNINSTALL=0
 OPT_PURGE=0
 OPT_DRY_RUN=0
 OPT_PRINT_CONFIG=0
+OPT_NO_NETWORK_LIMIT=0
 OPT_REPO=""
 OPT_REF=""
 OPT_SOURCE=""
@@ -139,6 +142,10 @@ Modes:
   --dry-run             Print the actions without changing anything
   --print-config        Print the config JSON that would be written, then exit
                         (no root needed)
+  --no-network-limit    Let the metrics unit reach any address. By default it may
+                        reach only the Manager (the addresses manager_url resolves
+                        to now) and the name servers; re-run the installer if the
+                        Manager's address changes. The disk unit never has network.
   --uninstall           Remove units and code; keep config, data and logs
   --purge               With --uninstall: also delete config, data (archives), logs
                         and the labmon user
@@ -463,6 +470,56 @@ else:
 ' "$1" "$2"
 }
 
+# manager_addresses URL: the IP addresses URL's host resolves to now, one per line
+# (an IP address in the URL is printed as it is); nothing if it doesn't resolve
+manager_addresses() {
+    local host
+    host=$("${PY[@]}" -c '
+import sys, urllib.parse
+print(urllib.parse.urlsplit(sys.argv[1]).hostname or "")
+' "$1" 2>/dev/null) || return 0
+    [[ -n $host ]] || return 0
+    getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
+}
+
+# name_servers [RESOLV_CONF]: the resolver addresses in resolv.conf, without a
+# %interface suffix (IPAddressAllow= takes addresses only)
+name_servers() {
+    awk '$1 == "nameserver" && $2 != "" {sub(/%.*/, "", $2); print $2}' "${1:-/etc/resolv.conf}" 2>/dev/null \
+        | sort -u || true
+}
+
+# metrics_network_dropin URL: the drop-in that lets the metrics unit (whose unit
+# file denies every address but loopback) reach the Manager and the name servers.
+# Fails if URL's host doesn't resolve: a drop-in without the Manager would
+# leave the collector unable to send anything.
+metrics_network_dropin() {
+    local url=$1 addrs servers a
+    if (( OPT_NO_NETWORK_LIMIT )); then
+        cat <<EOF
+# Written by install-collector-linux.sh --no-network-limit: the metrics unit
+# may reach any address. Re-run the installer without the flag to limit it to
+# the Manager again.
+[Service]
+IPAddressDeny=
+EOF
+        return 0
+    fi
+    addrs=$(manager_addresses "$url")
+    [[ -n $addrs ]] || return 1
+    servers=$(name_servers)
+    cat <<EOF
+# Written by install-collector-linux.sh: the metrics unit may reach only the
+# Manager ($url, resolved when the installer ran) and the name servers in
+# /etc/resolv.conf. If the Manager's address changes, the collector can't send
+# anything ("Network error"): re-run the installer to update this file.
+[Service]
+EOF
+    for a in $addrs $servers; do
+        printf 'IPAddressAllow=%s\n' "$a"
+    done
+}
+
 # disk_timeout_seconds FILE: TimeoutStartSec for the disk unit = the collector's
 # overall scan budget (total_timeout_seconds, or its default: max(3, number of
 # scan_paths entries) x timeout_seconds, see _default_total_timeout in
@@ -545,6 +602,7 @@ parse_args() {
             --purge)           OPT_PURGE=1 ;;
             --dry-run)         OPT_DRY_RUN=1 ;;
             --print-config)    OPT_PRINT_CONFIG=1; OPT_NON_INTERACTIVE=1 ;;
+            --no-network-limit) OPT_NO_NETWORK_LIMIT=1 ;;
             -h|--help)         usage; exit 0 ;;
             *)                 usage_error "unknown option: $1" ;;
         esac
@@ -1224,7 +1282,15 @@ configure() {
 
 install_units() {
     step "Step 7: systemd units"
-    local unit seconds
+    local unit seconds url network
+    if [[ -r $CONFIG_FILE ]]; then
+        url=$(config_get "$CONFIG_FILE" manager_url)
+    else
+        url=$OPT_MANAGER_URL   # dry run of a new install: no config yet
+    fi
+    # Before any unit changes: the new metrics unit reaches nothing without it
+    network=$(metrics_network_dropin "$url") \
+        || die "Could not resolve the Manager's host in '$url'. The metrics unit may only reach the Manager's addresses, so they are needed: fix name resolution (getent ahosts <host>), or re-run with --no-network-limit."
     for unit in "${UNITS[@]}"; do
         run install -m 0644 -o root -g root "$CODE_DIR/systemd/$unit" "$UNIT_DIR/$unit"
     done
@@ -1241,10 +1307,17 @@ install_units() {
 [Service]
 TimeoutStartSec=$seconds
 EOF
+    run install -d -m 0755 -o root -g root "$METRICS_DROPIN_DIR"
+    printf '%s\n' "$network" | write_file "$METRICS_NET_DROPIN" 0644
     run systemctl daemon-reload
     run systemctl enable --now "${TIMERS[@]}"
     TIMERS_STOPPED=0
     ok "Units installed; timers enabled (disk unit TimeoutStartSec=${seconds}s)"
+    if (( OPT_NO_NETWORK_LIMIT )); then
+        warn "--no-network-limit: the metrics unit may reach any address."
+    else
+        ok "Network: the metrics unit may reach only $(grep -c '^IPAddressAllow=' <<<"$network") address(es) (the Manager and the name servers); the disk unit none"
+    fi
 }
 
 # Number of messages waiting in this device's queue (empty if unknown)
@@ -1313,7 +1386,8 @@ sys.exit(0 if requests.get(sys.argv[1].rstrip("/") + "/health", timeout=10).ok e
         info "  It is kept in the queue and sent on the next successful run. Common causes:"
         info "  - HTTP 401: the Manager does not know this token yet (add the collector_tokens entry below, restart the Manager)"
         info "  - HTTP 403: the Manager's collector_tokens key for this token is not this device name"
-        info "  - Network error: check manager_url and the firewall"
+        info "  - Network error: check manager_url and the firewall; if the Manager's address changed,"
+        info "    re-run this installer (the metrics unit may only reach the addresses in $METRICS_NET_DROPIN)"
         info "  Retry with: sudo systemctl start lab-monitor-metrics.service"
     fi
 }
@@ -1421,9 +1495,12 @@ uninstall_main() {
     for unit in "${UNITS[@]}"; do
         run rm -f -- "$UNIT_DIR/$unit"
     done
-    run rm -f -- "$DISK_DROPIN"
+    run rm -f -- "$DISK_DROPIN" "$METRICS_NET_DROPIN"
     if [[ -d $DISK_DROPIN_DIR ]]; then
         run rmdir -- "$DISK_DROPIN_DIR" 2>/dev/null || warn "Kept $DISK_DROPIN_DIR (it has other drop-ins)"
+    fi
+    if [[ -d $METRICS_DROPIN_DIR ]]; then
+        run rmdir -- "$METRICS_DROPIN_DIR" 2>/dev/null || warn "Kept $METRICS_DROPIN_DIR (it has other drop-ins)"
     fi
     run systemctl daemon-reload || true
     run systemctl reset-failed "${SERVICES[@]}" 2>/dev/null || true

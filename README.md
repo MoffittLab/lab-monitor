@@ -109,8 +109,8 @@ release.
   nothing is deleted; history is kept forever unless retention is configured
 - **Scoped tokens**: admin, read (Dashboard) and per-device collector tokens; placeholder tokens
   stop the Manager from starting
-- **Dashboard login** (optional HTTP basic auth); CORS off by default. Everyone who can open the
-  Dashboard sees the per-user data ([docs/PRIVACY.md](docs/PRIVACY.md))
+- **Dashboard sign-in** (optional: one password, remembered per browser); CORS off by default.
+  Everyone who can open the Dashboard sees the per-user data ([docs/PRIVACY.md](docs/PRIVACY.md))
 - **Fleet tools** over SSH with pinned host keys: update, pause, run, archive, reset, replay, restart,
   verify and roll back an upgrade
 

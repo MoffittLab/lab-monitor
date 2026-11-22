@@ -163,8 +163,10 @@ def fake_proc(collector, monkeypatch):
     """
     Serve fake /proc files to collector.py only (shadows builtins.open in its
     module globals). Map a path to a string, a list of strings (one per open),
-    or an exception instance.
+    or an exception instance. The collector sees a Linux host, so the
+    fallbacks read /proc instead of taking their Windows branch.
     """
+    monkeypatch.setattr(sys, 'platform', 'linux')
     files = {}
     real_open = builtins.open
 

@@ -556,7 +556,9 @@ def measure_folder_recursive(path: str, timeout: float = 3600,
     recursion limit. Hard-linked files are counted once: (st_dev, st_ino) is
     remembered only for files with st_nlink > 1, so memory stays proportional
     to the number of multiply-linked files, not the size of the tree.
-    (On Windows os.scandir reports st_nlink = 0, so no dedup happens there.)
+    On Windows os.scandir reports st_nlink = st_ino = 0, so each file is
+    lstat()ed once more to get them (this scanner is only the fallback there;
+    the PowerShell scan counts every link, as Explorer does).
     
     Args:
         path: Folder path to measure
@@ -587,6 +589,7 @@ def measure_folder_recursive(path: str, timeout: float = 3600,
     skipped_examples = []
     linked_inodes = set()     # (dev, ino) of files with st_nlink > 1
     skip_reparse = sys.platform == 'win32'
+    stat_for_links = sys.platform == 'win32'
     stack = [root]
 
     while stack:
@@ -624,6 +627,13 @@ def measure_folder_recursive(path: str, timeout: float = 3600,
 
                     if entry.is_file(follow_symlinks=False):
                         st = entry.stat(follow_symlinks=False)
+                        if st.st_nlink == 0 and stat_for_links:
+                            # Windows: scandir's stat has no link count or file ID
+                            # (both 0); os.lstat opens the file and has them.
+                            try:
+                                st = os.lstat(entry.path)
+                            except OSError:
+                                pass
                         if st.st_nlink > 1:
                             inode_key = (st.st_dev, st.st_ino)
                             if inode_key in linked_inodes:

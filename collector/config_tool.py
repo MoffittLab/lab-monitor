@@ -48,6 +48,7 @@ import sys
 import os
 import json
 import argparse
+import stat
 import tempfile
 
 # The collector's lib/ (for lib/settings.py), appended like collector.py does
@@ -76,11 +77,27 @@ def load_config(path: str) -> dict:
 def save_config(path: str, config: dict):
     """Atomically write config back — temp file + rename to avoid corruption."""
     dir_ = os.path.dirname(os.path.abspath(path))
+    try:
+        before = os.stat(path)
+    except OSError:
+        before = None
     fd, tmp = tempfile.mkstemp(dir=dir_, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(config, f, indent=2)
             f.write('\n')
+        if before is not None:
+            # mkstemp makes the new file 0600 and owned by whoever runs this. Keep the
+            # old file's owner and mode instead: on a Linux install root edits
+            # /etc/lab-monitor/collector.json (0640 root:labmon) through sudo, and
+            # the service user reads it through its group. Owner first: chown can
+            # clear mode bits.
+            if hasattr(os, 'chown'):
+                try:
+                    os.chown(tmp, before.st_uid, before.st_gid)
+                except OSError:
+                    pass   # not root: the file stays ours, as before
+            os.chmod(tmp, stat.S_IMODE(before.st_mode))
         os.replace(tmp, path)   # atomic on POSIX; best-effort on Windows
     except Exception:
         try:
@@ -278,7 +295,8 @@ def cmd_set(config: dict, field: str, raw_value: str, config_path: str, as_json:
         if old_value == '__missing__':
             print(f"Added '{field}': {json.dumps(new_value)}")
         else:
-            print(f"Updated '{field}': {json.dumps(old_value)} → {json.dumps(new_value)}")
+            # ASCII only: a Windows console (cp1252) can't print an arrow
+            print(f"Updated '{field}': {json.dumps(old_value)} -> {json.dumps(new_value)}")
     return 0
 
 

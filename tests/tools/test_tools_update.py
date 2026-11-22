@@ -50,6 +50,59 @@ def test_update_dry_run_does_not_connect(monkeypatch):
     assert result['status'] == 'dry-run' and len(result['steps']) == 3
 
 
+@pytest.mark.parametrize('host, wanted, expected', [
+    ('triton2.hms.example.org', 'triton2', True),     # first label of a host name
+    ('triton2.hms.example.org', 'TRITON2', True),     # case ignored
+    ('triton2.hms.example.org', 'triton2.hms.example.org', True),
+    ('triton2.hms.example.org', 'triton', False),     # no prefix matches
+    ('triton20.hms.example.org', 'triton2', False),
+    ('192.168.1.42', '192.168.1.42', True),
+    ('192.168.1.42', '192', False),                   # an IP address only matches exactly
+    ('atlantis', 'atlantis', True),
+    ('', 'triton2', False),
+])
+def test_only_host_matching(host, wanted, expected):
+    assert update_collectors._ssh._host_matches(host, wanted) is expected
+
+
+INVENTORY = ('ip,username,password,git_path,python_path\n'
+             'triton2.hms.example.org,u,,/volume1/lab-monitor/scripts/lab-monitor,/py\n'
+             'triton20.hms.example.org,u,,/volume1/lab-monitor/scripts/lab-monitor,/py\n'
+             '192.168.1.42,u,,/volume1/lab-monitor/scripts/lab-monitor,/py\n')
+
+
+def _run_update(monkeypatch, tmp_path, *args):
+    csv = tmp_path / 'collectors.csv'
+    csv.write_text(INVENTORY)
+    seen = []
+    monkeypatch.setattr(update_collectors, 'update_system', lambda row, **kw: seen.append(row['ip']) or {
+        'ip': row['ip'], 'status': 'dry-run', 'steps': [], 'elapsed': 0.0})
+    monkeypatch.setattr(sys, 'argv', ['update_collectors.py', '--csv', str(csv), '--dry-run', *args])
+    with pytest.raises(SystemExit) as info:
+        update_collectors.main()
+    return info.value.code, seen
+
+
+def test_only_updates_just_the_selected_systems(monkeypatch, tmp_path, capsys):
+    code, seen = _run_update(monkeypatch, tmp_path, '--only', 'triton2')
+    assert code == 0 and seen == ['triton2.hms.example.org']
+    assert 'Systems : 1 (--only triton2)' in capsys.readouterr().out
+    code, seen = _run_update(monkeypatch, tmp_path, '--only', '192.168.1.42', '--only', 'triton2')
+    assert code == 0 and seen == ['triton2.hms.example.org', '192.168.1.42']   # inventory order
+
+
+def test_only_with_an_unknown_system_contacts_nobody(monkeypatch, tmp_path, capsys):
+    code, seen = _run_update(monkeypatch, tmp_path, '--only', 'triton2', '--only', 'trtion3')
+    assert code == 1 and seen == []
+    out = capsys.readouterr().out
+    assert '--only matched no system' in out and 'trtion3' in out and 'triton2,' not in out
+
+
+def test_without_only_every_system_is_updated(monkeypatch, tmp_path):
+    code, seen = _run_update(monkeypatch, tmp_path)
+    assert code == 0 and len(seen) == 3
+
+
 def test_run_collectors_dry_run_command():
     r = run_collectors.run_collection(WIN, mode='disk', dry_run=True, timeout=5)
     assert r['output'] == ('Would run: "C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe" '

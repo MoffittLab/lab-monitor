@@ -9,6 +9,10 @@ import types
 
 import pytest
 
+posix_only = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='needs a POSIX host (os.getuid / os.sysconf / /proc / POSIX paths)')
+
+
 LOG = logging.getLogger('test')
 
 
@@ -580,6 +584,7 @@ def test_windows_counters_end_to_end(collector, config, windows_counters, monkey
 # Platform facts and config values
 # ---------------------------------------------------------------------------
 
+@posix_only
 def test_platform_info(collector, tmp_path, monkeypatch):
     from lib import platform_info, disk_usage
     version = tmp_path / 'VERSION'
