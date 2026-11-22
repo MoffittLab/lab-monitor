@@ -40,6 +40,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     import fcntl          # POSIX
@@ -355,9 +356,31 @@ def _fsync_file(path: str):
         os.close(fd)
 
 
+# Windows path rules for sqlite_uri (a module setting so tests can try them on Linux)
+_WINDOWS = os.name == 'nt'
+
+
+def sqlite_uri(path: str, query: str = '') -> str:
+    """
+    A file: URI of `path` for sqlite3.connect(..., uri=True), with `query`
+    (for example 'mode=ro&immutable=1').  A UNC path (\\\\server\\share\\x.db)
+    becomes file:////server/share/x.db, with an empty URI authority: pathlib's
+    as_uri() gives file://server/share/x.db, which SQLite refuses ("invalid
+    uri authority: server") unless it was built with SQLITE_ALLOW_URI_AUTHORITY.
+    tools/verify_upgrade.py ro_uri and tools/rollback_upgrade.py _ro_uri do
+    the same.
+    """
+    p = os.path.abspath(path)
+    if _WINDOWS and (p.startswith('\\\\') or p.startswith('//')):
+        uri = 'file://' + quote(p.replace('\\', '/'), safe='/:')
+    else:
+        uri = Path(p).as_uri()
+    return uri + ('?' + query if query else '')
+
+
 def _open_backup_ro(path: str) -> sqlite3.Connection:
     """A read-only connection to a backup file that never creates -wal/-shm files."""
-    conn = sqlite3.connect(Path(os.path.abspath(path)).as_uri() + '?mode=ro&immutable=1', uri=True)
+    conn = sqlite3.connect(sqlite_uri(path, 'mode=ro&immutable=1'), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

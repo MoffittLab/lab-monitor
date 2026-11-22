@@ -6,26 +6,50 @@ unreliable, above all in WAL mode); once a day the Manager copies them to
 `snapshot.dest_dir`, typically a NAS share, so they are backed up there.
 
 One run:
-  1. Each database (metrics.db and every <system>/data.db) is copied to a
-     local staging folder with SQLite's online backup API.  That is a
-     consistent copy including committed WAL content, taken while the Manager
-     keeps ingesting.  The staged copy is switched to journal_mode=DELETE so
-     it is a single self-contained file, then checked with PRAGMA quick_check.
-  2. Staged databases (and any retention archives under <system>/archive/)
-     are copied to <dest_dir>/snapshot-<UTC stamp>.partial/ with a plain file
-     copy (SQLite never opens a file on the share), hashing as they go.
-  3. With verify_copy (default) every copied file is read back from the
+  1. Each database is copied to a local staging folder with SQLite's online
+     backup API: every <system>/data.db first, metrics.db LAST.  That is a
+     consistent copy of each database including committed WAL content, taken
+     while the Manager keeps ingesting.  Ingest commits metrics.db before the
+     system's data.db, so with metrics.db taken last, every message a staged
+     data.db holds also has its central updates in the staged metrics.db.
+     The copies are not of one instant: metrics.db can be a little newer, and
+     a replay after a restore stores those messages in data.db again (dedup
+     is per data.db; re-applying central updates is safe).  The staged copy
+     is written without fsync (it is temporary and is checked below), switched
+     to journal_mode=DELETE so it is a single self-contained file, then
+     checked with PRAGMA quick_check.  A database that can't be copied or
+     fails the check (a damaged file) is listed as failed in the manifest and
+     the others are still copied: the run is then 'partial'.
+  2. Only then are the other stored files listed: files under
+     <system>/archive/ (history retention writes a row there before it
+     deletes it from its database, so a row missing from a staged database
+     is in a listed archive file; a .jsonl archive is copied up to its last
+     complete line), the previous Manager's <name>/usage.jsonl, and the
+     <db>.post-upgrade-<stamp> files tools/rollback_upgrade.py set aside.
+  3. Staged databases and those files are copied to
+     <dest_dir>/snapshot-<UTC stamp>.partial/ with a plain file copy (SQLite
+     never opens a file on the share), hashing as they go.  The run creates
+     that folder itself with an atomic mkdir (the next second's if it exists:
+     two Managers sharing dest_dir never write into the same one).
+  4. With verify_copy (default) every copied file is read back from the
      destination and its SHA-256 compared.
-  4. manifest.json (files, sizes, hashes, row counts) is written last, then
-     the folder is renamed to snapshot-<stamp>.  A folder without the
-     .partial suffix is therefore always complete.
-  5. Old snapshots are pruned: the newest `keep_daily`, plus the newest one
-     of each of the last `keep_monthly` months, are kept.  Only folders named
-     snapshot-<stamp> that hold a manifest.json, and our own stale .partial
-     folders, are ever deleted; nothing else in dest_dir is touched.
+  5. manifest.json (files, sizes, hashes, row counts, and the databases that
+     failed) is written last, then the folder is renamed to snapshot-<stamp>.
+     A folder without the .partial suffix therefore holds every file its
+     manifest lists.
+  6. Old snapshots are pruned: the newest `keep_daily`, plus the newest one
+     of each of the last `keep_monthly` months, are kept; for a database that
+     failed in a kept snapshot, the newest snapshot with a good copy of it is
+     kept too.  Only this Manager's own snapshots (manifest host and
+     source_data_dir) and its own stale .partial folders are ever deleted;
+     nothing else in dest_dir is touched.
 
-Status (last success / failure) is kept in <data_dir>/snapshot-status.json and
-served by GET /api/snapshot.
+Not copied: the pre-upgrade *.bak copies (each a full copy of a database,
+needed only to go back to the f086e7e Manager), a collector's own files in a
+shared data_dir, logs, lock files and the staging folder.
+
+Status (last success / partial run / failure) is kept in
+<data_dir>/snapshot-status.json and served by GET /api/snapshot.
 
 Check a snapshot by hand:
     python snapshot.py verify <dest_dir>/snapshot-<stamp>
@@ -42,7 +66,11 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+
+# file: URIs that also work for a UNC path (`verify` of a snapshot on the NAS
+# share, staging from a data_dir on one); storage_util is standard library
+# only, like this module
+from storage_util import sqlite_uri
 
 logger = logging.getLogger('snapshot')
 
@@ -51,6 +79,9 @@ NAME_RE = re.compile(r'^snapshot-(\d{8}T\d{6}Z)$')
 PARTIAL_RE = re.compile(r'^snapshot-(\d{8}T\d{6}Z)\.partial$')
 PARTIAL_SUFFIX = '.partial'
 MANIFEST = 'manifest.json'
+# Written into a .partial folder when it is created, removed just before the
+# manifest: says which Manager may prune the folder if the run never finishes
+PARTIAL_OWNER = 'partial-owner.json'
 STATUS_FILE = 'snapshot-status.json'
 STAGING_DIR = '.snapshot-staging'
 STAMP_FMT = '%Y%m%dT%H%M%SZ'
@@ -60,6 +91,8 @@ BUSY_TIMEOUT_S = 60
 SPACE_MARGIN = 1.1
 SPACE_FLOOR = 64 * 1024 * 1024
 STALE_PARTIAL_SECONDS = 24 * 3600
+# tools/rollback_upgrade.py MOVED_INFIX: <db>.post-upgrade-<stamp>[-wal|-journal]
+MOVED_INFIX = '.post-upgrade-'
 
 DEFAULTS = {
     'enabled': False,
@@ -149,18 +182,47 @@ def _iso(t: float) -> str:
     return datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-def find_sources(data_dir: str) -> list:
+def find_databases(data_dir: str) -> list:
     """
-    [(relative path with '/', absolute path, 'db' | 'file')] to snapshot:
-    metrics.db, every <system>/data.db, and files under <system>/archive/
-    (history moved out of data.db by history retention).  Pre-upgrade .bak
-    files, a collector's own JSONL archive in a shared data_dir, logs and
-    lock files are left out.
+    [(relative path with '/', absolute path)] of the databases to snapshot,
+    in staging order: every <system>/data.db (sorted), then metrics.db LAST
+    (see the module docstring).
     """
     out = []
+    try:
+        entries = sorted(os.listdir(data_dir))
+    except OSError:
+        entries = []
+    for name in entries:
+        if name.startswith('.'):
+            continue
+        db = os.path.join(data_dir, name, 'data.db')
+        if os.path.isfile(db):
+            out.append((f'{name}/data.db', db))
     central = os.path.join(data_dir, 'metrics.db')
     if os.path.isfile(central):
-        out.append(('metrics.db', central, 'db'))
+        out.append(('metrics.db', central))
+    return out
+
+
+def _moved_aside(filename: str, base: str) -> bool:
+    """<base>.post-upgrade-<stamp> and its -wal / -journal (a -shm holds no data)."""
+    return filename.startswith(base + MOVED_INFIX) and not filename.endswith('-shm')
+
+
+def find_files(data_dir: str) -> list:
+    """
+    [(relative path with '/', absolute path)] of the other stored files:
+    everything under <system>/archive/ (history moved out of a database by
+    history retention), the previous Manager's <name>/usage.jsonl, and the
+    <db>.post-upgrade-<stamp> files tools/rollback_upgrade.py moved aside.
+    Pre-upgrade .bak files, a collector's own files in a shared data_dir,
+    logs, lock files and the staging folder are left out.
+    """
+    out = []
+
+    def add(path):
+        out.append((os.path.relpath(path, data_dir).replace(os.sep, '/'), path))
     try:
         entries = sorted(os.listdir(data_dir))
     except OSError:
@@ -168,31 +230,60 @@ def find_sources(data_dir: str) -> list:
     for name in entries:
         if name.startswith('.'):
             continue
-        sysdir = os.path.join(data_dir, name)
-        if not os.path.isdir(sysdir):
+        path = os.path.join(data_dir, name)
+        if not os.path.isdir(path):
+            if _moved_aside(name, 'metrics.db') and os.path.isfile(path):
+                add(path)
             continue
-        db = os.path.join(sysdir, 'data.db')
-        if os.path.isfile(db):
-            out.append((f'{name}/data.db', db, 'db'))
-        archive = os.path.join(sysdir, 'archive')
+        try:
+            names = sorted(os.listdir(path))
+        except OSError:
+            continue
+        for fn in names:
+            f = os.path.join(path, fn)
+            if (fn == 'usage.jsonl' or _moved_aside(fn, 'data.db')) and os.path.isfile(f):
+                add(f)
+        archive = os.path.join(path, 'archive')
         if os.path.isdir(archive):
             for root, dirs, files in os.walk(archive):
                 dirs.sort()
-                for f in sorted(files):
-                    p = os.path.join(root, f)
-                    rel = os.path.relpath(p, data_dir).replace(os.sep, '/')
-                    out.append((rel, p, 'file'))
+                for fn in sorted(files):
+                    add(os.path.join(root, fn))
     return out
 
 
-def _source_bytes(path: str, kind: str) -> int:
-    total = 0
-    for p in ((path, path + '-wal') if kind == 'db' else (path,)):
-        try:
-            total += os.path.getsize(p)
-        except OSError:
-            pass
-    return total
+def _is_archive_jsonl(rel: str) -> bool:
+    parts = rel.split('/')
+    return len(parts) >= 3 and parts[1] == 'archive' and rel.endswith('.jsonl')
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _whole_lines_size(path: str) -> int:
+    """
+    Bytes of `path` up to and including its last newline.  History retention
+    may be appending to an archive file (the Manager's thread, or
+    archive_metrics.py run by hand) while it is copied; what follows the last
+    newline is then a line still being written, whose rows are still in
+    their database (retention deletes rows only after their lines are
+    written), so leaving it out loses nothing and keeps the copy a valid
+    JSONL file that later appends can't corrupt.
+    """
+    with open(path, 'rb') as f:
+        pos = f.seek(0, os.SEEK_END)
+        while pos > 0:
+            step = min(CHUNK, pos)
+            f.seek(pos - step)
+            i = f.read(step).rfind(b'\n')
+            if i >= 0:
+                return pos - step + i + 1
+            pos -= step
+    return 0
 
 
 def _sha256(path: str) -> str:
@@ -203,19 +294,36 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _copy_hash(src: str, dst: str) -> tuple:
-    """Plain byte copy src -> dst (fsync'd), returning (size, sha256)."""
+def _copy_hash(src: str, dst: str, limit: int = None) -> tuple:
+    """Plain byte copy src -> dst (fsync'd; at most `limit` bytes), returning (size, sha256)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     h = hashlib.sha256()
     size = 0
     with open(src, 'rb') as fi, open(dst, 'wb') as fo:
-        for block in iter(lambda: fi.read(CHUNK), b''):
+        while limit is None or size < limit:
+            block = fi.read(CHUNK if limit is None else min(CHUNK, limit - size))
+            if not block:
+                break
             fo.write(block)
             h.update(block)
             size += len(block)
         fo.flush()
         os.fsync(fo.fileno())
     return size, h.hexdigest()
+
+
+def _open_staged(path: str) -> sqlite3.Connection:
+    """
+    The connection a staged copy is written through.  synchronous=OFF: the
+    staged file is temporary (an interrupted run leaves only staging files,
+    removed at the next start or run) and is checked by quick_check and
+    SHA-256 before anything relies on it, so it needs no fsync.  An fsync of
+    the whole copy would make the live Manager's own commits wait for the
+    disk, and with them every collector's request.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute('PRAGMA synchronous=OFF')
+    return conn
 
 
 def _stage_database(src_path: str, staged: str) -> dict:
@@ -226,12 +334,11 @@ def _stage_database(src_path: str, staged: str) -> dict:
     """
     os.makedirs(os.path.dirname(staged), exist_ok=True)
     # mode=rw: never create a database that has just been deleted
-    uri = Path(os.path.abspath(src_path)).as_uri() + '?mode=rw'
-    src = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_S)
+    src = sqlite3.connect(sqlite_uri(src_path, 'mode=rw'), uri=True, timeout=BUSY_TIMEOUT_S)
     dst = None
     try:
         src.execute(f'PRAGMA busy_timeout = {BUSY_TIMEOUT_S * 1000}')
-        dst = sqlite3.connect(staged)
+        dst = _open_staged(staged)
         # One step: a stepwise backup restarts whenever another connection
         # writes, which the live Manager does every few seconds.  In WAL mode
         # the read transaction this holds doesn't block those writers.
@@ -323,6 +430,37 @@ def list_snapshots(dest_dir: str) -> list:
     return sorted(out)
 
 
+def _read_json(path: str):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def keep_good_copies(snaps: list, keep: set) -> set:
+    """
+    `keep` plus, for every database listed as failed in a kept snapshot's
+    manifest, the newest snapshot that holds a good copy of it, so pruning
+    never deletes the last good copy of a database that has since been
+    damaged.  snaps: [(stamp, path, manifest)].
+    """
+    keep = set(keep)
+    while True:
+        failed = {f.get('path') for stamp, _, m in snaps if stamp in keep
+                  for f in (m.get('failed') or []) if isinstance(f, dict)}
+        added = False
+        for rel in sorted(p for p in failed if p):
+            good = [stamp for stamp, _, m in snaps
+                    if any(isinstance(e, dict) and e.get('path') == rel and e.get('kind') == 'db'
+                           for e in (m.get('files') or []))]
+            if good and max(good) not in keep:
+                keep.add(max(good))
+                added = True
+        if not added:
+            return keep
+
+
 # --------------------------------------------------------------------------- #
 # Runner                                                                      #
 # --------------------------------------------------------------------------- #
@@ -335,9 +473,11 @@ class SnapshotRunner:
         self.settings = settings
         self.log = log or logger
         self._lock = threading.Lock()
+        self._trigger_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = None
+        self._manual = False
         self.running_since = None
         self.next_run = None
         self.status = self._load_status()
@@ -349,12 +489,8 @@ class SnapshotRunner:
         return os.path.join(self.data_dir, STATUS_FILE)
 
     def _load_status(self) -> dict:
-        try:
-            with open(self.status_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        data = _read_json(self.status_path)
+        return data if isinstance(data, dict) else {}
 
     def _save_status(self):
         tmp = self.status_path + '.tmp'
@@ -379,8 +515,8 @@ class SnapshotRunner:
             'next_run': self.next_run,
         }
         body.update({k: self.status.get(k) for k in (
-            'last_attempt', 'last_success', 'last_snapshot', 'last_bytes', 'last_files',
-            'last_seconds', 'last_failure', 'last_error')})
+            'last_attempt', 'last_result', 'last_success', 'last_partial', 'last_snapshot',
+            'last_bytes', 'last_files', 'last_failed', 'last_seconds', 'last_failure', 'last_error')})
         last = self.status.get('last_success')
         body['hours_since_success'] = None
         if last:
@@ -397,28 +533,44 @@ class SnapshotRunner:
     def run(self, reason: str = 'scheduled') -> dict:
         """
         Take one snapshot now (blocking).  Returns {'status': 'ok', ...},
-        {'status': 'busy'} if one is already running, or
-        {'status': 'error', 'error': ...}.  Never raises.
+        {'status': 'partial', ..., 'failed': [...]} if some database could
+        not be copied (the others were), {'status': 'busy'} if one is
+        already running, or {'status': 'error', 'error': ...}.  Never raises.
         """
         if not self._lock.acquire(blocking=False):
             return {'status': 'busy'}
+        with self._trigger_lock:
+            self._manual = False        # a pending request is served by this run
         started = time.time()
         self.running_since = _iso(started)
         self.status['last_attempt'] = self.running_since
         try:
             result = self._run_locked(reason, started)
+            now = _iso(time.time())
             self.status.update({
-                'last_success': _iso(time.time()),
+                'last_result': result['status'],
                 'last_snapshot': result['path'],
                 'last_bytes': result['bytes'],
                 'last_files': result['files'],
+                'last_failed': [f['path'] for f in result['failed']],
                 'last_seconds': result['seconds'],
             })
+            if result['failed']:
+                msg = 'partial snapshot, not copied: ' + '; '.join(
+                    f"{f['path']} ({f['error']})" for f in result['failed'])
+                self.status.update({'last_partial': now, 'last_failure': now, 'last_error': msg})
+                self.log.error(f"Snapshot {result['stamp']} ({reason}) is PARTIAL: {msg}. Every other "
+                               f"database was copied; the newest snapshot with a good copy of "
+                               f"{'each' if len(result['failed']) > 1 else 'that'} database is kept "
+                               f"until it is copied again.")
+            else:
+                self.status['last_success'] = now
             self._save_status()
-            return dict(result, status='ok')
+            return dict(result)
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
-            self.status.update({'last_failure': _iso(time.time()), 'last_error': msg})
+            self.status.update({'last_result': 'error', 'last_failure': _iso(time.time()),
+                                'last_error': msg})
             self._save_status()
             self.log.error(f"Snapshot to {self.settings['dest_dir']} FAILED ({reason}): {msg}",
                            exc_info=True)
@@ -427,14 +579,55 @@ class SnapshotRunner:
             self.running_since = None
             self._lock.release()
 
+    def _new_stamp(self, dest_dir: str, started: float) -> tuple:
+        """
+        (stamp, final folder, .partial folder) for a run started at `started`.
+        The .partial folder is created here, with os.mkdir, which is atomic
+        (also on an SMB share): of two Managers sharing dest_dir that start in
+        the same second only one gets it, so a run only ever writes into and
+        removes a .partial folder it created itself.  A folder of that second
+        may exist already (a manual run right after another one, or another
+        Manager's run): take the next second rather than fail.
+        """
+        t = started
+        for _ in range(5):
+            stamp = utc_stamp(t)
+            final = os.path.join(dest_dir, PREFIX + stamp)
+            part = final + PARTIAL_SUFFIX
+            if not os.path.exists(final):
+                try:
+                    os.mkdir(part)
+                except FileExistsError:
+                    pass
+                else:
+                    if not os.path.exists(final):
+                        return stamp, final, part
+                    # its owner renamed that second's .partial meanwhile: ours is still empty
+                    os.rmdir(part)
+            time.sleep(max(0.0, int(t) + 1 - time.time()) + 0.01)
+            t = time.time()
+        raise FileExistsError(f"{final} already exists")
+
+    def _owner(self) -> dict:
+        return {'host': socket.gethostname(), 'source_data_dir': os.path.abspath(self.data_dir)}
+
+    def owns(self, info) -> bool:
+        """True if a manifest (or a .partial folder's owner file) was written by this Manager."""
+        if not isinstance(info, dict):
+            return False
+        host, src = info.get('host'), info.get('source_data_dir')
+        if not isinstance(host, str) or not isinstance(src, str) or not src:
+            return False
+        return host.lower() == socket.gethostname().lower() and _norm(src) == _norm(self.data_dir)
+
     def _run_locked(self, reason: str, started: float) -> dict:
         dest_dir = self.settings['dest_dir']
-        stamp = utc_stamp(started)
-        sources = find_sources(self.data_dir)
-        if not any(kind == 'db' for _, _, kind in sources):
+        databases = find_databases(self.data_dir)
+        if not databases:
             raise FileNotFoundError(f"No databases found in data_dir {self.data_dir!r}")
 
-        need = int(sum(_source_bytes(p, k) for _, p, k in sources) * SPACE_MARGIN) + SPACE_FLOOR
+        need = int((sum(_size(p) + _size(p + '-wal') for _, p in databases) +
+                    sum(_size(p) for _, p in find_files(self.data_dir))) * SPACE_MARGIN) + SPACE_FLOOR
         staging_root = os.path.join(self.data_dir, STAGING_DIR)
         self._clear_staging(staging_root)
         os.makedirs(staging_root, exist_ok=True)
@@ -449,39 +642,57 @@ class SnapshotRunner:
             raise OSError(f"Not enough free space in {dest_dir}: "
                           f"{free_dest:,} bytes free, about {need:,} needed")
 
-        final = os.path.join(dest_dir, PREFIX + stamp)
-        part = final + PARTIAL_SUFFIX
-        if os.path.exists(final) or os.path.exists(part):
-            raise FileExistsError(f"{final} already exists")
+        stamp, final, part = self._new_stamp(dest_dir, started)     # creates `part`: ours
         staging = os.path.join(staging_root, stamp)
-
-        self.log.info(f"Snapshot {stamp} ({reason}): {len(sources)} file(s) from "
-                      f"{self.data_dir} to {dest_dir}")
-        files = []
+        files, failed = [], []
         try:
-            os.makedirs(part)
-            for rel, path, kind in sources:
-                target = os.path.join(part, *rel.split('/'))
-                entry = {'path': rel, 'kind': kind}
-                if kind == 'db':
-                    staged = os.path.join(staging, *rel.split('/'))
-                    try:
-                        entry.update(_stage_database(path, staged))
-                    except sqlite3.OperationalError as e:
-                        if not os.path.exists(path):   # deleted meanwhile (DELETE /api/system)
-                            self.log.warning(f"Snapshot {stamp}: {rel} disappeared, skipped")
-                            continue
-                        raise sqlite3.OperationalError(f"{rel}: {e}") from e
-                    size, digest = _copy_hash(staged, target)
-                    os.remove(staged)
-                else:
-                    try:
-                        size, digest = _copy_hash(path, target)
-                    except FileNotFoundError:
+            self.log.info(f"Snapshot {stamp} ({reason}): {len(databases)} database(s) from "
+                          f"{self.data_dir} to {dest_dir}")
+            owner = os.path.join(part, PARTIAL_OWNER)
+            with open(owner, 'w', encoding='utf-8') as f:
+                json.dump(dict(self._owner(), stamp=stamp), f)
+
+            # 1. Every database into local staging, metrics.db last
+            staged_dbs = []
+            for rel, path in databases:
+                staged = os.path.join(staging, *rel.split('/'))
+                try:
+                    info = _stage_database(path, staged)
+                except sqlite3.Error as e:
+                    if isinstance(e, sqlite3.OperationalError) and not os.path.exists(path):
+                        # deleted meanwhile (DELETE /api/system)
                         self.log.warning(f"Snapshot {stamp}: {rel} disappeared, skipped")
                         continue
+                    msg = f"{type(e).__name__}: {e}"
+                    self.log.error(f"Snapshot {stamp}: {rel} could NOT be copied ({msg}); "
+                                   f"copying the other databases")
+                    failed.append({'path': rel, 'kind': 'db', 'error': msg})
+                    continue
+                staged_dbs.append((rel, staged, info))
+            if not staged_dbs:
+                raise sqlite3.DatabaseError(
+                    "no database could be copied: " +
+                    ('; '.join(f"{f['path']}: {f['error']}" for f in failed) or 'all disappeared'))
+
+            # 2. The other files, listed only now (see the module docstring)
+            others = find_files(self.data_dir)
+
+            # 3. Copy to dest_dir
+            for rel, staged, info in staged_dbs:
+                size, digest = _copy_hash(staged, os.path.join(part, *rel.split('/')))
+                os.remove(staged)
+                entry = {'path': rel, 'kind': 'db'}
+                entry.update(info)
                 entry.update({'bytes': size, 'sha256': digest})
                 files.append(entry)
+            for rel, path in others:
+                try:
+                    limit = _whole_lines_size(path) if _is_archive_jsonl(rel) else None
+                    size, digest = _copy_hash(path, os.path.join(part, *rel.split('/')), limit)
+                except FileNotFoundError:
+                    self.log.warning(f"Snapshot {stamp}: {rel} disappeared, skipped")
+                    continue
+                files.append({'path': rel, 'kind': 'file', 'bytes': size, 'sha256': digest})
 
             if self.settings['verify_copy']:
                 for entry in files:
@@ -500,9 +711,12 @@ class SnapshotRunner:
                 'host': socket.gethostname(),
                 'source_data_dir': os.path.abspath(self.data_dir),
                 'verified_copy': bool(self.settings['verify_copy']),
+                'complete': not failed,
                 'total_bytes': total,
                 'files': files,
+                'failed': failed,
             }
+            os.remove(owner)
             mpath = os.path.join(part, MANIFEST)
             with open(mpath, 'w', encoding='utf-8') as f:
                 json.dump(manifest, f, indent=2)
@@ -510,7 +724,7 @@ class SnapshotRunner:
                 os.fsync(f.fileno())
             _rename_dir(part, final)
         except BaseException:
-            if os.path.isdir(part):
+            if os.path.isdir(part):         # this run's own (_new_stamp created it)
                 _rmtree(part)
             raise
         finally:
@@ -518,17 +732,17 @@ class SnapshotRunner:
                 _rmtree(staging)
 
         seconds = round(time.time() - started, 1)
-        self.log.info(f"Snapshot {stamp} complete: {len(files)} file(s), {total:,} bytes, "
-                      f"{seconds}s -> {final}")
+        self.log.info(f"Snapshot {stamp} {'complete' if not failed else 'PARTIAL'}: {len(files)} "
+                      f"file(s), {total:,} bytes, {seconds}s -> {final}")
         try:
             self.prune()
         except Exception:
             self.log.error("Pruning old snapshots failed (the new snapshot is complete)",
                            exc_info=True)
-        return {'path': final, 'stamp': stamp, 'files': len(files), 'bytes': total,
-                'seconds': seconds}
+        return {'status': 'partial' if failed else 'ok', 'path': final, 'stamp': stamp,
+                'files': len(files), 'bytes': total, 'seconds': seconds, 'failed': failed}
 
-    def _clear_staging(self, staging_root: str):
+    def _clear_staging(self, staging_root: str, remove_root: bool = False):
         """Remove leftovers of an interrupted run (our own staging folder only)."""
         if not os.path.isdir(staging_root):
             return
@@ -536,18 +750,33 @@ class SnapshotRunner:
             p = os.path.join(staging_root, name)
             if re.fullmatch(r'\d{8}T\d{6}Z', name) and os.path.isdir(p):
                 _rmtree(p)
+        if remove_root:
+            try:
+                os.rmdir(staging_root)
+            except OSError:
+                pass
 
     def prune(self) -> list:
         """
-        Delete snapshots beyond keep_daily / keep_monthly, and our own .partial
-        folders older than a day.  Returns the deleted paths.
+        Delete this Manager's snapshots beyond keep_daily / keep_monthly (and
+        beyond the newest good copy of any database that failed since), and
+        its own .partial folders older than a day.  Snapshots and .partial
+        folders of another Manager or data_dir are never touched.  Returns the
+        deleted paths.
         """
         dest_dir = self.settings['dest_dir']
-        snaps = list_snapshots(dest_dir)
-        keep = snapshots_to_keep([s for s, _ in snaps],
+        snaps, foreign = [], []
+        for stamp, path in list_snapshots(dest_dir):
+            manifest = _read_json(os.path.join(path, MANIFEST))
+            if self.owns(manifest):
+                snaps.append((stamp, path, manifest))
+            else:
+                foreign.append(path)
+        keep = snapshots_to_keep([s for s, _, _ in snaps],
                                  self.settings['keep_daily'], self.settings['keep_monthly'])
+        keep = keep_good_copies(snaps, keep)
         deleted = []
-        for stamp, path in snaps:
+        for stamp, path, _ in snaps:
             if stamp not in keep:
                 _rmtree(path)
                 deleted.append(path)
@@ -556,37 +785,56 @@ class SnapshotRunner:
             m = PARTIAL_RE.match(name)
             p = os.path.join(dest_dir, name)
             if m and os.path.isdir(p) and \
-                    (now - stamp_to_datetime(m.group(1))).total_seconds() > STALE_PARTIAL_SECONDS:
+                    (now - stamp_to_datetime(m.group(1))).total_seconds() > STALE_PARTIAL_SECONDS and \
+                    self.owns(_read_json(os.path.join(p, PARTIAL_OWNER))):
                 _rmtree(p)
                 deleted.append(p)
         for p in deleted:
             self.log.info(f"Pruned old snapshot {p}")
+        if foreign:
+            self.log.info(f"{len(foreign)} snapshot(s) in {dest_dir} were made by another Manager or "
+                          f"from another data_dir; they are never pruned by this one")
         return deleted
 
     # ---- schedule --------------------------------------------------------- #
 
     def missed_last_slot(self, now: datetime = None) -> bool:
-        """True if no snapshot succeeded since the last scheduled time."""
+        """True if no snapshot ran to the end (complete or partial) since the last scheduled time."""
         now = now or datetime.now()
         slot = last_slot_before(now, self.settings['time']).astimezone(timezone.utc)
-        last = self.status.get('last_success')
-        if not last:
-            return True
-        try:
-            done = datetime.strptime(last, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-        except ValueError:
-            return True
-        return done < slot
+        done = None
+        for key in ('last_success', 'last_partial'):
+            try:
+                t = datetime.strptime(self.status.get(key) or '', '%Y-%m-%dT%H:%M:%SZ').replace(
+                    tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            done = t if done is None or t > done else done
+        return done is None or done < slot
 
-    def trigger(self) -> bool:
-        """Ask the scheduler thread to run now.  False if one is running already."""
-        if self._lock.locked():
-            return False
-        self._manual = True
-        self._wake.set()
-        return True
+    def trigger(self) -> str:
+        """
+        Ask the scheduler thread to run now.  'started'; or 'running' (a run
+        is in progress) or 'pending' (an earlier request has not started yet;
+        the run that serves it serves this one too), and then nothing more is
+        queued.
+        """
+        with self._trigger_lock:
+            if self._lock.locked():
+                return 'running'
+            if self._manual:
+                return 'pending'
+            self._manual = True
+            self._wake.set()
+            return 'started'
 
     def start(self):
+        # A Manager killed mid-snapshot leaves its staging copies (as large as
+        # the databases); remove them now, also when snapshots are off
+        try:
+            self._clear_staging(os.path.join(self.data_dir, STAGING_DIR), remove_root=True)
+        except OSError as e:
+            self.log.warning(f"Could not remove old snapshot staging files: {e}")
         if not self.settings['enabled']:
             self.log.info("Snapshots disabled (snapshot.enabled is false)")
             return None
@@ -618,7 +866,6 @@ class SnapshotRunner:
             self._wait(s['startup_delay_seconds'])
             if self._stop.is_set():
                 return
-            self._manual = False
             self.run('catch-up')
         while not self._stop.is_set():
             nxt = next_run_after(datetime.now(), s['time'])
@@ -632,9 +879,7 @@ class SnapshotRunner:
                     break
             if self._stop.is_set():
                 return
-            reason = 'manual' if self._manual else 'scheduled'
-            self._manual = False
-            self.run(reason)
+            self.run('manual' if self._manual else 'scheduled')
 
 
 # --------------------------------------------------------------------------- #
@@ -644,8 +889,9 @@ class SnapshotRunner:
 def verify_snapshot(path: str) -> list:
     """
     Problems found in one snapshot folder ([] = good): every file listed in
-    manifest.json exists with its size and SHA-256, and every database passes
-    PRAGMA quick_check (opened read-only, nothing written next to it).
+    manifest.json exists with its size and SHA-256, every database passes
+    PRAGMA quick_check (opened read-only, nothing written next to it), and no
+    database is listed as failed (a partial snapshot).
     """
     problems = []
     try:
@@ -653,6 +899,8 @@ def verify_snapshot(path: str) -> list:
             manifest = json.load(f)
     except (OSError, ValueError) as e:
         return [f"manifest.json unreadable: {e}"]
+    for entry in manifest.get('failed') or []:
+        problems.append(f"{entry.get('path')}: not in this snapshot (its copy failed: {entry.get('error')})")
     for entry in manifest.get('files', []):
         p = os.path.join(path, *entry['path'].split('/'))
         if not os.path.isfile(p):
@@ -666,8 +914,7 @@ def verify_snapshot(path: str) -> list:
             continue
         if entry.get('kind') == 'db':
             try:
-                conn = sqlite3.connect(Path(os.path.abspath(p)).as_uri() + '?mode=ro&immutable=1',
-                                       uri=True)
+                conn = sqlite3.connect(sqlite_uri(p, 'mode=ro&immutable=1'), uri=True)
                 try:
                     res = conn.execute('PRAGMA quick_check').fetchall()
                 finally:
