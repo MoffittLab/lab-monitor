@@ -15,6 +15,9 @@
   "max_messages_per_request": 10000,
   "history_retention_days": null,
   "backup_before_migration": true,
+  "rollups": {"enabled": true, "backfill_batch_ids": 2000, "backfill_max_duty": 0.5, "max_series_per_table": 5000},
+  "usage_cache_seconds": 300,
+  "ingest_commit_messages": 100,
   "threads": 8,
 
   "snapshot": {

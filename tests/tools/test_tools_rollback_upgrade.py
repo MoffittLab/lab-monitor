@@ -9,6 +9,7 @@ import hashlib
 import http.server
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import threading
@@ -228,14 +229,166 @@ def test_only_new_layout_backups_restore_the_newest_with_a_warning(tmp_path, cap
     assert 'already has the new layout' in capsys.readouterr().out
 
 
+def _review_fix_layout(path, rows, central=False, usage_metrics=False):
+    """A database as the review-fix release leaves it (or, usage_metrics, as the usage-metrics release does)."""
+    if central:
+        _db(path, rows)
+    else:
+        _new_layout(path, rows)
+    con = sqlite3.connect(path)
+    if central:
+        con.execute('CREATE TABLE dead_letter (id INTEGER PRIMARY KEY)')
+    if usage_metrics:
+        con.execute('CREATE TABLE device_session_snapshot (name TEXT)' if central else
+                    'CREATE TABLE _rollup_series (id INTEGER PRIMARY KEY)')
+    con.commit()
+    con.close()
+
+
+@pytest.fixture
+def twice_upgraded(tmp_path):
+    """f086e7e -> review-fix (first backups) -> usage-metrics (second backups, of the review-fix layout)."""
+    d = tmp_path / 'data'
+    central = str(d / 'metrics.db')
+    _db(central + '.pre-upgrade-20261101T100000Z.bak', ['central-f086e7e'])
+    _review_fix_layout(central + '.pre-upgrade-20261201T100000Z.bak', ['central-review-fix'], central=True)
+    _review_fix_layout(central, ['central-usage-metrics'], central=True, usage_metrics=True)
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-review-fix'])
+    _review_fix_layout(atl, ['atl-usage-metrics'], usage_metrics=True)
+    return d
+
+
+def test_refuses_to_go_back_past_the_review_fix_release(twice_upgraded, capsys):
+    """The way back to the review-fix release is starting its code (docs/UPGRADE.md), not this tool."""
+    d = twice_upgraded
+    before = _tree(d)
+    assert rb.main(['--data-dir', str(d)]) == 0                       # the plan, with the warning
+    out = capsys.readouterr().out
+    assert 'past the review-fix release' in out and '--past-review-fix' in out and 'do NOT run this tool' in out
+    assert 'the review-fix layout, copied by the usage-metrics release' in out
+    for extra in ([], ['--use-oldest']):
+        assert rb.main(['--data-dir', str(d), '--apply', '--force'] + extra) == 2
+        assert 'Refused: nothing was changed' in capsys.readouterr().out
+        assert _tree(d) == before
+    assert rb.main(['--data-dir', str(d), '--apply', '--force', '--past-review-fix']) == 0
+    assert _rows(str(d / 'atlantis' / 'data.db')) == ['atl-f086e7e']
+    assert _rows(str(d / 'metrics.db')) == ['central-f086e7e']
+
+
+def test_going_back_from_usage_metrics_straight_to_f086e7e_needs_no_flag(tmp_path, capsys):
+    """f086e7e -> usage-metrics (no review-fix release in between): its only backups have the old layout."""
+    d = tmp_path / 'data'
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl, ['atl-usage-metrics'], usage_metrics=True)
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 0
+    assert _rows(atl) == ['atl-f086e7e']
+    assert 'past the review-fix release' not in capsys.readouterr().out
+
+
+def _killed_after(path, sql):
+    """`path` in WAL mode with `sql` committed to its -wal only: a Manager killed before its next checkpoint."""
+    live = os.path.join(os.path.dirname(path), 'live-' + os.path.basename(path))
+    shutil.copyfile(path, live)
+    con = sqlite3.connect(live)
+    con.execute('PRAGMA journal_mode=WAL')
+    con.execute('PRAGMA wal_autocheckpoint=0')
+    con.execute(sql)
+    con.commit()
+    for suffix in ('', '-wal'):
+        shutil.copyfile(live + suffix, path + suffix)
+    con.close()
+    for suffix in ('', '-wal', '-shm'):
+        if os.path.exists(live + suffix):
+            os.remove(live + suffix)
+
+
+@pytest.fixture
+def twice_upgraded_then_killed(tmp_path):
+    """As twice_upgraded, but the usage-metrics Manager was killed right after its first start."""
+    d = tmp_path / 'data'
+    central = str(d / 'metrics.db')
+    _db(central + '.pre-upgrade-20261101T100000Z.bak', ['central-f086e7e'])
+    _review_fix_layout(central + '.pre-upgrade-20261201T100000Z.bak', ['central-review-fix'], central=True)
+    _review_fix_layout(central, ['central-usage-metrics'], central=True)
+    _killed_after(central, 'CREATE TABLE device_session_snapshot (name TEXT)')
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-review-fix'])
+    _review_fix_layout(atl, ['atl-usage-metrics'])
+    _killed_after(atl, 'CREATE TABLE _rollup_series (id INTEGER PRIMARY KEY)')
+    return d
+
+
+def test_the_guard_sees_tables_that_are_only_in_the_wal(twice_upgraded_then_killed, capsys):
+    """
+    Stop-ScheduledTask and Stop-Process -Force kill the Manager: its new tables can be in
+    the -wal only.  immutable=1 ignores the -wal, so the guard reads a private copy of
+    database + -wal; nothing is written next to the live files.
+    """
+    d = twice_upgraded_then_killed
+    for db, new_table in ((d / 'metrics.db', 'device_session_snapshot'), (d / 'atlantis' / 'data.db', '_rollup_series')):
+        con = sqlite3.connect('file:%s?mode=ro&immutable=1' % db, uri=True)
+        try:
+            # what immutable=1 sees: the new table is not there
+            assert new_table not in {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+        finally:
+            con.close()
+        assert os.path.getsize(str(db) + '-wal') > 0
+    before = _tree(d)
+    assert rb.usage_metrics_ran(str(d)) is True
+    assert rb.main(['--data-dir', str(d)]) == 0
+    out = capsys.readouterr().out
+    assert 'the review-fix layout, copied by the usage-metrics release' in out and 'do NOT run this tool' in out
+    assert 'a copy of a partly migrated database' not in out
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 2
+    assert 'Refused: nothing was changed' in capsys.readouterr().out
+    assert _tree(d) == before
+
+
+def test_a_wal_that_cannot_be_read_counts_as_the_usage_metrics_release(twice_upgraded_then_killed, capsys,
+                                                                       monkeypatch):
+    d = twice_upgraded_then_killed
+
+    def no_space(*a, **kw):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(rb, '_tables_with_wal', lambda db: no_space())
+    assert rb.usage_metrics_ran(str(d)) is None
+    before = _tree(d)
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 2
+    out = capsys.readouterr().out
+    assert 'could not be read' in out and 'Refused: nothing was changed' in out
+    assert _tree(d) == before
+    # restoring anyway still works, on request
+    assert rb.main(['--data-dir', str(d), '--apply', '--force', '--past-review-fix']) == 0
+    assert _rows(str(d / 'atlantis' / 'data.db')) == ['atl-f086e7e']
+
+
+def test_a_wal_without_the_new_tables_is_not_the_usage_metrics_release(tmp_path):
+    """A review-fix Manager killed with data in its -wal: read through the copy, no new tables, no refusal."""
+    d = tmp_path / 'data'
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-partly'])
+    _review_fix_layout(atl, ['atl-review-fix'])
+    _killed_after(atl, "INSERT INTO t VALUES ('only-in-wal')")
+    assert rb.usage_metrics_ran(str(d)) is False
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 0
+    assert _rows(atl) == ['atl-f086e7e']
+
+
 def test_manager_data_layout_with_snapshot_files_and_a_killed_managers_wal(tmp_path):
     """
     The review-fix layout: the databases in their own manager-data folder (an absolute
     data_dir in the config), the nightly snapshots' status file and a killed snapshot's
     staging leftover next to them, and a live database whose newest rows are only in its
-    -wal (the Manager was killed, not stopped).  The tool decides nothing from a live
-    database (it reads only the .bak files), so that -wal goes aside with its database and
-    stays readable there; the snapshot files are no system and are left as they are.
+    -wal (the Manager was killed, not stopped).  The tool decides nothing from this live
+    database (its only backup has the old layout, so the usage-metrics guard never reads
+    it; when the guard does, it reads a private copy: test_the_guard_sees_tables_that_are_
+    only_in_the_wal), so that -wal goes aside with its database and stays readable there;
+    the snapshot files are no system and are left as they are.
     """
     d = tmp_path / 'E' / 'manager-data'
     atl = str(d / 'atlantis' / 'data.db')
@@ -298,3 +451,31 @@ def test_a_data_dir_on_a_share(data_dir, monkeypatch):
     monkeypatch.undo()
     assert _rows(str(data_dir / 'atlantis' / 'data.db')) == ['atl-original']
     assert _rows(str(data_dir / 'metrics.db')) == ['central-original']
+
+
+def test_the_guard_on_a_share_reads_the_wal_copy_too(twice_upgraded_then_killed, monkeypatch, tmp_path):
+    """
+    The usage-metrics guard on a data_dir on a share, with the newest tables only in a
+    -wal (the Manager was killed): both its read-only open of the live file and its read
+    of the private copy (here in a TEMP folder that is a share too) need the UNC-safe
+    URI.  With pathlib's file://server/share/... SQLite refuses both, and the guard could
+    only answer "unknown".  POSIX emulation as in test_a_data_dir_on_a_share.
+    """
+    if os.name == 'nt':
+        pytest.skip('POSIX emulation of a UNC path (needs a real share on Windows)')
+    import tempfile
+    from pathlib import PureWindowsPath
+    d = twice_upgraded_then_killed
+    before = _tree(d)
+    tmp = tmp_path / 'share-temp'
+    tmp.mkdir()
+    monkeypatch.setattr(rb, '_WINDOWS', True, raising=False)
+    monkeypatch.setattr(rb, 'Path', PureWindowsPath)
+    monkeypatch.setattr(tempfile, 'tempdir', '/' + os.path.abspath(str(tmp)))
+    unc = '/' + os.path.abspath(str(d))
+    assert rb.usage_metrics_ran(unc) is True
+    code, _items = rb.rollback(unc, apply=True, out=lambda *_: None)
+    assert code == 2                                       # refused, as on a local disk
+    monkeypatch.undo()
+    assert _tree(d) == before
+    assert os.listdir(str(tmp)) == []                      # the private copy is gone again

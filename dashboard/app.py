@@ -193,12 +193,45 @@ NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
 # ISO-8601 date or date-time, as sent by the chart range controls
 ISO_TS_RE = re.compile(r'^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?)?(Z|[+-]\d{2}:?\d{2})?$')
 MAX_FIELD_LEN = 512
+# storage_breakdown history fields embed a folder path ("folder/<path>/bytes"),
+# and paths may be up to 4096 characters (R10)
+MAX_BREAKDOWN_FIELD_LEN = 4400
+MAX_FOLDER_LEN = 4096
+MAX_ENTITY_LEN = 256
+HISTORY_RESOLUTIONS = frozenset({'auto', 'raw', 'hour', 'day'})
 
 # Manager endpoints polled for every /api/data refresh.  The device registry
 # is the core call: without it the dashboard has no authoritative system list.
-CORE_ENDPOINT  = '/api/devices'
+CORE_ENDPOINT      = '/api/devices'
+SESSIONS_ENDPOINT  = '/api/sessions/all'
+HEALTH_ENDPOINT    = '/api/storage/health/all'
+BREAKDOWN_ENDPOINT = '/api/storage/breakdown/all'
+USAGE_ENDPOINT     = '/api/user_metrics/usage'     # the Manager defaults to window=24h
 POLL_ENDPOINTS = (CORE_ENDPOINT, '/api/metrics/all', '/api/usage/all',
-                  '/api/totals', '/api/user_metrics/all')
+                  '/api/totals', '/api/user_metrics/all',
+                  SESSIONS_ENDPOINT, HEALTH_ENDPOINT, BREAKDOWN_ENDPOINT, USAGE_ENDPOINT)
+
+# Endpoints an older Manager doesn't have (R7): its 404 means "feature not
+# available", which is neither an error nor a degraded poll.  Value: the key
+# in the /api/data "features" dict.
+OPTIONAL_ENDPOINTS = {
+    SESSIONS_ENDPOINT:  'sessions',
+    HEALTH_ENDPOINT:    'storage_health',
+    BREAKDOWN_ENDPOINT: 'breakdown',
+    USAGE_ENDPOINT:     'usage',
+}
+
+# Slow-changing data is fetched at most once per TTL (seconds), whatever the
+# refresh interval.  Sessions change every run and are fetched every poll.
+ENDPOINT_TTL = {
+    BREAKDOWN_ENDPOINT: 600,
+    USAGE_ENDPOINT:     300,
+    HEALTH_ENDPOINT:    60,
+}
+
+# A user row is hidden when it is this much older than the system's latest
+# system_metrics: the Manager keeps the last row of users who logged off.
+STALE_USER_SECONDS = 120
 
 ManagerResult = namedtuple('ManagerResult', 'data error status')
 
@@ -245,6 +278,35 @@ class _TTLCache:
 
 _data_cache = _TTLCache()
 
+
+class _EndpointCache:
+    """
+    Last answer of each ENDPOINT_TTL path, kept apart from the /api/data
+    cache.  Only answers are stored (parsed JSON, or a 404 = feature absent);
+    a failed fetch is never stored, so it can't replace a good value - the
+    failure is reported for that poll and the next poll fetches again.
+    """
+
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._entries = {}    # path -> (ManagerResult, expires)
+
+    def clear(self):
+        with self._lock:
+            self._entries.clear()
+
+    def get(self, path: str):
+        with self._lock:
+            entry = self._entries.get(path)
+            return entry[0] if entry is not None and _monotonic() < entry[1] else None
+
+    def put(self, path: str, result: ManagerResult, ttl: float):
+        with self._lock:
+            self._entries[path] = (result, _monotonic() + ttl)
+
+
+_endpoint_cache = _EndpointCache()
+
 # Sign-in state.  _signing_key is derived from the key file and the password
 # hash (None while auth is off); _login_failures counts wrong passwords per
 # client address.  Wall clock for cookie ages (patched in tests).
@@ -263,6 +325,7 @@ def init_app(config: dict, logger: logging.Logger):
     with _session_lock:
         _session = None
     _data_cache.clear()
+    _endpoint_cache.clear()
     with _login_lock:
         _login_failures.clear()
     _signing_key = _make_signing_key(config['auth'], logger) if config.get('auth') else None
@@ -320,6 +383,71 @@ def _to_int(val):
     return int(v) if v is not None else None
 
 
+_TS_PARTS_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?'
+                          r'(Z|[+-]\d{2}:?\d{2})?$')
+
+
+def _parse_ts(ts):
+    """Epoch seconds of a Manager timestamp (no zone = UTC), or None if unparseable."""
+    m = _TS_PARTS_RE.match(ts.strip()) if isinstance(ts, str) else None
+    if not m:
+        return None
+    year, month, day, hour, minute, sec, frac, zone = m.groups()
+    try:
+        dt = datetime(int(year), int(month), int(day), int(hour), int(minute), int(sec or 0),
+                      tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    secs = dt.timestamp() + (float('0.' + frac) if frac else 0.0)
+    if zone and zone != 'Z':
+        offset = int(zone[1:3]) * 3600 + int(zone[-2:]) * 60
+        secs -= offset if zone[0] == '+' else -offset
+    return secs
+
+
+def _clean_str(val, max_len: int):
+    """val if it is a str of at most max_len characters, else None."""
+    return val if isinstance(val, str) and len(val) <= max_len else None
+
+
+def _str_list(val, max_len: int, max_items: int) -> list:
+    """The str entries (each at most max_len characters) of a list; [] otherwise."""
+    if not isinstance(val, list):
+        return []
+    return [v for v in val[:max_items] if isinstance(v, str) and len(v) <= max_len]
+
+
+def _str_map(val, max_len: int = 64) -> dict:
+    """{str: str} entries of a dict, such as {source: status}; {} otherwise."""
+    if not isinstance(val, dict):
+        return {}
+    return {k: v for k, v in val.items()
+            if isinstance(k, str) and isinstance(v, str) and len(k) <= max_len and len(v) <= max_len}
+
+
+def _pick(row: dict, numbers=(), strings=None, flags=(), lists=None) -> dict:
+    """
+    The known keys of one nested row from a Manager response: numbers via
+    _to_float (unmeasured stays null), strings only as str within their
+    length limit, flags only as bool, lists as lists of short strings.
+    Keys the row doesn't have stay absent; anything else is dropped.
+    """
+    out = {}
+    for key in numbers:
+        if key in row:
+            out[key] = _to_float(row[key])
+    for key, max_len in (strings or {}).items():
+        if key in row:
+            out[key] = _clean_str(row[key], max_len)
+    for key in flags:
+        if key in row:
+            out[key] = row[key] if isinstance(row[key], bool) else None
+    for key, max_items in (lists or {}).items():
+        if key in row:
+            out[key] = _str_list(row[key], 64, max_items)
+    return out
+
+
 def _json_safe(obj):
     """
     Replace NaN/inf floats with None, recursively.  Python's json emits them as
@@ -353,6 +481,16 @@ def _valid_system_name(name: str) -> bool:
     Every segment is URL-quoted before it is forwarded.
     """
     return _valid_name(name) or (name.strip('.') != '' and name in _registered_names)
+
+
+def _has_dot_segment(path: str) -> bool:
+    """True if a '/' or '\\' separated path has a '.' or '..' segment."""
+    return any(seg in ('.', '..') for seg in path.replace('\\', '/').split('/'))
+
+
+def _valid_entity(entity: str) -> bool:
+    """History ?entity= (a username): 1-256 printable characters, as the Manager checks."""
+    return 1 <= len(entity) <= MAX_ENTITY_LEN and entity.isprintable()
 
 
 def _manager_headers() -> dict:
@@ -392,7 +530,9 @@ def _manager_fetch(path: str, params: dict = None) -> ManagerResult:
         return ManagerResult(None, 'request failed', None)
 
     if r.status_code != 200:
-        _logger.warning(f"Manager {path} returned {r.status_code}")
+        # An older Manager answers 404 to the optional endpoints on every poll (R7)
+        log = _logger.debug if r.status_code == 404 and path in OPTIONAL_ENDPOINTS else _logger.warning
+        log(f"Manager {path} returned {r.status_code}")
         reason = {
             401: 'HTTP 401 (Manager rejected manager_token)',
             403: 'HTTP 403 (manager_token is not allowed to read)',
@@ -530,16 +670,209 @@ def parse_folder_usage(raw: dict) -> dict:
 
 
 def fetch_manager_state() -> dict:
-    """Fetch every POLL_ENDPOINTS path concurrently. Returns {path: ManagerResult}."""
-    futures = {path: _executor.submit(_manager_fetch, path) for path in POLL_ENDPOINTS}
+    """
+    Fetch every POLL_ENDPOINTS path concurrently. Returns {path: ManagerResult}.
+    ENDPOINT_TTL paths are answered from _endpoint_cache while their last
+    answer is younger than the TTL.
+    """
     results = {}
+    futures = {}
+    for path in POLL_ENDPOINTS:
+        cached = _endpoint_cache.get(path) if path in ENDPOINT_TTL else None
+        if cached is not None:
+            results[path] = cached
+        else:
+            futures[path] = _executor.submit(_manager_fetch, path)
     for path, future in futures.items():
         try:
-            results[path] = future.result()
+            res = future.result()
         except Exception as e:   # _manager_fetch handles request errors; this is a bug guard
             _logger.error(f"Unexpected error fetching {path}: {e}", exc_info=True)
-            results[path] = ManagerResult(None, 'internal error', None)
+            res = ManagerResult(None, 'internal error', None)
+        results[path] = res
+        if path in ENDPOINT_TTL and (res.error is None or res.status == 404):
+            _endpoint_cache.put(path, res, ENDPOINT_TTL[path])
     return results
+
+
+# ---------------------------------------------------------------------------
+# Optional sections (sessions, storage health, storage owners, usage totals).
+# Each cleaner keeps only the keys the frontend knows, with numbers as
+# numbers-or-null and strings within the R10 limits; non-dict rows are
+# dropped.  Every string still goes through escapeHtml() in the browser.
+# ---------------------------------------------------------------------------
+
+# New system_metrics keys (spec §11), copied into systems[name]['metrics']
+SYSTEM_METRIC_NUMBERS = (
+    'interval_s', 'cpu_count', 'cpu_iowait_percent', 'cpu_steal_percent', 'proc_cpu_coverage_percent',
+    'disk_read_bytes_per_s', 'disk_write_bytes_per_s', 'disk_read_iops', 'disk_write_iops',
+    'disk_await_ms', 'disk_busy_max_percent', 'gpu_sample_seconds',
+)
+GPU_USER_NUMBERS = ('vram_bytes', 'util_percent', 'processes')
+GPU_NUMBERS      = ('users_truncated', 'unattributed_vram_bytes', 'unattributed_processes')
+MAX_GPU_USERS    = 64
+
+SESSION_SUMMARY_NUMBERS = ('_schema', '_collect_seconds', 'clients_total', 'users_total', 'rdp_disconnected')
+SESSION_SUMMARY_STRINGS = {'_unit': 16, '_detail': 16, '_list_state': 16, '_list_hash': 64}
+SESSION_COUNT_RE        = re.compile(r'^[a-z][a-z0-9]{0,15}_(clients|users)$')
+SESSION_ROW_STRINGS     = {'service': 16, 'username': 256, 'client': 64, 'client_host': 256,
+                           'since': 40, 'state': 16, 'source': 16}
+MAX_SESSION_ROWS        = 5000
+
+HEALTH_STATUSES = frozenset({'ok', 'warning', 'critical', 'unknown'})
+ARRAY_NUMBERS   = ('members_total', 'members_active', 'degraded', 'sync_percent', 'sync_speed_kbps',
+                   'sync_eta_seconds', 'mismatch_cnt', 'size_bytes')
+ARRAY_STRINGS   = {'id': 64, 'kind': 16, 'name': 64, 'level': 16, 'role': 16, 'state': 32,
+                   'status': 16, 'sync_action': 16}
+DISK_NUMBERS    = ('size_bytes', 'temperature_c', 'power_on_hours', 'reallocated_sectors', 'pending_sectors',
+                   'uncorrectable_sectors', 'read_errors_uncorrected', 'write_errors_uncorrected',
+                   'wear_used_percent', 'remaining_life_percent', 'bad_sectors', 'io_errors')
+DISK_STRINGS    = {'id': 64, 'model': 128, 'serial': 64, 'media': 16, 'bus': 16, 'status': 16,
+                   'health_source': 16, 'device_state': 32}
+VOLUME_STRINGS  = {'id': 64, 'fs': 32, 'health': 32, 'status': 16}
+
+BREAKDOWN_TOTALS = ('bytes', 'files', 'cold_1y_bytes', 'cold_3y_bytes')
+MAX_OWNER_ROWS   = 1000
+MAX_FOLDER_ROWS  = 10000
+
+USAGE_USER_NUMBERS = ('samples', 'cpu_core_hours', 'avg_cores', 'peak_cores',
+                      'gpu_busy_hours', 'gpu_held_hours', 'peak_gpu_vram_bytes')
+
+
+def _dict_rows(val, max_rows: int) -> list:
+    return [r for r in val[:max_rows] if isinstance(r, dict)] if isinstance(val, list) else []
+
+
+def _clean_gpu(g: dict) -> dict:
+    """One gpus[i] entry: passed through, with the per-user detail cleaned."""
+    out = dict(g)
+    out.update(_pick(g, GPU_NUMBERS))
+    if 'users' in g:
+        users = g['users']
+        # null: no per-process data for this GPU; anything else non-list is treated the same
+        out['users'] = [
+            {'username': u['username'], **_pick(u, GPU_USER_NUMBERS)}
+            for u in _dict_rows(users, MAX_GPU_USERS)
+            if _clean_str(u.get('username'), 256) is not None
+        ] if isinstance(users, list) else None
+    return out
+
+
+def _drop_stale_users(users: list, metrics_ts) -> list:
+    """
+    Drop user rows more than STALE_USER_SECONDS older than the latest
+    system_metrics (the Manager never deletes the snapshot rows of users who
+    logged off).  Rows are kept when either timestamp is missing or unparseable.
+    """
+    ref = _parse_ts(metrics_ts)
+    if ref is None:
+        return users
+    kept = []
+    for u in users:
+        ts = _parse_ts(u.get('timestamp'))
+        if ts is None or ref - ts <= STALE_USER_SECONDS:
+            kept.append(u)
+    return kept
+
+
+def _clean_sessions(entry: dict) -> dict:
+    """One /api/sessions/all entry: {timestamp, list_timestamp, list_confirmed_at, summary, sessions}."""
+    raw = entry.get('summary') if isinstance(entry.get('summary'), dict) else {}
+    summary = _pick(raw, SESSION_SUMMARY_NUMBERS, SESSION_SUMMARY_STRINGS, flags=('sessions_truncated',))
+    for key, val in raw.items():
+        if isinstance(key, str) and SESSION_COUNT_RE.match(key):
+            summary[key] = _to_float(val)
+    summary['_sources'] = _str_map(raw.get('_sources'))
+    return {
+        'timestamp':         _clean_str(entry.get('timestamp'), 40),
+        'list_timestamp':    _clean_str(entry.get('list_timestamp'), 40),
+        'list_confirmed_at': _clean_str(entry.get('list_confirmed_at'), 40),
+        'summary':           summary,
+        'sessions':          [_pick(r, ('connections',), SESSION_ROW_STRINGS)
+                              for r in _dict_rows(entry.get('sessions'), MAX_SESSION_ROWS)],
+    }
+
+
+def _health_status(row: dict) -> dict:
+    """Statuses outside the shared vocabulary read as null (shown as unknown)."""
+    if row.get('status') not in HEALTH_STATUSES:
+        row['status'] = None
+    return row
+
+
+def _clean_storage_health(entry: dict) -> dict:
+    """One /api/storage/health/all entry (the flattened history keys are not sent)."""
+    events = entry.get('events')
+    reasons = entry.get('status_reasons')
+    # A list or dict here is unhashable: test the type before the set lookup
+    overall = entry.get('overall_status')
+    return {
+        'timestamp':      _clean_str(entry.get('timestamp'), 40),
+        'overall_status': overall if isinstance(overall, str) and overall in HEALTH_STATUSES else None,
+        'status_reasons': [r[:200] for r in reasons[:10] if isinstance(r, str)] if isinstance(reasons, list) else [],
+        'sources':        _str_map(entry.get('sources')),
+        'arrays':  [_health_status(_pick(a, ARRAY_NUMBERS, ARRAY_STRINGS,
+                                         lists={'faulty_members': 512, 'members': 512}))
+                    for a in _dict_rows(entry.get('arrays'), 128)],
+        'disks':   [_health_status(_pick(d, DISK_NUMBERS, DISK_STRINGS, ('smart_passed', 'in_standby'),
+                                         lists={'arrays': 128}))
+                    for d in _dict_rows(entry.get('disks'), 512)],
+        'volumes': [_health_status(_pick(v, (), VOLUME_STRINGS, ('read_only',)))
+                    for v in _dict_rows(entry.get('volumes'), 64)],
+        'events':  {k: _to_float(v) for k, v in events.items() if isinstance(k, str) and len(k) <= 64}
+                   if isinstance(events, dict) else None,
+    }
+
+
+def _clean_owner_totals(val):
+    """A device / other block: {bytes, files, cold_1y_bytes, cold_3y_bytes[, owner_count]}, or None."""
+    return _pick(val, BREAKDOWN_TOTALS + ('owner_count',)) if isinstance(val, dict) else None
+
+
+def _clean_owner_rows(val):
+    """owners rows; None (owners not collected) stays None, unlike [] (collected, none)."""
+    if not isinstance(val, list):
+        return None
+    return [{'owner': r['owner'], **_pick(r, BREAKDOWN_TOTALS)}
+            for r in _dict_rows(val, MAX_OWNER_ROWS) if _clean_str(r.get('owner'), 256) is not None]
+
+
+def _clean_breakdown(entry: dict) -> dict:
+    """One /api/storage/breakdown/all entry (folder totals plus the device owner rollup)."""
+    device = entry.get('device')
+    if isinstance(device, dict):
+        device = dict(_clean_owner_totals(device),
+                      owners=_clean_owner_rows(device.get('owners')),
+                      other=_clean_owner_totals(device.get('other')))
+    else:
+        device = None
+    thresholds = entry.get('cold_thresholds_days')
+    return {
+        'timestamp':            _clean_str(entry.get('timestamp'), 40),
+        'reference_time':       _clean_str(entry.get('reference_time'), 40),
+        'owner_source':         _clean_str(entry.get('owner_source'), 32),
+        'cold_thresholds_days': [_to_float(t) for t in thresholds[:2]] if isinstance(thresholds, list) else None,
+        'device':               device,
+        'folders':              [_pick(f, BREAKDOWN_TOTALS + ('top_owner_bytes',),
+                                       {'path': MAX_FOLDER_LEN, 'folder_owner': 256, 'top_owner': 256})
+                                 for f in _dict_rows(entry.get('folders'), MAX_FOLDER_ROWS)
+                                 if _clean_str(f.get('path'), MAX_FOLDER_LEN) is not None],
+        'folders_truncated':    entry.get('folders_truncated') is True,
+    }
+
+
+def _clean_usage(resp: dict, entry: dict) -> dict:
+    """One device of /api/user_metrics/usage, with the window it covers."""
+    return {
+        'window':   _clean_str(resp.get('window'), 16),
+        'from':     _clean_str(resp.get('from'), 40),
+        'to':       _clean_str(resp.get('to'), 40),
+        'source':   _clean_str(entry.get('source'), 16),
+        'complete': entry.get('complete') if isinstance(entry.get('complete'), bool) else None,
+        'users':    [{'username': u['username'], **_pick(u, USAGE_USER_NUMBERS)}
+                     for u in _dict_rows(entry.get('users'), 1000)
+                     if _clean_str(u.get('username'), 256) is not None],
+    }
 
 
 def _blank_system(name: str, device_type='unknown') -> dict:
@@ -552,28 +885,37 @@ def _blank_system(name: str, device_type='unknown') -> dict:
 
 def get_all_systems_data(results: dict = None) -> tuple:
     """
-    Merge the Manager responses (system_metrics, folder_usage, totals, users)
-    into a single dict keyed by system name.
+    Merge the Manager responses (system_metrics, folder_usage, totals, users,
+    and on Managers that have them sessions, storage health, storage owners
+    and usage totals) into a single dict keyed by system name.
 
     Returns:
-        (systems, global_totals, errors) where systems is
+        (systems, global_totals, errors, features) where systems is
         {
             "Triton": {
-                "name":        "Triton",
-                "device_type": "synology",
-                "metrics":     { cpu_percent, ram_percent, ... } or None,
-                "disk":        { folders, volumes, total_usage_bytes, ... } or None,
+                "name":           "Triton",
+                "device_type":    "synology",
+                "metrics":        { cpu_percent, ram_percent, ... } or None,
+                "disk":           { folders, volumes, total_usage_bytes, ... } or None,
+                "sessions":       { timestamp, list_confirmed_at, summary, sessions }   (when reported)
+                "storage_health": { overall_status, status_reasons, disks, ... }        (when reported)
+                "breakdown":      { device, folders, ... }                              (when reported)
+                "usage":          { window, users: [...] }                              (when reported)
             },
             ...
         }
-        and errors is [{"endpoint": path, "error": reason}, ...] for every
-        Manager call that failed or returned an unexpected shape.
+        errors is [{"endpoint": path, "error": reason}, ...] for every
+        Manager call that failed or returned an unexpected shape, and
+        features is {sessions, storage_health, breakdown, usage}: true when
+        the Manager answered, false when it doesn't have the endpoint (404,
+        R7 - not an error), null when the call failed.
     """
     global _registered_names
     if results is None:
         results = fetch_manager_state()
 
     errors: list = []
+    features: dict = {}
 
     def _payload(path: str, expected_type=dict):
         res = results.get(path) or ManagerResult(None, 'not fetched', None)
@@ -585,6 +927,23 @@ def get_all_systems_data(results: dict = None) -> tuple:
             errors.append({'endpoint': path, 'error': 'unexpected response'})
             return expected_type()
         return res.data
+
+    def _optional(path: str) -> dict:
+        """_payload for an OPTIONAL_ENDPOINTS path."""
+        res = results.get(path)
+        key = OPTIONAL_ENDPOINTS[path]
+        absent = res is not None and (
+            res.status == 404
+            # An older Manager routes /api/user_metrics/usage to
+            # /api/user_metrics/<device_name> and answers with a user list
+            or (path == USAGE_ENDPOINT and res.error is None and isinstance(res.data, list)))
+        if absent:
+            features[key] = False
+            return {}
+        failures = len(errors)
+        data = _payload(path)
+        features[key] = True if len(errors) == failures else None
+        return data
 
     systems: dict = {}
 
@@ -615,7 +974,7 @@ def get_all_systems_data(results: dict = None) -> tuple:
         systems.setdefault(name, _blank_system(name, data.get('device_type')))
         units = data.get('units')
         gpus  = data.get('gpus')
-        systems[name]['metrics'] = {
+        metrics = {
             'timestamp':                    data.get('timestamp'),
             'cpu_percent':                  data.get('cpu_percent'),
             'ram_percent':                  data.get('ram_percent'),
@@ -627,8 +986,16 @@ def get_all_systems_data(results: dict = None) -> tuple:
             'network_bandwidth_in_mbps':    data.get('network_bandwidth_in_mbps'),
             'network_bandwidth_out_mbps':   data.get('network_bandwidth_out_mbps'),
             'units':                        units if isinstance(units, dict) else {},
-            'gpus':                         [g for g in gpus if isinstance(g, dict)] if isinstance(gpus, list) else [],
+            'gpus':                         [_clean_gpu(g) for g in gpus if isinstance(g, dict)] if isinstance(gpus, list) else [],
         }
+        # Counter-based fields (spec §11), only when the Manager sends them, so
+        # an older Manager's answer comes out exactly as before
+        for key in SYSTEM_METRIC_NUMBERS:
+            if key in data:
+                metrics[key] = _to_float(data[key])
+        if 'disk_busy_max_name' in data:
+            metrics['disk_busy_max_name'] = _clean_str(data['disk_busy_max_name'], 32)
+        systems[name]['metrics'] = metrics
 
     # --- disk snapshots ---
     for name, data in _payload('/api/usage/all').items():
@@ -653,7 +1020,22 @@ def get_all_systems_data(results: dict = None) -> tuple:
     # --- per-user metrics snapshot ---
     for name, users in _payload('/api/user_metrics/all').items():
         if name in systems and isinstance(users, list):
-            systems[name]['users'] = [u for u in users if isinstance(u, dict)]
+            metrics_ts = (systems[name].get('metrics') or {}).get('timestamp')
+            systems[name]['users'] = _drop_stale_users([u for u in users if isinstance(u, dict)], metrics_ts)
+
+    # --- optional sections: an older Manager answers 404 and they stay absent ---
+    for path, key, clean in ((SESSIONS_ENDPOINT,  'sessions',       _clean_sessions),
+                             (HEALTH_ENDPOINT,    'storage_health', _clean_storage_health),
+                             (BREAKDOWN_ENDPOINT, 'breakdown',      _clean_breakdown)):
+        for name, entry in _optional(path).items():
+            if name in systems and isinstance(entry, dict):
+                systems[name][key] = clean(entry)
+
+    usage_resp = _optional(USAGE_ENDPOINT)
+    usage_devices = usage_resp.get('devices')
+    for name, entry in (usage_devices.items() if isinstance(usage_devices, dict) else ()):
+        if name in systems and isinstance(entry, dict):
+            systems[name]['usage'] = _clean_usage(usage_resp, entry)
 
     # Surface most-recent timestamp per system
     for sys_ in systems.values():
@@ -664,7 +1046,7 @@ def get_all_systems_data(results: dict = None) -> tuple:
     global_totals = totals_resp.get('global', {})
     if not isinstance(global_totals, dict):
         global_totals = {}
-    return systems, global_totals, errors
+    return systems, global_totals, errors, features
 
 
 def build_data_payload() -> tuple:
@@ -673,7 +1055,7 @@ def build_data_payload() -> tuple:
       - 502 + success:false when the core call (device registry) failed
       - 200 + degraded:true when only some of the other calls failed
     """
-    systems, global_totals, errors = get_all_systems_data(fetch_manager_state())
+    systems, global_totals, errors, features = get_all_systems_data(fetch_manager_state())
     now = _utc_now_iso()
 
     if any(e['endpoint'] == CORE_ENDPOINT for e in errors):
@@ -691,6 +1073,7 @@ def build_data_payload() -> tuple:
         "errors":        errors,
         "systems":       systems,
         "global_totals": global_totals,
+        "features":      features,
     }), 200
 
 
@@ -699,6 +1082,9 @@ def downsample(points: list, max_points: int) -> list:
     Bucket-average a time-ordered [{timestamp, value}] list down to at most
     max_points entries.  Fallback for Managers that ignore ?max_points.
     Each bucket keeps its middle timestamp and the mean of its non-null values.
+    Points that are aggregates themselves ({min, max, count}, from rollups)
+    merge into min of mins, max of maxes and summed counts, and the mean is
+    weighted by count.
     """
     n = len(points)
     if max_points <= 0 or n <= max_points:
@@ -707,11 +1093,19 @@ def downsample(points: list, max_points: int) -> list:
     out = []
     for start in range(0, n, bucket):
         chunk  = points[start:start + bucket]
-        values = [v for v in (_to_float(p.get('value')) for p in chunk) if v is not None]
-        out.append({
-            'timestamp': chunk[len(chunk) // 2].get('timestamp'),
-            'value':     (sum(values) / len(values)) if values else None,
-        })
+        valued = [(v, p) for v, p in ((_to_float(p.get('value')), p) for p in chunk) if v is not None]
+        counts = [_to_float(p.get('count')) for _, p in valued]
+        point  = {'timestamp': chunk[len(chunk) // 2].get('timestamp'), 'value': None}
+        if valued and all(c is not None and c > 0 for c in counts):
+            point['value'] = sum(v * c for (v, _), c in zip(valued, counts)) / sum(counts)
+            point['count'] = int(sum(counts))
+        elif valued:
+            point['value'] = sum(v for v, _ in valued) / len(valued)
+        for key, pick in (('min', min), ('max', max)):
+            vals = [x for x in (_to_float(p.get(key)) for p in chunk) if x is not None]
+            if vals:
+                point[key] = pick(vals)
+        out.append(point)
     return out
 
 
@@ -1048,8 +1442,8 @@ def get_metric_history(system_name, data_type, field):
         return _error('Invalid data type', 400)
     # "." / ".." segments would be collapsed by URL normalisation and could
     # reach a different Manager endpoint
-    if not field or len(field) > MAX_FIELD_LEN \
-            or any(seg in ('.', '..') for seg in field.replace('\\', '/').split('/')):
+    max_len = MAX_BREAKDOWN_FIELD_LEN if data_type == 'storage_breakdown' else MAX_FIELD_LEN
+    if not field or len(field) > max_len or _has_dot_segment(field):
         return _error('Invalid field', 400)
 
     from_param = request.args.get('from') or None
@@ -1057,6 +1451,15 @@ def get_metric_history(system_name, data_type, field):
     for ts in (from_param, to_param):
         if ts is not None and not ISO_TS_RE.match(ts):
             return _error('Invalid time range', 400)
+
+    # entity: one user of user_metrics; resolution: raw / hourly / daily data.
+    # Managers before the usage-metrics release ignore both.
+    entity     = request.args.get('entity')
+    resolution = request.args.get('resolution')
+    if entity is not None and not _valid_entity(entity):
+        return _error('Invalid entity', 400)
+    if resolution is not None and resolution not in HISTORY_RESOLUTIONS:
+        return _error('Invalid resolution', 400)
 
     # Bounded response size: the Manager bucket-averages to max_points
     # ("downsampled") and caps raw rows at limit ("truncated").  Older
@@ -1076,6 +1479,10 @@ def get_metric_history(system_name, data_type, field):
         params['from'] = from_param
     if to_param:
         params['to'] = to_param
+    if entity is not None:
+        params['entity'] = entity
+    if resolution is not None:
+        params['resolution'] = resolution
 
     try:
         # URL-encode every path segment so that names, data types and field
@@ -1093,6 +1500,10 @@ def get_metric_history(system_name, data_type, field):
             return _error('Manager unavailable', 502)
 
         data = res.data
+        if entity is not None and data.get('entity') is None:
+            # An older Manager ignored ?entity and answered with every user's
+            # values mixed into one series - not a chart of this user
+            return _error('Per-user history needs a newer Manager', 404)
         points = data.get('data')
         if isinstance(points, list) and len(points) > max_points:
             data['data'] = downsample(points, max_points)
@@ -1102,6 +1513,35 @@ def get_metric_history(system_name, data_type, field):
 
     except Exception as e:
         _logger.error(f"Error fetching metric history: {e}", exc_info=True)
+        return _error('Internal error', 500)
+
+
+@app.route('/api/storage/breakdown/<system_name>')
+def get_storage_breakdown(system_name):
+    """
+    Proxy the Manager's latest storage breakdown of one system, with the full
+    owner rows of ?folder=<path> (every folder when omitted).  The card loads
+    it when a folder's cold-data bar is clicked.  A Manager without storage
+    breakdown, or without data for this system, answers 404.
+    """
+    if not _valid_system_name(system_name):
+        return _error('Invalid system name', 400)
+    folder = request.args.get('folder') or None
+    if folder is not None and (len(folder) > MAX_FOLDER_LEN or _has_dot_segment(folder)):
+        return _error('Invalid folder', 400)
+
+    try:
+        res = _manager_fetch(f"/api/storage/breakdown/{quote(system_name, safe='')}",
+                             params={'folder': folder} if folder is not None else None)
+        if res.status == 404:
+            return _error('Not found', 404)
+        if res.status == 400:
+            return _error('Bad request', 400)
+        if res.error or not isinstance(res.data, dict):
+            return _error('Manager unavailable', 502)
+        return jsonify(_json_safe(res.data)), 200
+    except Exception as e:
+        _logger.error(f"Error fetching storage breakdown: {e}", exc_info=True)
         return _error('Internal error', 500)
 
 

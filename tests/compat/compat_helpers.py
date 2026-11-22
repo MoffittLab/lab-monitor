@@ -11,6 +11,14 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 TOOLS = REPO / 'tools'
 OLD_REF = 'f086e7e'
+# The release before this one: the review-fix release as it will be deployed
+# (fix/review-findings e5cd699: fb6498c plus nightly snapshots, the
+# manager-data layout and the review's snapshot / UNC / verify fixes).  Its
+# database code is fb6498c's, so what it writes is fb6498c-format data; the
+# earlier review-fix commits write the same format and stay covered as old
+# sides of their own (test_compat_verify_current.py: SAME_FORMAT_REFS).
+CURRENT_REF = 'e5cd699'
+SAME_FORMAT_REFS = ('160da09', 'fb6498c')
 OLD_TOKEN = 'fixture-old-auth-token-0123456789abcdef'   # make_old_fixture.TOKEN
 
 
@@ -33,9 +41,20 @@ def build_fixture(old_code, out, *extra):
     return json.loads(r.stdout.decode('utf-8').strip().splitlines()[-1])
 
 
+def build_current_fixture(current_code, old_data, out, *extra):
+    """Run make_current_fixture.py on a copy of old_data (a make_old_fixture.py data_dir); returns its summary."""
+    r = subprocess.run(
+        [sys.executable, str(HERE / 'make_current_fixture.py'), '--current-code', str(current_code),
+         '--old-data', str(old_data), '--out', str(out), *extra],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    assert r.returncode == 0, r.stderr.decode('utf-8', 'replace')[-4000:]
+    return json.loads(r.stdout.decode('utf-8').strip().splitlines()[-1])
+
+
 # A process that dies (os._exit, like a kill) inside a write transaction of
-# `staged`, a complete copy of `src`: what a review-fix Manager killed while
-# it staged a database for its nightly snapshot leaves in
+# `staged`, a complete copy of `src`: what a review-fix (or later) Manager
+# killed while it staged a database for its nightly snapshot leaves in
 # <data_dir>/.snapshot-staging/ (a copy whose changed pages are in the file,
 # with a hot rollback journal that a read-only connection can't roll back).
 _KILLED_STAGING = r'''
@@ -62,7 +81,7 @@ def leave_killed_staging(src_db, staged):
         raise RuntimeError('no hot journal next to %s' % staged)
 
 
-# The lock file a review-fix Manager leaves in every data_dir it ran on:
+# The lock file a review-fix (or later) Manager leaves in every data_dir it ran on:
 # manager/storage_util.py InstanceLock takes <data_dir>/manager.lock at start
 # and never deletes it (the OS releases the lock when the process ends).
 _MANAGER_LOCK = r'''

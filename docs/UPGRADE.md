@@ -12,6 +12,9 @@ live `data_dir`.
 
 Paths below are the installer defaults. Check yours: `data_dir` is in `manager\config.json`.
 
+> The later **usage-metrics release** goes on top of this one, once this procedure is complete. It has
+> its own short section at the end: [The usage-metrics release](#the-usage-metrics-release).
+
 | What | Default |
 |------|---------|
 | Repository (Manager, Dashboard, and on atlantis also the collector) | `E:\Users\lab-monitor\scripts\lab-monitor` |
@@ -52,7 +55,7 @@ checkout and one installer, so steps 3 and 4 do both. Collectors always come las
 | Folder history | One SQLite column per folder (limit 2000 columns; two folders differing only in case broke the insert) | Narrow tables: one row per folder per scan | Large shares could not be stored |
 | Auth | One shared token with full rights; placeholder tokens accepted | Scoped `admin_tokens`, `read_tokens`, `collector_tokens`; placeholder or short tokens stop the Manager | A leaked Dashboard or collector token could delete systems |
 | Network totals | `max(0, current − last)`: traffic since a reboot was lost | A drop with a fresh `uptime_seconds` counts as a reboot and adds the traffic since boot; a drop without a reboot adds nothing | Wrong lifetime totals |
-| Servers | Flask development server, SQLite connections shared between threads | waitress, one lock per connection, one transaction per message | Crashes and lost writes under load |
+| Servers | Flask development server, SQLite connections shared between threads | waitress, one lock per connection, every message stored or rolled back on its own (one transaction per message; the usage-metrics release groups up to 100 per commit: [manager/README.md](../manager/README.md#ingest)) | Crashes and lost writes under load |
 | Dashboard | An outage looked like a healthy page; HTML injection possible; no login | Outage and "degraded" banners, escaping everywhere, optional login, `—` for unmeasured values | Misleading and unsafe page |
 | Tools | Any SSH host key accepted; destructive tools ran without asking | Host keys pinned on first use; confirmations; new `replay_archives.py`, `verify_upgrade.py`, `rollback_upgrade.py` | Safety |
 | Retention | `retention_days` only trimmed the legacy `usage.jsonl` reports | `history_retention_days`, **off** by default | The old setting never pruned the history databases, so yours hold everything since installation; that stays so |
@@ -958,10 +961,16 @@ go away.
 7. Classify every non-PASS item:
    - `source` WARN with only `.db` / `-wal` / `-shm` changes while the live Manager runs: expected.
      A `snapshot-status.json`, `.snapshot-staging\` or `manager.lock` in the `data_dir` (a review-fix
-     Manager ran on it before, e.g. before a rollback) is never copied or opened; only a review-fix
-     Manager changes them, so a WARN that says "its snapshot ran" while the old Manager is the live
-     one means a review-fix Manager is running on this `data_dir` too: stop and find out why. The
-     same changes with no live Manager answering are a FAIL, and so is a changed `manager.lock`.
+     Manager ran on it before, e.g. before a rollback) is never copied or opened. Which changes to them
+     are expected depends on the old side:
+     - `f086e7e` (this procedure): only a review-fix Manager changes them, so a WARN that says "its
+       snapshot ran" while the old Manager is the live one means a review-fix Manager is running on
+       this `data_dir` too: stop and find out why. A new or changed `manager.lock` is always a FAIL
+       (the `f086e7e` Manager never writes it).
+     - A review-fix commit (the usage-metrics upgrade below): the live review-fix Manager writes all
+       three itself, so they are a WARN while it answers, like its database files.
+
+     The same changes with no live Manager answering are a FAIL.
    - `source` FAIL listing only a collector's own files: dual role (see Step 1c); re-run with that
      collector's tasks disabled if a clean PASS is needed.
    - Anything else: reproduce it with `--keep-work` (copy A = old, copy B = new, Manager logs in the
@@ -976,3 +985,164 @@ go away.
    first snapshot (`last_result` `ok`, `snapshot.py verify` prints OK).
 10. Clean up only what you created: the verification work folder (it holds full copies of the data)
     and, when the owner agrees, the `lab-monitor-new` worktree.
+
+---
+
+## The usage-metrics release
+
+The usage-metrics release (`feature/usage-metrics`: per-user CPU-seconds and GPU use, who is connected,
+storage health, storage owners and cold data, hourly and daily rollups) comes **after** the review-fix
+release this guide is about. Start it only once the procedure above is complete: the review-fix release
+verified against the real databases (Step 1) and running in production (Steps 3–5, with the databases in a
+local `manager-data` folder and nightly snapshots, Step 3b). Below, CURRENT means that deployed review-fix
+release (`fix/review-findings` at `e5cd699`, or the merge of it on `main` that is deployed; the earlier
+`160da09` and `fb6498c` write the same databases) and OLD the code before it (`f086e7e`). The owner's rule
+is the same: nothing stored is rewritten or deleted, and every migration is backed up first.
+
+1. **Checks on atlantis** first: [FIELD_CHECKS.md](FIELD_CHECKS.md#atlantis-manager-and-dashboard-server),
+   checks 27–30 (SQLite version, `verify_upgrade.py` on OLD data, the first start on a copy of the CURRENT
+   data, ingest with rollups).
+2. **Back up** as in [Step 0](#step-0-back-up), into a new `$Backup` folder, and record the running commit
+   (`git -C $Repo rev-parse HEAD`): it is the CURRENT commit to go back to.
+3. **Verify against the real data**, as in [Step 1](#step-1-verify-against-your-real-data) but from a
+   checkout of this release and with the commit the server runs as the old side (the live Manager may keep
+   running; see [Verifying CURRENT → usage-metrics](#verifying-current--usage-metrics) below). Upgrade only on
+   PASS.
+4. **Manager and Dashboard together** with the installer, as in [Step 3](#step-3-upgrade-the-manager-and-dashboard)
+   3c and 3d. Step 3b was done for CURRENT and is not repeated: the databases stay in `manager-data`, and the
+   installer keeps the config with its `data_dir` and `snapshot` section as they are. The new Dashboard works
+   with both Manager versions. The first start takes one
+   `metrics.db.pre-upgrade-*.bak` (new per-user columns and snapshot tables) and one `data.db.pre-upgrade-*.bak`
+   per system (before the rollup tables are added, also when its tables hold no row; covering a wide
+   `storage_breakdown` table's migration; none for an empty `data.db` with no table),
+   so it needs free space about the size of the `data_dir` and takes longer, as Step 3 did. It then starts the
+   rollup backfill in the background
+   (`python rollups.py --config config.json --status` in `manager\`, or `GET /api/rollups/status`). Check
+   the next snapshot as in [Step 4](#step-4-check-the-upgraded-server) (`last_result` `ok`, `snapshot.py
+   verify`): the databases are larger now (rollup tables), and so are the snapshots.
+5. **Collectors**, in this order, each after its platform's checks in [FIELD_CHECKS.md](FIELD_CHECKS.md):
+   one Linux GPU server, then one x86 Synology, then one armv7 Synology, then the Windows servers, then
+   the rest. **Never point new collectors at an OLD (`f086e7e`) Manager.** On atlantis the collector runs
+   from the same checkout, so step 4 already upgrades it: run the Windows checks there first, or put the
+   new features' switches (e.g. `"storage_breakdown": {"enabled": false}`) into its collector config
+   before step 4 ([ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md)).
+6. The new defaults (storage breakdown, per-user GPU, sessions, storage health) count as trusted on a
+   platform only once its field checks have passed.
+
+Details: [manager/README.md](../manager/README.md#upgrading-to-the-usage-metrics-release),
+[collector/README.md](../collector/README.md#upgrading-to-the-usage-metrics-release),
+[dashboard/README.md](../dashboard/README.md#usage-metrics-release).
+
+### Verifying CURRENT → usage-metrics
+
+The old side is the code the live Manager runs, so `--old-ref` is the commit recorded in step 2 (`e5cd699`,
+or the merge of it that is deployed); `verify_upgrade.py` recognizes the review-fix release from that code
+and checks with the expectations for it ([tools/README.md, section 8](../tools/README.md#with-the-review-fix-release-as-the-old-side-the-usage-metrics-upgrade)).
+The free space needed is the same as in Step 1 (about 4.5 times the databases plus twice the other files;
+the review-fix upgrade's own `.bak` files count as other files):
+
+```powershell
+conda activate lab-monitor
+$Repo    = "E:\Users\lab-monitor\scripts\lab-monitor"
+$Current = (git -C $Repo rev-parse HEAD).Trim()             # the commit the server runs now
+$Work    = "F:\verify-usage"                                 # a drive with enough free space
+git -C $Repo fetch origin
+git -C $Repo ls-remote origin feature/usage-metrics         # must print one line (see below)
+git -C $Repo worktree add E:\Users\lab-monitor\scripts\lab-monitor-usage origin/feature/usage-metrics
+cd E:\Users\lab-monitor\scripts\lab-monitor-usage
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
+python -u tools\verify_upgrade.py `
+    --manager-config "$Repo\manager\config.json" `
+    --old-ref $Current `
+    --work-dir $Work `
+    --with-dashboard `
+    --report "$Work\report.json" | Tee-Object -FilePath "$Work\console.txt"
+"exit code: $LASTEXITCODE"
+```
+
+`origin/feature/usage-metrics` exists only once the release has been pushed to GitHub, which is the owner's
+decision: if `ls-remote` prints nothing, the `worktree add` fails ("invalid reference"); stop there and don't
+verify against some other copy of the code.
+
+The console must show `OLD side: current (the review-fix release ...)`. Exit code 2 with "the data_dir was
+written by the review-fix release ..., but the old code is f086e7e or older" means `--old-ref` is not what the
+server runs. The live Manager can keep running: its lock file (`manager.lock`), its snapshot status file
+(`snapshot-status.json`) and its snapshot staging folder (`.snapshot-staging\`, including what a snapshot killed
+mid-run left there) are neither copied nor read, and `source` is WARN if only those and its database files
+changed meanwhile. For a strict PASS, run it away from `snapshot.time` (03:30) and from the catch-up run 10
+minutes after a Manager start, and check first that `GET /api/snapshot` shows `"running": false`; or stop the
+Manager. With the Step 3b layout the local collector writes to `E:\Users\lab-monitor\data`, not into the
+Manager's `data_dir`, so its files can't show up there; if they do, Step 3b was not done: handle the `source`
+FAIL as in [Step 1](#step-1-verify-against-your-real-data).
+
+**PASS means**, for this upgrade:
+
+- every table the review-fix release wrote, `folder_usage_legacy`, `folder_usage_msgs`, `folder_usage_items`,
+  `dead_letter` and the review-fix upgrade's own `.bak` copies included, still holds every row unchanged; the new
+  release only added tables and columns (`storage`). That is checked after the migration and again after the
+  tool stored new messages and re-sent stored ones: the rows stored before are still exactly the original rows;
+- every endpoint of the review-fix Manager, rows with their `msg_id`, every chart window, `/api/usage/history`
+  and `/api/dead_letter` included, answers the same from the new Manager, and the new Dashboard shows what the
+  review-fix Dashboard shows plus only its new sections (`endpoints`, `dashboard`); only the intended differences
+  that apply to a review-fix old side are normalized (report: `intended_differences.<id>.old_sides`);
+- messages already stored, re-sent with their own `msg_id` or the way an old collector would, are answered
+  exactly as the review-fix Manager answers them: duplicates, nothing stored twice, no device card or total
+  changed (`legacy-resend`);
+- `metrics.db` and every `data.db` the new release changed got exactly one pre-upgrade copy, identical to the
+  original, also a `data.db` whose tables history retention emptied (`backups`; an index,
+  trigger or view the new release added counts as a change too; an empty `data.db` with no table, which the
+  OLD Manager could leave and CURRENT keeps as it is, needs none): the first start needs
+  free space about the size of the databases;
+- the way back below works: the review-fix Manager started on the migrated data takes no backup, changes no
+  table or schema and gives every answer it gave before the upgrade, and then stores and serves new messages,
+  a new reading of every data type of every system and a usage-metrics collector's batch, since collectors
+  keep running on the way back (`rollback`). The only accepted exception is N22, storage-breakdown runs the
+  new Manager moved out of a wide table (only if a usage-metrics collector already reported to CURRENT), which
+  the section below describes.
+
+Keep `report.json` and `console.txt`; on anything but PASS, don't upgrade and handle it as in Step 1
+("If it is not PASS"). Delete `$Work` afterwards (it holds full copies of the data) and, with the owner's
+agreement, the `lab-monitor-usage` worktree.
+
+### Going back from the usage-metrics release to CURRENT
+
+**Do not run `tools\rollback_upgrade.py` for this.** That tool restores the databases the OLD (`f086e7e`)
+code needs. After OLD → CURRENT → usage-metrics, those are the copies taken before CURRENT, so everything
+stored since (by CURRENT and by the usage-metrics release) would be moved aside to `*.post-upgrade-*`
+files: not lost, but no longer served. It recognizes that case and refuses `--apply` (exit 2, nothing changed)
+unless `--past-review-fix` is given. `verify_upgrade.py`'s `rollback` check (above) tests the way back below on
+a copy of your data: CURRENT must answer every recorded question as before, and store and serve new messages
+from collectors of both releases.
+
+Just start the CURRENT code on the same `data_dir`:
+
+```powershell
+Stop-ScheduledTask -TaskName "Lab Monitor Manager"
+Stop-ScheduledTask -TaskName "Lab Monitor Dashboard"
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match 'manager\.py|app\.py' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+git -C $Repo checkout <the CURRENT commit recorded in step 2: e5cd699 or its merge; not fb6498c (no snapshots)>
+Start-ScheduledTask -TaskName "Lab Monitor Manager"
+Start-ScheduledTask -TaskName "Lab Monitor Dashboard"
+Invoke-RestMethod http://localhost:5000/health
+```
+
+- CURRENT reserves the table prefixes `_` and `storage_breakdown_`, so it ignores the rollup tables and the
+  narrow storage-breakdown tables, takes no backup, and serves and stores everything as before, with one
+  exception: **storage-breakdown history is not shown while CURRENT runs.** The usage-metrics release keeps it
+  in those narrow tables, so CURRENT's `/api/data/<system>/storage_breakdown` lists only the runs CURRENT
+  stores itself (none until the collectors' next daily disk run), and a system without one has no
+  `storage_breakdown` data type. Nothing is lost: the runs are served again after the next upgrade. The
+  configs need no change (the new keys are optional and CURRENT ignores them).
+- Upgraded collectors can keep running: CURRENT stores their new messages in plain tables. Their
+  `storage_breakdown` runs go into a new wide table, which the next upgrade migrates after its own backup.
+  A run CURRENT stored a second time (a batch re-sent because the stop above killed the Manager before its
+  answer, or an archive replay) is copied once.
+- To return to the usage-metrics release, upgrade again (step 3): the rows CURRENT stored meanwhile are rolled
+  up in the background. CURRENT updated each user's latest CPU / RAM row without the per-user usage fields,
+  so the Cores and GPU columns of a user stay empty until a new collector reports that user again (the next
+  metrics run, if the collectors were not rolled back too); the per-user history keeps every value.
+- Never go back further than CURRENT this way: the OLD (`f086e7e`) code does not reserve those prefixes.
+  Going back to OLD is the [Rollback](#rollback) above, with its replay (whose window then starts at the
+  review-fix upgrade).

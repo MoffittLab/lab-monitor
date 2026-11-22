@@ -1,10 +1,14 @@
 """folder_usage: narrow storage, flat read shape, wide->narrow migration."""
 import json
+import logging
 import math
 import os
 import sqlite3
 
-from manager_helpers import READ, auth, make_msg, post_queue
+import archive_metrics
+import data_store
+import manager as mgr
+from manager_helpers import ADMIN, READ, auth, make_msg, post_queue
 
 
 def _folder_payload(n, base=1000):
@@ -147,6 +151,30 @@ def test_wide_to_narrow_migration(make_client, data_dir):
 
     assert sorted(client.get('/api/data/Triton', headers=auth(READ)).get_json()['data_types']) == \
         ['folder_usage', 'system_metrics']
+
+
+def test_retention_skips_folder_usage_until_it_is_migrated(make_client, data_dir, monkeypatch, caplog):
+    _build_old_db(data_dir)
+
+    def fail(*a, **kw):
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(data_store.TypedDataStore, '_migrate_wide_folder_usage', fail)
+    client = make_client()
+    msgs = [make_msg('system_metrics', {'cpu_percent': 1.0}, ts='2026-08-02T00:00:00Z', name='Zeta')]
+    assert post_queue(client, msgs, token=ADMIN, name='Zeta').get_json()['counts']['stored'] == 1
+    log = logging.getLogger('test-retention')
+    with caplog.at_level(logging.WARNING):
+        first = archive_metrics.run_history_retention(mgr._data_store, mgr._metrics_db, data_dir, 30, log)
+        again = archive_metrics.run_history_retention(mgr._data_store, mgr._metrics_db, data_dir, 30, log)
+    # the run goes on to the next system; the wide rows are not archived (again and again)
+    assert first['archived'] == {'zeta/system_metrics': 1} and again['archived'] == {}
+    assert sum('triton/folder_usage: skipped' in r.getMessage() for r in caplog.records) == 2
+    assert not os.path.exists(os.path.join(data_dir, 'triton', 'archive'))
+    assert len(client.get('/api/data/Triton/folder_usage', headers=auth(READ)).get_json()['rows']) == 2
+    monkeypatch.undo()
+    mgr._data_store._get_db('Triton').folder_attempted -= data_store.UPGRADE_RETRY_SECONDS
+    result = archive_metrics.run_history_retention(mgr._data_store, mgr._metrics_db, data_dir, 30, log)
+    assert result['archived']['triton/folder_usage'] == 2
 
 
 def test_migration_runs_once_and_reopen_is_stable(make_client, data_dir):

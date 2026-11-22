@@ -15,6 +15,23 @@ Follow [docs/UPGRADE.md](docs/UPGRADE.md) instead: it backs up and verifies your
 Each collector needs its own token from the Manager config (`collector_tokens`), so install the
 Manager first.
 
+**Upgrading to the usage-metrics release** (per-user GPU and CPU-seconds, who is connected, storage
+health, storage owners, rollups): it goes on top of the review-fix release, once that one is verified
+and deployed ([docs/UPGRADE.md](docs/UPGRADE.md#the-usage-metrics-release)). Order:
+
+1. **Manager and Dashboard** together: re-run `install-manager-dashboard-taskscheduler.ps1`. The new
+   Dashboard works with the old and the new Manager. The Manager's first start backs up `metrics.db`
+   and each system's `data.db` once (before it adds the new tables; a `data.db` with no table needs
+   none), so it needs free space about the size of the `data_dir`, and then starts the rollup backfill
+   in the background.
+2. **Collectors**, one platform at a time, each after its checks in
+   [docs/FIELD_CHECKS.md](docs/FIELD_CHECKS.md): one Linux GPU server, then one x86 Synology, then one
+   armv7 Synology, then the Windows servers, then everything else.
+
+Never point a new collector at an OLD (`f086e7e`) Manager. Re-running a collector installer keeps the
+existing config: the new settings take their defaults; a fresh config lists them all
+([collector/README.md](collector/README.md#usage-metrics-settings)).
+
 **Network:** the Manager (port 5000) and the Dashboard (port 5001) serve plain **HTTP**. Tokens and
 the Dashboard password cross the network unencrypted. Keep them on a trusted network (the installer
 opens both ports in Windows Firewall; restrict them to the collectors' and users' addresses if you
@@ -219,7 +236,14 @@ cd lab-monitor
   the NAS host name in lowercase.
 - Writes `collector/local/config.json` with mode 600 (it holds the token). On a re-run it keeps the
   existing config and asks before restricting a more open one.
-- Runs one metrics collection as a test, then prints the two DSM tasks to create.
+- Runs one metrics collection as a test, then a storage-health dry run as the installing user (nothing
+  sent), and prints what that account can read (`Storage health: ok (hwmon unavailable, md ok, mounts ok,
+  sysfs ok)`), then the two DSM tasks to create.
+
+**What a non-root collector reports on a NAS:** who is connected by client IP for SMB, NFS, AFP, SSH, DSM
+and the other services (SSH logins by name where DSM keeps utmp); RAID state from md; disk state from
+sysfs; temperatures where hwmon has them; per-user CPU and RAM (active users only, by default). SMB user
+names and SMART data need root and are not collected in this release; nothing in it needs root.
 
 **Schedule jobs** (Control Panel -> Task Scheduler -> Create -> Scheduled Task -> User-defined
 script). Run both as the owner of `config.json` (the installing user) or root; with mode 600 no
@@ -284,6 +308,23 @@ Get-Content E:\Users\lab-monitor\logs\collector.log -Tail 20 -Wait
 
 **Edit the config later** (as Administrator):
 `notepad E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`
+
+**Windows notes for the usage-metrics release:**
+- Per-user CPU, disk I/O and the TCP session counts need psutil (installed from
+  `collector\requirements.txt`).
+- Who is connected over RDP and SMB comes from WTS and NetSessionEnum. NetSessionEnum needs
+  Administrators: the SYSTEM task has it; a task running as your account without elevation reports
+  `netsession not_permitted`.
+- **GPU driver model.** The installer prints each GPU's driver model. Under **TCC** per-user GPU memory,
+  held time and busy % are all reported. Under **WDDM** (desktop driver model) NVML gives no per-process
+  memory: `gpu_vram_bytes` is null, held time, process counts and the busy split still work.
+- **The WDDM "C+G" rule.** Under WDDM, desktop programs appear in both the compute and graphics process
+  lists ("C+G" in `nvidia-smi`). The collector counts such processes as graphics: they don't hold the GPU
+  or get a share of its busy %. A CUDA job shows as "C" and is attributed normally.
+- Storage health runs one PowerShell check per hour (`Get-PhysicalDisk`, reliability counters, Storage
+  Spaces, volumes, disk events), killed after `storage_health.timeout_seconds` (90 s). Disks behind a
+  hardware RAID controller show with blank counters.
+- The storage breakdown on Windows has bytes, file counts and cold data, no owners.
 
 On the Manager server itself (atlantis), the collector uses the same checkout but its own data
 folder: the collector writes to `E:\Users\lab-monitor\data`, the Manager keeps its databases in
@@ -355,6 +396,14 @@ Temperature should match within a degree or two and power within a few watts. Ut
 VRAM used can differ by the driver-reserved amount. Causes and fixes:
 [collector/README.md](collector/README.md#gpu-servers).
 
+With the usage-metrics release, the journal also shows one `Sessions: ...` and one `Storage health: ...` line
+per run, and the `CPU:` segment says `(avg <N>s)` (about 300) from the second run on, `(1-s sample)` on the first:
+```bash
+journalctl -u lab-monitor-metrics.service --since '15 min ago' | grep -E 'CPU:|Sessions:|Storage health:'
+```
+Everything these features read is readable by `labmon` inside the existing sandbox; nothing new needs
+root, and SMART is not collected ([collector/README.md](collector/README.md#linux--ubuntu)).
+
 **Fleet tools:** to update, run, pause or archive this collector from `tools/` like the others, add it to
 `collectors.csv` with `platform` = `linux` and add the sudoers rule in
 [tools/README.md](tools/README.md#linux-collectors-platform--linux).
@@ -425,11 +474,15 @@ registered keep working.
 
 1. **Watch the first day:** metrics every 5 minutes, the disk run at 02:00, no errors in the logs,
    every system on the Dashboard.
-2. **Data growth:** history is kept forever by default (`history_retention_days: null`). To archive
+2. **Before trusting the new defaults** on a platform (storage breakdown, per-user GPU, sessions, storage
+   health), run its checks in [docs/FIELD_CHECKS.md](docs/FIELD_CHECKS.md) on the real machines.
+3. **Data growth:** history is kept forever by default (`history_retention_days: null`). To archive
    and prune old rows, set `history_retention_days` in `manager\config.json` (see
    [manager/README.md](manager/README.md#retention)). Collector archives (`YYYY-MM.jsonl`) are never
    deleted by the collector.
-3. **Fleet tools:** [tools/README.md](tools/README.md) (update, pause, run, archive, replay, restart).
+4. **Fleet tools:** [tools/README.md](tools/README.md) (update, pause, run, archive, replay, restart).
+5. **Privacy:** everyone with Dashboard access sees per-user data; turn on the Dashboard login and see
+   [docs/PRIVACY.md](docs/PRIVACY.md) for what is recorded and how to record less.
 
 ---
 
@@ -437,6 +490,7 @@ registered keep working.
 
 - [README.md](README.md) — Project overview
 - [docs/UPGRADE.md](docs/UPGRADE.md) — Upgrading an existing installation
+- [docs/FIELD_CHECKS.md](docs/FIELD_CHECKS.md) — Field checks per platform for the usage-metrics release
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System design
 - [CONFIG.md](CONFIG.md) — Configuration and security
 - [METRICS.md](METRICS.md) — Metrics reference

@@ -48,7 +48,9 @@ E:\Users\lab-monitor\data\             ← the local collector only
     ├── 2026-09.jsonl
     ├── queue.json                ← messages not yet acknowledged
     ├── queue.json.lock           ← queue lock
-    └── network_snapshot.json     ← previous network counters
+    ├── network_snapshot.json     ← previous network counters
+    └── perf_snapshot.json, sessions_state.json, storage_health_state.json,
+        storage_breakdown_state.json  ← usage-metrics state (usage-metrics release)
 
 \\<nas>\<share>\snapshots\              ← snapshot.dest_dir (written by the Manager each night)
 ├── snapshot-20261122T083000Z\
@@ -199,12 +201,14 @@ Manager reads metrics.db (and data.db for history charts)
 |-----------|-------|----------|--------|
 | Collector | `YYYY-MM.jsonl` | `data\<name>\` | Append only |
 | Collector | `queue.json`, `queue.json.lock` | `data\<name>\` | Locked, atomic rewrite |
+| Collector | `perf_snapshot.json` (+ `.lock`), `sessions_state.json`, `storage_health_state.json`, `storage_breakdown_state.json` | `data\<name>\` | Atomic rewrite, after the run's messages are recorded (usage-metrics release) |
 | Manager | `data.db` (+ `-wal`, `-shm`) | `manager-data\<normalized name>\` | SQLite, one locked connection per database |
 | Manager | `metrics.db` (+ `-wal`, `-shm`) | `manager-data\` | SQLite, one locked connection |
 | Manager | `snapshot-<stamp>\` | `snapshot.dest_dir` (NAS) | Written once a night, plain file copy |
 
-- The Manager uses SQLite WAL mode: readers don't block the writer. Writes for one message happen in
-  one transaction. A writer waits up to 10 s for a lock another process holds (for example a database
+- The Manager uses SQLite WAL mode: readers don't block the writer. The messages of one request share
+  one transaction per database (each message in its own savepoint, so a failing message is rolled back
+  alone; `ingest_commit_messages`, default 100), and nothing is acknowledged before it is committed. A writer waits up to 10 s for a lock another process holds (for example a database
   browser with an open transaction); if the database stays locked, the messages are answered `error`
   and stay queued on the collectors.
 - Only **one** Manager may use the data directory. The installer stops older instances before it
@@ -223,7 +227,12 @@ Manager reads metrics.db (and data.db for history charts)
   Manager's databases. The data itself is not changed; the Manager tasks run elevated as an
   administrator and keep access.
 - Upgrading the checkout upgrades the collector together with the Manager: don't do it while
-  atlantis's 02:00 disk run is in progress.
+  atlantis's 02:00 disk run is in progress. For the usage-metrics release this makes atlantis's
+  collector the first Windows collector to get the new features, before the field checks of the other
+  Windows servers ([FIELD_CHECKS.md](FIELD_CHECKS.md#windows-server-2016-2019-2022)). Run those checks on
+  atlantis first, or put the new features' switches (for example `"storage_breakdown": {"enabled":
+  false}`, `"storage_health": {"enabled": false}`) into its collector config before the upgrade; the
+  older collector ignores keys it doesn't know.
 
 ---
 

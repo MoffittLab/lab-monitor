@@ -330,6 +330,31 @@ config = {
     'request_timeout_seconds': 30,
     'max_batch_messages': 100,
     'max_queue_messages': 50000,
+    # Interval counters, per-user metrics (active users only on DSM), who is
+    # connected, storage health and the storage breakdown, spelled out with
+    # their defaults (collector/lib/settings.py, config.synology.example.json)
+    'perf_counters': True,
+    'counter_max_window_seconds': 86400,
+    'user_metrics': 'auto',
+    'user_metrics_min_cores': 0.02,
+    'user_metrics_min_ram_bytes': 1073741824,
+    'user_cpu_count_children': True,
+    'disk_io': True,
+    'disk_io_exclude': [],
+    'sessions': {
+        'enabled': True, 'detail': 'full', 'history': 'changes', 'list_heartbeat_seconds': 3600,
+        'max_entries': 200, 'ports': None, 'extra_ports': {}, 'exclude_clients': [],
+        'timeout_seconds': 20,
+    },
+    'storage_health': {
+        'enabled': True, 'interval_seconds': 3600, 'timeout_seconds': 90,
+        'temperature_c': {'hdd': [50, 60], 'ssd': [70, 80]}, 'ignore': [],
+    },
+    'storage_breakdown': {
+        'enabled': True, 'owners': 'file', 'top_owners': 10, 'device_top_owners': 25,
+        'max_rows': 5000, 'cold_days': [365, 1095], 'name_lookup_budget_seconds': 30,
+        'max_timeout_fraction': 0.6,
+    },
 }
 path = env['LM_CONFIG_FILE']
 with open(path, 'w') as f:
@@ -398,6 +423,20 @@ else
     echo "Log: /tmp/collector-test.log"
     echo "This may be normal if Manager isn't running yet"
 fi
+# What storage health can read as this (non-root) account: RAID state from
+# md, disk state from sysfs, read-only volumes, temperatures where hwmon has
+# them. Nothing is sent (--dry-run).
+echo "Checking storage health as $CURRENT_USER (dry run, nothing sent)..."
+if "$COLLECTOR_PYTHON" collector.py --config local/config.json --mode health --dry-run 2>/dev/null \
+        | "$COLLECTOR_PYTHON" -c 'import json, sys
+d = json.load(sys.stdin)[0]["data"]
+print("   Storage health: %s (%s)" % (d["overall_status"], ", ".join("%s %s" % kv for kv in sorted(d["sources"].items()))))
+for reason in d["status_reasons"]:
+    print("   - " + reason)'; then
+    :
+else
+    echo "   Storage health could not be checked (see $LOGS_DIR/collector.log)"
+fi
 echo ""
 
 echo "=========================================="
@@ -432,4 +471,9 @@ echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $COLLECTOR_PYTHON collector.
 echo ""
 echo "3. Verify jobs run:"
 echo "   tail -f $LOGS_DIR/collector.log"
+echo ""
+echo "Without root this collector reports who is connected by client IP for SMB, NFS, AFP, SSH,"
+echo "DSM and the other services (SSH logins by name where DSM keeps utmp), RAID state from md,"
+echo "and disk state from sysfs. SMB usernames and disk SMART data need root and are not"
+echo "collected in this release."
 echo ""

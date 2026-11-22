@@ -248,7 +248,7 @@ def test_disk_message_reports_timeouts_errors_and_keeps_capacity(
 def test_total_timeout_defaults_to_three_times_per_folder(collector, config, disk_usage, monkeypatch):
     seen = {}
 
-    def fake_scan(folders, timeout, deadline=None):
+    def fake_scan(folders, timeout, deadline=None, breakdown=None):
         seen['timeout'] = timeout
         seen['budget'] = deadline - collector.time.monotonic()
         return {'sizes': {}, 'timed_out': [], 'errors': []}
@@ -415,7 +415,7 @@ def test_total_timeout_default_keeps_per_entry_time_off_windows(collector):
 def test_total_timeout_default_counts_scan_paths(tmp_path, collector, config, monkeypatch):
     seen = {}
 
-    def fake_scan(folders, timeout, deadline=None):
+    def fake_scan(folders, timeout, deadline=None, breakdown=None):
         seen['budget'] = deadline - collector.time.monotonic()
         return {'sizes': {}, 'timed_out': [], 'errors': []}
     monkeypatch.setattr(collector, 'scan_folders', fake_scan)

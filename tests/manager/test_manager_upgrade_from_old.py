@@ -655,17 +655,18 @@ def test_new_machine_with_an_alike_name_gets_its_own_row(make_client, data_dir):
 
 
 def test_tables_of_a_later_manager_are_left_alone(make_client, data_dir):
-    # A later Manager adds _rollup_* and storage_breakdown_* tables to data.db.
-    # Running this one again on such a database must not list them, treat
-    # them as old tables (backup on every start) or fail on them.
+    # A later Manager adds tables under the reserved "_" and "storage_breakdown_"
+    # prefixes to data.db (this one's own are _rollup_* and storage_breakdown_msgs /
+    # _rows / _legacy).  Running this one again on such a database must not list
+    # them, treat them as old tables (backup on every start) or fail on them.
     client = make_client()
     post_queue(client, [make_msg('system_metrics', metrics_payload(), ts='2026-08-05T00:00:00Z')])
     db = os.path.join(data_dir, 'triton', 'data.db')
     con = sqlite3.connect(db)
     try:
         con.execute('CREATE TABLE _rollup_hourly (bucket TEXT, n INTEGER)')
-        con.execute('CREATE TABLE storage_breakdown_msgs (id INTEGER PRIMARY KEY, ts TEXT)')
-        con.execute('CREATE TABLE storage_breakdown_rows (msg INTEGER, owner TEXT)')
+        con.execute('CREATE TABLE storage_breakdown_quota (id INTEGER PRIMARY KEY, ts TEXT)')
+        con.execute('CREATE TABLE storage_breakdown_owners_v2 (msg INTEGER, owner TEXT)')
         con.commit()
     finally:
         con.close()

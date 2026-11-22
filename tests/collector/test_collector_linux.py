@@ -599,18 +599,64 @@ def test_windows_does_not_ask_psutil_for_uids(collector, config, monkeypatch):
 
 @linux_only
 def test_metrics_from_proc_without_psutil(collector, config, monkeypatch):
+    # This host's real /proc: interval counters, disk I/O and per-user CPU
+    # all work without psutil (armv7 DSM units have none)
     monkeypatch.setitem(sys.modules, 'psutil', None)
-    monkeypatch.setattr(collector, 'get_gpu_stats', lambda: [])
+    monkeypatch.setitem(sys.modules, 'pynvml', None)
     captured = []
-    monkeypatch.setattr(collector, '_record_and_sync',
-                        lambda cfg, n, i, entries, log, sync=True: captured.extend(entries) or True)
+
+    def record(cfg, n, entries, log):
+        captured.append(entries)
+        return True
+    monkeypatch.setattr(collector, '_record', record)
+    monkeypatch.setattr(collector, '_sync', lambda *a: True)
     config['platform'] = 'linux'
-    assert collector.collect_metrics(config, logging.getLogger('test')) is True
-    data = captured[0]['data']
-    assert 0 <= data['cpu_percent'] <= 100 and 0 < data['ram_percent'] < 100
-    assert data['total_ram_bytes'] > 0 and data['uptime_seconds'] > 0
-    assert data['network_bytes_in'] is not None and data['network_bytes_out'] is not None
-    assert len(captured) == 1                     # no per-user messages without psutil
+    for run in range(2):
+        assert collector.collect_metrics(config, logging.getLogger('test')) is True
+        if run == 0:
+            # second run more than 5 s later: move the baseline back instead of sleeping
+            path = collector.get_perf_snapshot_path(config, 'testbox')
+            with open(path) as f:
+                snap = json.load(f)
+            snap['boot']['mono'] -= 10
+            snap['boot']['wall'] -= 10
+            with open(path, 'w') as f:
+                json.dump(snap, f)
+    # Each run records twice: the metrics, then the optional collectors' messages
+    runs = [batch for batch in captured if batch[0]['data']['data_type'] == 'system_metrics']
+    first, second = runs[0][0]['data'], runs[1][0]['data']
+    for data in (first, second):
+        assert 0 <= data['cpu_percent'] <= 100 and 0 < data['ram_percent'] < 100
+        assert data['total_ram_bytes'] > 0 and data['uptime_seconds'] > 0
+        assert data['network_bytes_in'] is not None and data['network_bytes_out'] is not None
+    assert first['interval_s'] is None and 9 <= second['interval_s'] <= 30
+    assert second['cpu_iowait_percent'] is not None and second['proc_cpu_coverage_percent'] is not None
+    users = [m['data'] for m in runs[1][1:]]
+    assert users and all(m['data_type'] == 'user_metrics' for m in users)
+    assert all(isinstance(u['cpu_seconds'], float) and u['process_count'] >= 0 for u in users)
+
+
+def test_metrics_unit_lets_the_collector_read_its_sources():
+    # Everything metrics mode reads as labmon, without root or capabilities:
+    # counters, every user's processes, sessions, storage health Tier A, NVML
+    svc = _unit('lab-monitor-metrics.service')['Service']
+    needed = ('/proc/stat', '/proc/uptime', '/proc/diskstats', '/proc/mounts', '/proc/1/stat', '/proc/1/status',
+              '/proc/sys/kernel/random/boot_id', '/proc/net/tcp', '/proc/net/tcp6', '/proc/mdstat',
+              '/sys/block', '/sys/class/hwmon', '/run/utmp', '/run/systemd/sessions', '/etc/passwd',
+              '/etc/login.defs', '/dev/nvidiactl', '/proc/driver/nvidia')
+    hidden = []
+    for key in ('InaccessiblePaths', 'TemporaryFileSystem', 'BindPaths', 'BindReadOnlyPaths'):
+        for value in ' '.join(svc.get(key, [])).split():
+            path = value.lstrip('-+').split(':')[0].rstrip('/')
+            hidden += [(key, p) for p in needed if p == path or p.startswith(path + '/')]
+    assert hidden == []
+    # Not ProtectProc=invisible / ProcSubset=pid / PrivateUsers (other users' /proc entries),
+    # nor PrivateNetwork (/proc/net/tcp would show only the sandbox's own sockets)
+    for key in ('ProtectProc', 'ProcSubset', 'PrivateUsers', 'PrivateNetwork', 'PrivateDevices'):
+        assert svc.get(key, ['no'])[-1] in ('no', 'default'), key
+    # ProtectKernelTunables / ProtectControlGroups only make /proc/sys and /sys read-only
+    assert svc['ProtectSystem'] == ['strict'] and svc['ReadWritePaths'] == ['/var/lib/lab-monitor /var/log/lab-monitor']
+    assert svc.get('AmbientCapabilities', ['']) == [''] and svc['CapabilityBoundingSet'] == ['']
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +735,25 @@ def test_print_config_defaults(monkeypatch):
     assert config['exclude_system_accounts'] is True and config['exclude_users'] == []
     proc, config = _print_config('--token', TOKEN, '--scan-paths', 'none', '--volumes', 'auto')
     assert config['scan_paths'] == [] and 'volumes' not in config
+
+
+@needs_bash
+def test_print_config_spells_out_the_new_keys_like_the_example(collector, tmp_path):
+    # Counters, per-user GPU, sessions, storage health and breakdown: the
+    # same values as config.linux.example.json, and the collector's defaults
+    from lib import settings
+    proc, config = _print_config('--token', TOKEN)
+    assert proc.returncode == 0, proc.stderr
+    with open(os.path.join(REPO_DIR, 'collector', 'config.linux.example.json')) as f:
+        example = json.load(f)
+    for key in settings.SCHEMA:
+        assert settings.raw_value(config, key) == settings.raw_value(example, key), key
+        assert settings.value(config, key) == settings.SCHEMA[key][1], key
+    path = tmp_path / 'printed.json'
+    path.write_text(json.dumps(config))
+    check = subprocess.run([sys.executable, os.path.join(REPO_DIR, 'collector', 'config_tool.py'),
+                            '--config', str(path), 'check'], capture_output=True, text=True, timeout=60)
+    assert check.returncode == 0, check.stdout
 
 
 @needs_bash
@@ -949,6 +1014,13 @@ def test_disk_unit_reads_everything_without_root_but_has_no_network():
     svc = unit['Service']
     assert svc['AmbientCapabilities'] == ['CAP_DAC_READ_SEARCH']
     assert svc['CapabilityBoundingSet'] == ['CAP_DAC_READ_SEARCH']
+    # The storage breakdown runs in the same walk: st_uid / st_mtime from the
+    # lstat it already makes, and owner names through NSS (/etc/passwd, or
+    # sssd / nscd / winbind over a unix socket) within its own budget. Those
+    # sockets are files, which PrivateNetwork leaves reachable; PrivateUsers
+    # would turn every owner into 'nobody'
+    assert 'AF_UNIX' in svc['RestrictAddressFamilies'][0].split()
+    assert svc.get('PrivateUsers', ['no'])[-1] in ('no', 'default')
     # The capability holder can't send anything anywhere: the next metrics run sends its result
     assert svc['PrivateNetwork'] == ['yes'] and svc['RestrictAddressFamilies'] == ['AF_UNIX']
     assert svc['IPAddressDeny'] == ['any'] and 'IPAddressAllow' not in svc
@@ -1559,7 +1631,9 @@ def test_disk_no_sync_queues_without_sending(tmp_path, collector, config, monkey
     assert collector.collect_disk_usage(config, logging.getLogger('test'), sync=False) is True
     queue = tmp_path / 'data' / 'testbox' / 'queue.json'
     entries = json.loads(queue.read_text())
-    assert len(entries) == 1 and entries[0]['data']['data_type'] == 'folder_usage'
+    # Folder sizes, plus the storage breakdown (owners) when that is on: all queued, none sent
+    types = [e['data']['data_type'] for e in entries]
+    assert 'folder_usage' in types and set(types) <= {'folder_usage', 'storage_breakdown'}
 
 
 def test_disk_sync_is_the_default(tmp_path, collector, config, monkeypatch):
@@ -1575,7 +1649,7 @@ def test_no_sync_flag_reaches_disk_mode(collector, monkeypatch, tmp_path, config
     cfg.write_text(json.dumps(config))
     seen = {}
     monkeypatch.setattr(collector, 'collect_disk_usage',
-                        lambda c, log, sync=True: seen.setdefault('sync', sync))
+                        lambda c, log, dry_run=False, sync=True: seen.setdefault('sync', sync))
     monkeypatch.setattr(sys, 'argv', ['collector.py', '--config', str(cfg), '--mode', 'disk', '--no-sync'])
     with pytest.raises(SystemExit):
         collector.main()

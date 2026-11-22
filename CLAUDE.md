@@ -20,7 +20,8 @@ without the owner's explicit go-ahead. Schema changes add tables or columns only
 - Tests: `python -m pytest -p no:cacheprovider` (config in `pytest.ini`; `tests/compat` runs the old
   `f086e7e` Manager through `git archive`, so git must be on PATH).
 - Collector code must stay Python 3.8-compatible, stdlib-only, with psutil and nvidia-ml-py optional.
-- The wire protocol and API are described in [METRICS.md](METRICS.md) and
-  [manager/README.md](manager/README.md). Unmeasured values are `null`, never 0.
+- The wire protocol and API are described in [docs/PROTOCOL.md](docs/PROTOCOL.md) (canonical),
+  [METRICS.md](METRICS.md) and [manager/README.md](manager/README.md). Unmeasured values are `null`,
+  never 0.
 - The GitHub repo is public: never commit tokens, configs with tokens, logs, or real data.
 - Ask before pushing; work on branches, never commit to `main` directly.

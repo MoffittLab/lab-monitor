@@ -63,9 +63,9 @@ PowerShell. These are the most likely places for a bug, so test them here first,
 - Queue locking with `msvcrt` (`collector/lib/local_queue.py`) and file replacement on Windows
 - The Windows script that `tools/archive_all_collectors.py` sends (`FileStream.Lock`)
 - SQLite opening a database by URI on a UNC path (`file:////server/share/...`, an empty URI
-  authority): `verify_upgrade.py`, `rollback_upgrade.py`, `snapshot.py verify` and a snapshot's
-  staging, the Manager's backup check. Tested here only by emulating Windows' path rules
-  (`tests/manager/test_manager_unc_paths.py`)
+  authority): `verify_upgrade.py`, `rollback_upgrade.py` (also its `%TEMP%` copy below),
+  `snapshot.py verify` and a snapshot's staging, the Manager's backup check, `rollups.py --status`.
+  Tested here only by emulating Windows' path rules (`tests/manager/test_manager_unc_paths.py`)
 - The Manager and Dashboard under waitress on Windows; the single-instance lock in `data_dir\manager.lock`
 - Task Scheduler behaviour, for example an S4U task reaching a UNC `data_dir`
 - Windows NVIDIA GPU stats (WDDM and TCC driver models)
@@ -76,6 +76,8 @@ PowerShell. These are the most likely places for a bug, so test them here first,
 - `is_network_path` on Windows (`GetDriveTypeW` for mapped drives) behind the startup layout warnings
 - The PowerShell and robocopy commands of UPGRADE.md Step 3b (moving the databases to `manager-data`,
   editing `config.json` with `ConvertTo-Json`)
+- `rollback_upgrade.py` reading a killed Manager's `-wal` through a copy in `%TEMP%` (the check that
+  refuses to go back past the review-fix release once the usage-metrics Manager has run)
 
 ## Your job, in order
 
@@ -143,3 +145,37 @@ These are for the feature branch, not this one: per-user data is visible to ever
 access; the Synology NAS units get nothing that needs root (no SMART, no SNMP); Windows storage
 breakdown is cold data and file counts only; session lists are kept in history; days use UTC
 boundaries.
+
+## Feature release (feature/usage-metrics)
+
+A second release, built on top of `fix/review-findings` at `fb6498c` and since merged with its final state,
+`e5cd699` (nightly snapshots and the local `manager-data` layout, which this release keeps, and the review's
+snapshot, UNC-path and `verify_upgrade.py` fixes). It adds, without changing what the review-fix release
+stores:
+
+- **Collectors:** CPU %, iowait and disk I/O averaged over the whole interval from kernel counters;
+  per-user CPU-seconds (also on armv7 NAS units without psutil); per-user GPU memory, busy time and GPUs
+  held (Linux and Windows, TCC and WDDM); who is connected (`sessions`); RAID, disk and volume state
+  (`storage_health`, nothing that needs root on a NAS, no SMART, no SNMP); file counts, cold data and
+  storage per owner in the daily disk run (`storage_breakdown`; on Windows without owners).
+- **Manager:** hourly and daily rollups kept forever with a background backfill, the new snapshot tables
+  and per-user columns, eight new read endpoints, `resolution` / `entity` on `/api/history`.
+- **Dashboard:** Disk I/O, per-user cores and GPU, "Last 24 h" totals, Connected, storage health and
+  storage owners; min–max bands on long charts. It works with the OLD, CURRENT and new Managers.
+- **Docs:** [PROTOCOL.md](PROTOCOL.md), [PRIVACY.md](PRIVACY.md), [FIELD_CHECKS.md](FIELD_CHECKS.md), and
+  the "usage-metrics release" sections of [UPGRADE.md](UPGRADE.md#the-usage-metrics-release) and the
+  component READMEs.
+
+**Tests on this branch** (both releases' tests, after the merge of `e5cd699`): 1183 passed, 1 skipped
+(`shellcheck` missing), on Ubuntu 24.04 with Python 3.12. The CURRENT baseline of the upgrade tests is
+`e5cd699`, with `160da09` and `fb6498c` as further old sides of the same format.
+
+**It comes after the review-fix release:** only once this handoff's job is done (the review-fix release
+verified against the real databases and deployed) does it get its turn, with the owner's go-ahead. Going
+back from it to the review-fix release means starting the CURRENT code on the same `data_dir`, never
+`rollback_upgrade.py` (UPGRADE.md explains why).
+
+**[FIELD_CHECKS.md](FIELD_CHECKS.md) must be done on the real machines before the new defaults are
+trusted.** The feature code was tested only with fakes on the Linux development box (no Synology,
+Windows, PowerShell or GPU there), so each platform's checks gate that platform's collector upgrade; the
+atlantis checks (27–30) gate the Manager. Owner decisions for this release are in the section above.

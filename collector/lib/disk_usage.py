@@ -23,6 +23,9 @@ Cross-platform approach:
 - Handles permission errors gracefully
 - Per-folder timeout plus an optional overall deadline for large trees (100TB+)
 - A folder that times out or fails is reported as such, never as 0 bytes
+- Storage breakdown (scan_folders with BreakdownOptions): the same walk also
+  sums each folder's files per owner (POSIX st_uid) and by age (st_mtime;
+  LastWriteTimeUtc in the PowerShell scanner), within a time guard
 """
 import contextlib
 import contextvars
@@ -53,6 +56,22 @@ PS_MEASURE_SCRIPT = (
     "| Measure-Object -Property Length -Sum; "
     "Write-Output ('{0} {1}' -f [int64]$r.Sum, [int64]$r.Count)"
 )
+# The storage breakdown's variant: the same single enumeration, with each
+# file's length also added to the cold totals by LastWriteTimeUtc (cut-offs
+# in .NET ticks from the environment). The totals live in an array so the
+# pipeline's process block (a child scope) updates them in place.
+PS_COLD1_ENV_VAR = 'LM_COLD1_TICKS'
+PS_COLD3_ENV_VAR = 'LM_COLD3_TICKS'
+PS_BREAKDOWN_SCRIPT = (
+    "$c1 = [int64]$env:" + PS_COLD1_ENV_VAR + "; $c3 = [int64]$env:" + PS_COLD3_ENV_VAR + "; "
+    "$t = New-Object 'int64[]' 4; "
+    "Get-ChildItem -LiteralPath $env:" + PS_PATH_ENV_VAR + " "
+    "-Recurse -Force -File -ErrorAction SilentlyContinue "
+    "| & { process { $n = [int64]$_.Length; $t[0] += $n; $t[1] += 1; $w = $_.LastWriteTimeUtc.Ticks; "
+    "if ($w -lt $c1) { $t[2] += $n; if ($w -lt $c3) { $t[3] += $n } } } }; "
+    "Write-Output ('{0} {1} {2} {3}' -f $t[0], $t[1], $t[2], $t[3])"
+)
+DOTNET_EPOCH_TICKS = 621355968000000000      # 0001-01-01 -> 1970-01-01 in 100 ns ticks
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -388,6 +407,43 @@ def format_bytes(b: int) -> str:
     return f"{b:.1f} PB"
 
 
+def _run_powershell_scan(script: str, path: str, timeout: float, extra_env: Optional[dict] = None) -> List[str]:
+    """The words PowerShell `script` prints for folder `path` ($env:LM_SCAN_PATH); see measure_folder_powershell."""
+    env = dict(os.environ)
+    env[PS_PATH_ENV_VAR] = path
+    env.update(extra_env or {})
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=max(timeout, 0.001),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"PowerShell measurement of {path} exceeded {timeout:.0f}s")
+    except OSError as e:
+        raise RuntimeError(f"Could not run PowerShell: {e}")
+
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError(f"PowerShell returned empty output for {path}")
+    return output.split()
+
+
+def _check_empty_folder(path: str) -> None:
+    """
+    -ErrorAction SilentlyContinue makes Get-ChildItem print "0 0" for an
+    empty folder, a missing one and one it can't list (access denied)
+    alike. Listing it here tells them apart: the last two raise, so the
+    folder goes in _errors instead of being reported as 0 bytes.
+    """
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Not a directory: {path}")
+    with os.scandir(path):
+        pass
+
+
 def measure_folder_powershell(path: str, timeout: float = 3600) -> Tuple[int, int]:
     """
     Measure folder size on Windows using PowerShell Get-ChildItem.
@@ -407,40 +463,35 @@ def measure_folder_powershell(path: str, timeout: float = 3600) -> Tuple[int, in
             is missing or can't be listed; RuntimeError if PowerShell is
             unavailable or its output can't be parsed.
     """
-    env = dict(os.environ)
-    env[PS_PATH_ENV_VAR] = path
+    parts = _run_powershell_scan(PS_MEASURE_SCRIPT, path, timeout)
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_MEASURE_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=max(timeout, 0.001),
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"PowerShell measurement of {path} exceeded {timeout:.0f}s")
-    except OSError as e:
-        raise RuntimeError(f"Could not run PowerShell: {e}")
-
-    output = result.stdout.strip()
-    if not output:
-        raise RuntimeError(f"PowerShell returned empty output for {path}")
-    try:
-        parts = output.split()
         total_bytes = int(parts[0])
         files_counted = int(parts[1]) if len(parts) > 1 else -1
     except (ValueError, IndexError) as e:
         raise RuntimeError(f"Could not parse PowerShell output for {path}: {e}")
     if files_counted == 0:
-        # -ErrorAction SilentlyContinue makes Get-ChildItem print "0 0" for an
-        # empty folder, a missing one and one it can't list (access denied)
-        # alike. Listing it here tells them apart: the last two raise, so the
-        # folder goes in _errors instead of being reported as 0 bytes.
-        if not os.path.isdir(path):
-            raise FileNotFoundError(f"Not a directory: {path}")
-        with os.scandir(path):
-            pass
+        _check_empty_folder(path)
     return total_bytes, files_counted
+
+
+def measure_folder_powershell_breakdown(path: str, timeout: float, cut1: float, cut3: float) -> Tuple[int, int, Dict]:
+    """
+    measure_folder_powershell() with the cold totals of the storage
+    breakdown, from the same enumeration (PS_BREAKDOWN_SCRIPT): (bytes,
+    files, {None: [bytes, files, cold_1y_bytes, cold_3y_bytes]}). Windows
+    gives no owners here. cut1 / cut3 as in measure_folder_recursive_breakdown.
+    """
+    def ticks(unix_time):
+        return str(int(unix_time * 10 ** 7) + DOTNET_EPOCH_TICKS)
+    parts = _run_powershell_scan(PS_BREAKDOWN_SCRIPT, path, timeout,
+                                 {PS_COLD1_ENV_VAR: ticks(cut1), PS_COLD3_ENV_VAR: ticks(cut3)})
+    try:
+        total_bytes, files_counted, cold1, cold3 = (int(part) for part in parts[:4])
+    except ValueError as e:
+        raise RuntimeError(f"Could not parse PowerShell output for {path}: {e}")
+    if files_counted == 0:
+        _check_empty_folder(path)
+    return total_bytes, files_counted, {None: [total_bytes, files_counted, cold1, cold3]}
 
 
 def _is_reparse_dir(entry: os.DirEntry) -> bool:
@@ -459,6 +510,41 @@ def _is_reparse_dir(entry: os.DirEntry) -> bool:
         return False
     return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
     
+
+def _walk_root(path: str, policy: ScanPolicy):
+    """
+    (root, root_dev, inner_mounts, never_enter) for a walk of `path`: the
+    path to walk (canonical when mount-aware, so entry paths compare equal to
+    mount points), the st_dev it must stay on (None: any), and the mount
+    points below it that are never entered. Raises OSError when the policy
+    refuses the folder (checked before any stat(): a network mount's server
+    may be down), FileNotFoundError when it is not a directory.
+    """
+    if policy.mount_aware:
+        reason = policy.refusal_for(os.path.abspath(path))
+        if reason:
+            raise OSError(reason)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Not a directory: {path}")
+
+    root = path
+    root_dev = None                # set when the walk must stay on one filesystem
+    inner_mounts = never_enter = frozenset()
+    if policy.mount_aware:
+        root = os.path.realpath(path)
+        reason = policy.refusal_for(root)
+        if reason:
+            raise OSError(reason if root == os.path.abspath(path) else f"{path} -> {reason}")
+        if root in policy.automounts:
+            # Mount it first: until then stat() reports the autofs placeholder
+            _trigger_automount(root)
+        prefix = root.rstrip(os.sep) + os.sep
+        never_enter = frozenset(m for m in policy.never_enter if m.startswith(prefix))
+        if policy.one_filesystem:
+            root_dev = os.stat(root).st_dev
+            inner_mounts = frozenset(m for m in policy.mount_points if m.startswith(prefix))
+    return root, root_dev, inner_mounts, never_enter
+
 
 def measure_folder_recursive(path: str, timeout: float = 3600,
                              deadline: Optional[float] = None,
@@ -492,31 +578,7 @@ def measure_folder_recursive(path: str, timeout: float = 3600,
         limit = min(limit, deadline)
 
     policy = policy or current_policy()
-    if policy.mount_aware:
-        # Before any stat(): a network mount's server may be down
-        reason = policy.refusal_for(os.path.abspath(path))
-        if reason:
-            raise OSError(reason)
-    if not os.path.isdir(path):
-        raise FileNotFoundError(f"Not a directory: {path}")
-
-    root = path
-    root_dev = None                # set when the walk must stay on one filesystem
-    inner_mounts = never_enter = frozenset()
-    if policy.mount_aware:
-        # Walk the canonical path so entry paths compare equal to mount points
-        root = os.path.realpath(path)
-        reason = policy.refusal_for(root)
-        if reason:
-            raise OSError(reason if root == os.path.abspath(path) else f"{path} -> {reason}")
-        if root in policy.automounts:
-            # Mount it first: until then stat() reports the autofs placeholder
-            _trigger_automount(root)
-        prefix = root.rstrip(os.sep) + os.sep
-        never_enter = frozenset(m for m in policy.never_enter if m.startswith(prefix))
-        if policy.one_filesystem:
-            root_dev = os.stat(root).st_dev
-            inner_mounts = frozenset(m for m in policy.mount_points if m.startswith(prefix))
+    root, root_dev, inner_mounts, never_enter = _walk_root(path, policy)
     check_mounts = root_dev is not None or bool(never_enter)
 
     total_bytes = 0
@@ -606,6 +668,122 @@ def measure_folder_recursive(path: str, timeout: float = 3600,
             f"{', '.join(skipped_examples)}{' ...' if skipped_mounts > len(skipped_examples) else ''}"
         )
     return total_bytes, files_counted
+
+
+# One accumulator record: [bytes, files, cold_1y_bytes, cold_3y_bytes]
+BYTES, FILES, COLD1, COLD3 = range(4)
+
+
+def measure_folder_recursive_breakdown(path: str, timeout: float, deadline: Optional[float],
+                                       cut1: float, cut3: float, owners: bool,
+                                       policy: Optional[ScanPolicy] = None) -> Tuple[int, int, Dict]:
+    """
+    measure_folder_recursive() that also adds each file to its owner's
+    record, for the storage breakdown: returns (total_bytes, files_counted,
+    acc) where acc = {uid: [bytes, files, cold_1y_bytes, cold_3y_bytes]}
+    (one record under None when owners is False).
+
+    The same walk with the same rules (symlinks, Synology system names,
+    mount points, reparse directories skipped; hard links counted once), and
+    uid and mtime come from the lstat the walk already makes, so it costs
+    no extra syscalls. cut1 / cut3: the Unix times before which content was
+    last modified more than 1 / 3 years ago (cut3 <= cut1); a future mtime is
+    never cold. Consecutive files usually share an owner, so the last
+    owner's record is kept at hand instead of looked up per file.
+
+    Raises like measure_folder_recursive (TimeoutError: no partial result).
+    """
+    limit = time.monotonic() + timeout
+    if deadline is not None:
+        limit = min(limit, deadline)
+
+    policy = policy or current_policy()
+    root, root_dev, inner_mounts, never_enter = _walk_root(path, policy)
+    check_mounts = root_dev is not None or bool(never_enter)
+
+    total_bytes = 0
+    files_counted = 0
+    unreadable_dirs = 0
+    entries_seen = 0
+    skipped_mounts = 0
+    linked_inodes = set()
+    skip_reparse = sys.platform == 'win32'
+    acc = {}
+    last_uid, rec = object(), None
+    stack = [root]
+
+    while stack:
+        if time.monotonic() > limit:
+            raise TimeoutError(f"Measurement of {path} exceeded {timeout:.0f}s")
+        dir_path = stack.pop()
+        try:
+            it = os.scandir(dir_path)
+        except OSError as e:
+            if dir_path == root:
+                raise
+            unreadable_dirs += 1
+            logger.debug(f"Cannot access {dir_path}: {e}")
+            continue
+
+        with it:
+            for entry in it:
+                entries_seen += 1
+                if entries_seen % _DEADLINE_CHECK_EVERY == 0 and time.monotonic() > limit:
+                    raise TimeoutError(f"Measurement of {path} exceeded {timeout:.0f}s")
+                try:
+                    if entry.is_symlink():
+                        continue
+                    name = entry.name
+                    if policy.skip_synology_names:
+                        if name.startswith('@') or name == '#recycle' or name.startswith('.@'):
+                            continue
+                        if name.endswith('.hbk'):
+                            continue
+
+                    if entry.is_file(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        if st.st_nlink > 1:
+                            inode_key = (st.st_dev, st.st_ino)
+                            if inode_key in linked_inodes:
+                                continue
+                            linked_inodes.add(inode_key)
+                        size = st.st_size
+                        total_bytes += size
+                        files_counted += 1
+                        uid = st.st_uid if owners else None
+                        if uid != last_uid:
+                            rec = acc.get(uid)
+                            if rec is None:
+                                rec = acc[uid] = [0, 0, 0, 0]
+                            last_uid = uid
+                        rec[BYTES] += size
+                        rec[FILES] += 1
+                        mtime = st.st_mtime
+                        if mtime < cut1:
+                            rec[COLD1] += size
+                            if mtime < cut3:
+                                rec[COLD3] += size
+                    elif entry.is_dir(follow_symlinks=False):
+                        if skip_reparse and _is_reparse_dir(entry):
+                            continue
+                        if name in policy.skip_names:
+                            continue
+                        if check_mounts and (
+                                entry.path in never_enter or
+                                (root_dev is not None and (
+                                    entry.path in inner_mounts or
+                                    entry.stat(follow_symlinks=False).st_dev != root_dev))):
+                            skipped_mounts += 1
+                            continue
+                        stack.append(entry.path)
+                except OSError:
+                    continue
+
+    if unreadable_dirs:
+        logger.info(f"{path}: skipped {unreadable_dirs} unreadable subfolder(s)")
+    if skipped_mounts:
+        logger.info(f"{path}: did not enter {skipped_mounts} other filesystem(s) / mount point(s)")
+    return total_bytes, files_counted, acc
 
 
 def should_skip_folder(folder_name: str, nas_type: str = "synology") -> bool:
@@ -871,8 +1049,66 @@ def _measure_one_folder(folder_path: str, timeout: float, use_powershell: bool) 
                                     deadline=deadline)
 
 
+class BreakdownOptions:
+    """
+    What scan_folders() also measures for the storage breakdown
+    (storage_breakdown.py):
+      cut1, cut3    Unix times: content last modified before them is cold
+                    (more than 1 / 3 years); cut3 <= cut1
+      owners        per-uid records (POSIX); False: totals and cold bytes only
+      previous      {path: seconds} of the previous disk run's successful
+                    measurements (storage_breakdown_state.json)
+      max_fraction  time guard: a folder gets the breakdown walker only when
+                    its previous measurement took at most this share of the
+                    timeout it has now; otherwise (first run, a previous
+                    timeout, a slow folder) the plain walker measures it and
+                    it is listed in 'breakdown_unavailable'. A breakdown walk
+                    that still runs out of time is redone with the plain
+                    walker in the same run (within the overall deadline), so
+                    the slower walk doesn't cost folder_usage a folder.
+    """
+
+    def __init__(self, cut1: float, cut3: float, owners: bool, previous: Optional[Dict[str, float]] = None,
+                 max_fraction: float = 0.6):
+        self.cut1, self.cut3, self.owners = cut1, cut3, owners
+        self.previous = previous or {}
+        self.max_fraction = max_fraction
+
+    def use_for(self, path: str, timeout: float) -> bool:
+        seconds = self.previous.get(path)
+        return (isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+                and 0 <= seconds <= self.max_fraction * timeout)
+
+
+def _measure_one_folder_breakdown(folder_path: str, timeout: float, use_powershell: bool,
+                                  breakdown: BreakdownOptions) -> Tuple[int, int, Dict]:
+    """_measure_one_folder() with the breakdown walkers: (bytes, files, acc). Owners only off Windows."""
+    deadline = time.monotonic() + timeout
+    if use_powershell:
+        try:
+            return measure_folder_powershell_breakdown(folder_path, timeout, breakdown.cut1, breakdown.cut3)
+        except OSError:
+            raise
+        except Exception as ps_err:
+            logger.warning(
+                f"PowerShell measurement failed for {folder_path} ({ps_err}); "
+                f"falling back to Python scanner"
+            )
+    return measure_folder_recursive_breakdown(folder_path, max(0.0, deadline - time.monotonic()), deadline,
+                                              breakdown.cut1, breakdown.cut3,
+                                              breakdown.owners and sys.platform != 'win32')
+
+
+def _folder_owner(path: str) -> Optional[int]:
+    try:
+        return os.stat(path).st_uid
+    except OSError:
+        return None
+
+
 def scan_folders(folders: List[str], timeout: float = 3600,
-                 deadline: Optional[float] = None) -> Dict:
+                 deadline: Optional[float] = None,
+                 breakdown: Optional[BreakdownOptions] = None) -> Dict:
     """
     Measure each folder in a pre-discovered list.
 
@@ -886,13 +1122,25 @@ def scan_folders(folders: List[str], timeout: float = 3600,
         deadline: Optional overall time.monotonic() deadline shared by all
                   folders. Folders not reached before it are reported as
                   timed out rather than silently dropped.
+        breakdown: BreakdownOptions to also measure owners and cold data
+                  (storage breakdown), or None.
 
     Returns: {'sizes': {path: bytes}, 'timed_out': [paths], 'errors': [paths]}
              A timed-out or failed folder is never reported with a size.
+             With breakdown, also, for the successfully measured folders:
+             'files' {path: count, -1 if unknown}, 'seconds' {path: seconds
+             the measurement took}, 'breakdown' {path: {'acc': {uid: [bytes,
+             files, cold_1y, cold_3y]} or None (plain walker), 'folder_owner':
+             uid or None}} and 'breakdown_unavailable' [paths the time guard
+             gave the plain walker].
     """
     sizes: Dict[str, int] = {}
     timed_out: List[str] = []
     errors: List[str] = []
+    files: Dict[str, int] = {}
+    seconds: Dict[str, float] = {}
+    details: Dict[str, dict] = {}
+    unavailable: List[str] = []
     use_powershell = sys.platform == 'win32'
 
     if use_powershell and folders:
@@ -912,8 +1160,26 @@ def scan_folders(folders: List[str], timeout: float = 3600,
 
         logger.info(f"Measuring ... {folder_path}")
         folder_start = time.monotonic()
+        acc = None
         try:
-            bytes_used, files_counted = _measure_one_folder(folder_path, folder_timeout, use_powershell)
+            if breakdown is not None and breakdown.use_for(folder_path, folder_timeout):
+                try:
+                    bytes_used, files_counted, acc = _measure_one_folder_breakdown(
+                        folder_path, folder_timeout, use_powershell, breakdown)
+                except TimeoutError:
+                    # Slower than the guard allowed for: measure it without the
+                    # breakdown with whatever budget is left, so folder_usage
+                    # keeps the folder; its time steers the next run to the
+                    # plain walker
+                    now = time.monotonic()
+                    retry_timeout = timeout if deadline is None else min(timeout, deadline - now)
+                    logger.warning(f"The storage breakdown of {folder_path} took longer than "
+                                   f"{folder_timeout:.0f}s; measuring it again without")
+                    if retry_timeout <= 0:
+                        raise
+                    bytes_used, files_counted = _measure_one_folder(folder_path, retry_timeout, use_powershell)
+            else:
+                bytes_used, files_counted = _measure_one_folder(folder_path, folder_timeout, use_powershell)
         except TimeoutError as e:
             logger.warning(f"Timed out measuring {folder_path}: {e} (reported as timed out, not 0)")
             timed_out.append(folder_path)
@@ -927,5 +1193,15 @@ def scan_folders(folders: List[str], timeout: float = 3600,
         folder_elapsed = time.monotonic() - folder_start
         count_str = f"{files_counted:,} files" if files_counted >= 0 else "file count n/a"
         logger.info(f"[{folder_elapsed:.1f}s] {folder_path}: {format_bytes(bytes_used)} ({count_str})")
+        if breakdown is not None:
+            files[folder_path] = files_counted
+            seconds[folder_path] = round(folder_elapsed, 1)
+            owner = _folder_owner(folder_path) if breakdown.owners and not use_powershell else None
+            details[folder_path] = {'acc': acc, 'folder_owner': owner}
+            if acc is None:
+                unavailable.append(folder_path)
 
-    return {'sizes': sizes, 'timed_out': timed_out, 'errors': errors}
+    result = {'sizes': sizes, 'timed_out': timed_out, 'errors': errors}
+    if breakdown is not None:
+        result.update(files=files, seconds=seconds, breakdown=details, breakdown_unavailable=unavailable)
+    return result

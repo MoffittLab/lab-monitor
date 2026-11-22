@@ -359,6 +359,33 @@ else:
         # as labmon itself) and keep root (docker containers, sudo jobs)
         'exclude_system_accounts': True,
         'exclude_users': [],
+        # Interval counters, per-user CPU and GPU, who is connected, storage
+        # health and the storage breakdown, spelled out with their defaults
+        # (collector/lib/settings.py; config.linux.example.json)
+        'perf_counters': True,
+        'counter_max_window_seconds': 86400,
+        'user_metrics': 'auto',
+        'user_metrics_min_cores': 0.02,
+        'user_metrics_min_ram_bytes': 1073741824,
+        'user_cpu_count_children': True,
+        'disk_io': True,
+        'disk_io_exclude': [],
+        'gpu_per_user': 'auto',
+        'metrics_interval_seconds': 300,
+        'sessions': {
+            'enabled': True, 'detail': 'full', 'history': 'changes', 'list_heartbeat_seconds': 3600,
+            'max_entries': 200, 'ports': None, 'extra_ports': {}, 'exclude_clients': [],
+            'timeout_seconds': 20,
+        },
+        'storage_health': {
+            'enabled': True, 'interval_seconds': 3600, 'timeout_seconds': 90,
+            'temperature_c': {'hdd': [50, 60], 'ssd': [70, 80]}, 'ignore': [],
+        },
+        'storage_breakdown': {
+            'enabled': True, 'owners': 'file', 'top_owners': 10, 'device_top_owners': 25,
+            'max_rows': 5000, 'cold_days': [365, 1095], 'name_lookup_budget_seconds': 30,
+            'max_timeout_fraction': 0.6,
+        },
     }
 
 for key, var in (('name', 'LM_NAME'), ('id', 'LM_ID'), ('device_type', 'LM_DEVICE_TYPE'),

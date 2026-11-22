@@ -28,7 +28,9 @@ banner above).
 **Manager and Collector have independent `data_dir` settings.**
 
 - **Collector's `data_dir`**: local archive (`YYYY-MM.jsonl`), queue (`queue.json` +
-  `queue.json.lock`) and `network_snapshot.json`
+  `queue.json.lock`), `network_snapshot.json` and, with the usage-metrics release, the small state
+  files `perf_snapshot.json` (+ `.lock`), `sessions_state.json`, `storage_health_state.json` and
+  `storage_breakdown_state.json`
 - **Manager's `data_dir`**: central database (`metrics.db`) and per-system history
   (`<system>\data.db`), plus the `*.pre-upgrade-*.bak` copies after an upgrade
 
@@ -150,7 +152,8 @@ transactions and `disk I/O error` (see the banner). Move such an install to a lo
 ([Migration from Remote back to Local](#migration-from-remote-back-to-local)). Until then:
 
 - Never point two Managers (or a Manager and a copy job that writes) at the same files.
-- Network latency makes every write slower; the Manager stores each message in its own transaction.
+- Network latency makes every write slower. The Manager commits up to `ingest_commit_messages` (100)
+  messages of a request together, one COMMIT (and sync) per database, rather than two per message.
 - If the share is briefly unreachable, writes fail as `error` and the collectors keep those messages
   queued; they are stored on a later run.
 - If the share is unreachable at startup, the Manager exits with "Cannot open data_dir …" and the

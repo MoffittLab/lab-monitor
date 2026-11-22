@@ -26,10 +26,12 @@ For metrics.db and every <system>\data.db with a pre-upgrade backup:
 Nothing is deleted: the .bak stays where it is, and the moved-aside files
 keep everything the new Manager stored after the upgrade (the collectors'
 archives hold those messages too), so a rollback can itself be undone by
-renaming the files back.  Only the backups are read (the choice and the check
-below); a current database is never opened, only renamed together with its
-side files, so what a killed Manager (Task Scheduler's End, Stop-Process
--Force) left only in a -wal file stays readable in the moved-aside files.
+renaming the files back.  The choice and the check below read only the
+backups.  A current database is never written: it is only renamed together
+with its side files (the usage-metrics check further down reads it
+read-only, or a private copy of it and its -wal), so what a killed Manager
+(Task Scheduler's End, Stop-Process -Force) left only in a -wal file stays
+readable in the moved-aside files.
 The new Manager's snapshot status file (snapshot-status.json) and staging
 folder (.snapshot-staging) hold no data and are left as they are.
 
@@ -43,6 +45,21 @@ columns, dead_letter: an earlier version of the new Manager could copy a
 partly migrated database) is skipped with a warning, because the old Manager
 would not show the folder history in it.  If no backup has the old layout the
 newest is used, with a warning.  --use-oldest picks the oldest instead.
+
+Not for going back from the usage-metrics release to the review-fix release
+(e5cd699 as deployed, or 160da09 / fb6498c): that needs no restore, the review-fix code is started
+on the same data_dir (docs/UPGRADE.md, "Going back from the usage-metrics
+release to CURRENT").  After f086e7e -> review-fix -> usage-metrics, the
+backups with the old layout are the ones taken before the review-fix upgrade,
+so restoring them sets aside everything stored since then.  When the
+usage-metrics release has run on the data_dir (its _rollup_* tables) and a
+newer backup in the review-fix layout exists, the plan says so and --apply is
+refused unless --past-review-fix is given.  A Manager that was killed (Task
+Scheduler's End, Stop-Process -Force) may hold those tables only in a -wal
+file: such a database and its -wal are copied to a private temporary folder
+(the system's TEMP) and read there, so nothing is written next to the live
+files.  If that copy can't be read, the tool assumes the usage-metrics release
+ran (refused without --past-review-fix).
 
 Databases WITHOUT a backup are left as they are and listed: databases the
 new Manager created after the upgrade (systems first seen since), or ones it
@@ -64,7 +81,8 @@ After the rollback (see also docs/UPGRADE.md):
 
 Exit status: 0 rolled back (or, without --apply, the plan is ready), 1 a
 problem (bad backup, a file that could not be renamed: see the message),
-2 refused (Manager running, bad arguments, nothing to roll back).
+2 refused (Manager running, bad arguments, nothing to roll back, or it would go
+back past the review-fix release without --past-review-fix).
 """
 import argparse
 import json
@@ -73,6 +91,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -123,22 +142,29 @@ def find_databases(data_dir):
     return dbs
 
 
-# Windows path rules for _ro_uri (a module setting so tests can try them on Linux)
+# Windows path rules for _file_uri (a module setting so tests can try them on Linux)
 _WINDOWS = os.name == 'nt'
 
 
-def _ro_uri(path):
+def _file_uri(path, query=''):
     """
-    Read-only file: URI.  A UNC path (a data_dir on a share) becomes
-    file:////server/share/...: SQLite refuses pathlib's file://server/share/...
-    ("invalid uri authority").  The same as tools/verify_upgrade.py ro_uri.
+    file: URI of `path` (with `query`).  A UNC path (a data_dir on a share, a
+    TEMP folder on one) becomes file:////server/share/...: SQLite refuses
+    pathlib's file://server/share/... ("invalid uri authority").  The same as
+    manager/storage_util.py sqlite_uri and tools/verify_upgrade.py ro_uri
+    (this tool stays standalone, so it has its own copy).
     """
     p = os.path.abspath(path)
     if _WINDOWS and (p.startswith('\\\\') or p.startswith('//')):
         uri = 'file://' + quote(p.replace('\\', '/'), safe='/:')
     else:
         uri = Path(p).as_uri()
-    return uri + '?mode=ro&immutable=1'
+    return uri + ('?' + query if query else '')
+
+
+def _ro_uri(path):
+    """Read-only file: URI that never creates side files (UNC-safe, see _file_uri)."""
+    return _file_uri(path, 'mode=ro&immutable=1')
 
 
 def has_old_layout(path, central):
@@ -174,6 +200,68 @@ def has_old_layout(path, central):
             conn.close()
     except (OSError, sqlite3.Error):
         return None
+
+
+def _tables(uri):
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def _tables_with_wal(db):
+    """
+    The tables of `db` including what only its -wal holds (a Manager that
+    was killed, not stopped, checkpoints nothing), read from a private copy
+    of the database and its -wal in a temporary folder: immutable=1 ignores
+    the -wal, and a plain read-only open of the live file could write its
+    -shm.  Raises OSError / sqlite3.Error.
+    """
+    tmp = tempfile.mkdtemp(prefix='lab-monitor-rollback-check-')
+    try:
+        copy = os.path.join(tmp, 'check.db')
+        shutil.copyfile(db, copy)
+        shutil.copyfile(db + '-wal', copy + '-wal')
+        return _tables(_file_uri(copy))        # SQLite replays the -wal into this copy only
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _has_usage_metrics_tables(tables):
+    return any(t.startswith('_rollup_') for t in tables) or 'device_session_snapshot' in tables
+
+
+def usage_metrics_ran(data_dir):
+    """
+    True if the usage-metrics release (or a later one) has opened this
+    data_dir: a <system>/data.db has its _rollup_* tables, or metrics.db its
+    device_session_snapshot table, committed to the database file or only to
+    its -wal.  None if that can't be told: a database's -wal could not be
+    read (callers treat that as True).  A database that can't be read at all
+    counts as no.
+    """
+    unknown = False
+    for db in find_databases(data_dir):
+        if not os.path.isfile(db):
+            continue
+        try:
+            if _has_usage_metrics_tables(_tables(_ro_uri(db))):
+                return True
+        except (OSError, sqlite3.Error):
+            continue
+        try:
+            has_wal = os.path.getsize(db + '-wal') > 0
+        except OSError:
+            has_wal = False
+        if not has_wal:
+            continue
+        try:
+            if _has_usage_metrics_tables(_tables_with_wal(db)):
+                return True
+        except (OSError, sqlite3.Error):
+            unknown = True
+    return None if unknown else False
 
 
 def choose_backup(db_path, backups, use_oldest=False):
@@ -242,7 +330,10 @@ def plan(data_dir, use_oldest=False):
     for db in find_databases(data_dir):
         bks = backups_of(db)
         chosen, skipped, old_layout = choose_backup(db, bks, use_oldest)
+        central = os.path.basename(db) == 'metrics.db'
+        newer = bks[bks.index(chosen) + 1:] if chosen else []
         items.append({
+            'newer_new_layout': [b for b in newer if has_old_layout(b, central) is False],
             'db': db,
             'rel': os.path.relpath(db, data_dir),
             'backups': bks,
@@ -286,14 +377,21 @@ def restore_one(item, stamp):
     return moved
 
 
-def rollback(data_dir, apply=False, use_oldest=False, out=say):
-    """Plan (and with apply=True perform) the rollback. Returns (exit code, plan)."""
+def rollback(data_dir, apply=False, use_oldest=False, out=say, past_review_fix=False):
+    """
+    Plan (and with apply=True perform) the rollback. Returns (exit code, plan).
+    Going back past the review-fix release (the usage-metrics release has run
+    and newer backups in the review-fix layout exist) needs past_review_fix.
+    """
     items = plan(data_dir, use_oldest)
     todo = [i for i in items if i['backup']]
     keep = [i for i in items if not i['backup']]
     if not todo:
         out('No pre-upgrade backups (*%s*.bak) found under %s: nothing to roll back.' % (BACKUP_INFIX, data_dir))
         return 2, items
+    # usage_metrics_ran is only asked when it matters (it may copy a database to read its -wal)
+    ran = usage_metrics_ran(data_dir) if any(i['newer_new_layout'] for i in todo) else False
+    twice = ran is not False
     out('Databases to restore (%d):' % len(todo))
     for i in todo:
         others = len(i['backups']) - 1
@@ -301,9 +399,10 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
                                    ' (%d other backup%s ignored)' % (others, 's' if others > 1 else '') if others else '',
                                    '' if i['exists'] else '  [database missing now: recreated]'))
         for b in i['skipped_new_layout']:
-            out('      WARNING: skipped the newer %s: it already has the new layout (a copy of a partly '
-                'migrated database), so the old Manager would not show its folder history'
-                % os.path.basename(b))
+            out('      WARNING: skipped the newer %s: it already has the new layout (%s), so the old Manager '
+                'would not show its folder history'
+                % (os.path.basename(b), 'the review-fix layout, copied by the usage-metrics release'
+                   if twice else 'a copy of a partly migrated database'))
         if i['check'] == 'ok' and not i['old_layout']:
             out('      WARNING: %s already has the new layout (no backup of this database has the old '
                 'one): the old Manager will not show the folder history stored in it' % os.path.basename(i['backup']))
@@ -313,6 +412,21 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
         out('Databases without a pre-upgrade backup, left as they are (%d):' % len(keep))
         for i in keep:
             out('  %s' % i['rel'])
+    if twice:
+        n = sum(1 for i in todo if i['newer_new_layout'])
+        out('')
+        if ran is None:
+            out('NOTE: a database has a -wal file (the Manager was killed, not stopped) that could not be read, '
+                'so it is not known whether the usage-metrics release ran; it is assumed it did. A copy of the '
+                'database is read in the TEMP folder: check its free space and run this again.')
+        out('WARNING: the usage-metrics release has run on this data_dir, and %d database(s) have a newer backup '
+            'than the one chosen, in the layout the review-fix release writes. After f086e7e -> review-fix -> '
+            'usage-metrics, restoring goes back past the review-fix release to what the f086e7e Manager reads: '
+            'everything stored since the chosen backups were taken is set aside in *%s* files (kept, but no '
+            'longer served).' % (n, MOVED_INFIX))
+        out('To go back to the review-fix release, do NOT run this tool: start the review-fix code on this '
+            'data_dir (docs/UPGRADE.md, "Going back from the usage-metrics release to CURRENT"). To restore '
+            'the chosen backups anyway, add --past-review-fix.')
     bad = [i for i in todo if i['check'] != 'ok']
     if bad:
         out('')
@@ -322,6 +436,10 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
         out('')
         out('Dry run: nothing changed. Stop the Manager, then re-run with --apply.')
         return 0, items
+    if twice and not past_review_fix:
+        out('')
+        out('Refused: nothing was changed (see the warning above).')
+        return 2, items
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     done = []
     for i in todo:
@@ -363,6 +481,10 @@ def main(argv=None):
     ap.add_argument('--use-oldest', action='store_true', help='restore the oldest backup of each database')
     ap.add_argument('--force', action='store_true',
                     help='skip the check that no Manager answers on the configured port')
+    ap.add_argument('--past-review-fix', action='store_true',
+                    help='after f086e7e -> review-fix -> usage-metrics: really restore the f086e7e layout, setting '
+                         'aside everything stored since the review-fix upgrade (to go back to the review-fix '
+                         'release no tool is needed: see docs/UPGRADE.md)')
     args = ap.parse_args(argv)
 
     config = {}
@@ -386,7 +508,8 @@ def main(argv=None):
             'Manager"), then run this again.' % config.get('port', 5000))
         return 2
     say('data_dir: %s' % os.path.abspath(data_dir))
-    code, _items = rollback(data_dir, apply=args.apply, use_oldest=args.use_oldest)
+    code, _items = rollback(data_dir, apply=args.apply, use_oldest=args.use_oldest,
+                            past_review_fix=args.past_review_fix)
     return code
 
 

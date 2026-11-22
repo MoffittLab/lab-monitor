@@ -10,13 +10,28 @@ What is archived:
   - every per-system history table in data/<system>/data.db
     (system_metrics, folder_usage, user_metrics, not_specified, ...)
       → data/<system>/archive/<YYYY-MM>-<data_type>.jsonl
+    (folder_usage and storage_breakdown runs as the read API returns them:
+    one line per run, a storage_breakdown run with its nested folders)
   - user_metrics_history in the central metrics.db
       → data/<system>/archive/<YYYY-MM>-user_metrics_history.jsonl
 
 Rows are deleted only after their archive lines have been written and
 fsync'd.  The legacy "retention_days" key is NOT used here (it only ever
 applied to the old usage.jsonl files).  folder_usage_legacy (the pre-upgrade
-wide table) is left untouched.
+wide table) is left untouched.  A folder_usage / storage_breakdown table an
+older Manager stored wide, whose one-time migration has not succeeded yet,
+is skipped (WARNING) until it has.
+
+Rollups (rollups.py) are kept forever and never archived.  A rolled-up
+table (system_metrics, user_metrics, sessions, storage_health) is pruned
+only once every row of it is rolled up: pending backfill ranges are worked
+off first, and if that does not finish the table is skipped for this run
+(WARNING); so is a table whose rollups have reached
+rollups.max_series_per_table (fields / users beyond it are not rolled up, so
+their raw rows are all there is of them).  Before pruning, the table's rollup cutoff frozen_before is set to
+the retention cutoff, so a pruned message replayed later is stored again but
+not rolled up twice.  The central user_metrics_history has no rollups and is
+pruned without this guard.
 
 The Manager runs this daily itself when history_retention_days is set; it
 can also be run by hand or from Task Scheduler (safe while the Manager is
@@ -31,17 +46,25 @@ import sys
 import json
 import logging
 import argparse
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 
 # Add this directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import rollups
 from metrics import MetricsDB
 from data_store import TypedDataStore
-from storage_util import format_timestamp, normalize_device_name
+from storage_util import MigrationBlockedError, format_timestamp, normalize_device_name
 
 BATCH = 5000
+# Runs per batch where one run is many rows (a storage_breakdown run is
+# rebuilt with every folder and owner: up to 50,000 rows)
+BATCH_BY_TYPE = {'storage_breakdown': 20}
+# Longest a retention run works off pending rollups of one table before it
+# skips pruning that table (retried at the next run)
+ROLLUP_CATCHUP_SECONDS = 3600
 
 
 def setup_logging(log_file: str = None):
@@ -103,6 +126,44 @@ def _append_archive(data_dir: str, system_key: str, label: str, rows: List[dict]
     return len(rows)
 
 
+def _rollups_ready_for_pruning(data_store: TypedDataStore, system_key: str, data_type: str,
+                               cutoff: str, logger: logging.Logger, dry_run: bool) -> bool:
+    """
+    Before pruning a rolled-up table: finish its pending rollups (bounded
+    by ROLLUP_CATCHUP_SECONDS), then freeze them at the cutoff.  False =
+    skip pruning this table for this run (also while it is at
+    max_series_per_table: what is beyond it exists only in raw rows).
+    """
+    if data_type not in rollups.REGISTRY:
+        return True
+    if not data_store.rows_older_than(system_key, data_type, cutoff, limit=1):
+        return True             # nothing to prune
+    if not data_store.rollups_complete(system_key, data_type):
+        if dry_run:
+            logger.info(f"  {system_key}/{data_type}: rollups still pending - a real run finishes "
+                        f"them before pruning")
+            return True
+        logger.info(f"  {system_key}/{data_type}: completing pending rollups before pruning ...")
+        try:
+            data_store.run_rollup_backfill(system_key, [data_type],
+                                           deadline=time.monotonic() + ROLLUP_CATCHUP_SECONDS)
+        except Exception as e:
+            logger.error(f"  {system_key}/{data_type}: rollup backfill failed: {e}", exc_info=True)
+        if not data_store.rollups_complete(system_key, data_type):
+            logger.warning(f"  {system_key}/{data_type}: skipped - its rollups are not complete yet "
+                           f"(raw rows are pruned only once they are rolled up; retried next run)")
+            return False
+    if data_store.rollups_at_series_cap(system_key, data_type):
+        logger.warning(f"  {system_key}/{data_type}: skipped - its rollups have reached "
+                       f"rollups.max_series_per_table ({data_store.rollups.max_series}): fields / users "
+                       f"beyond it are not rolled up, so its raw rows are kept. Raise the setting and run "
+                       f"'rollups.py --rebuild --data-type {data_type}'")
+        return False
+    if not dry_run:
+        data_store.freeze_rollups(system_key, data_type, cutoff)
+    return True
+
+
 def run_history_retention(data_store: TypedDataStore, metrics_db, data_dir: str,
                           days: int, logger: logging.Logger, dry_run: bool = False) -> dict:
     """
@@ -123,21 +184,35 @@ def run_history_retention(data_store: TypedDataStore, metrics_db, data_dir: str,
                            f"(pre-upgrade backup failed: {pending})")
             continue
         for data_type in data_store.list_data_types(system_key):
+            # A wide folder_usage / storage_breakdown table whose migration
+            # failed: its rows can't be deleted, so they are not archived
+            # either (each run would append them again)
+            blocked = data_store.type_migration_pending(system_key, data_type, retry=not dry_run)
+            if blocked:
+                logger.warning(f"  {system_key}/{data_type}: skipped - {blocked}; pruned once it is migrated")
+                continue
+            if not _rollups_ready_for_pruning(data_store, system_key, data_type, cutoff, logger, dry_run):
+                continue
             total = 0
-            while True:
-                rows = data_store.rows_older_than(system_key, data_type, cutoff, limit=BATCH)
-                if not rows:
-                    break
-                if dry_run:
-                    total += len(rows)
-                    if len(rows) == BATCH:
-                        logger.info(f"  {system_key}/{data_type}: at least {total} rows (dry run stops counting)")
-                    break
-                _append_archive(data_dir, system_key, data_type, rows)
-                deleted = data_store.delete_rows(system_key, data_type, [r['id'] for r in rows])
-                total += deleted
-                if deleted == 0:
-                    break
+            batch = BATCH_BY_TYPE.get(data_type, BATCH)
+            try:
+                while True:
+                    rows = data_store.rows_older_than(system_key, data_type, cutoff, limit=batch)
+                    if not rows:
+                        break
+                    if dry_run:
+                        total += len(rows)
+                        if len(rows) == batch:
+                            logger.info(f"  {system_key}/{data_type}: at least {total} rows (dry run stops counting)")
+                        break
+                    _append_archive(data_dir, system_key, data_type, rows)
+                    deleted = data_store.delete_rows(system_key, data_type, [r['id'] for r in rows])
+                    total += deleted
+                    if deleted == 0:
+                        break
+            except MigrationBlockedError as e:
+                # Never stops the run: the other tables and systems are pruned
+                logger.error(f"  {system_key}/{data_type}: stopped - {e}")
             if total:
                 archived[f"{system_key}/{data_type}"] = total
                 logger.info(f"  {system_key}/{data_type}: {'would archive' if dry_run else 'archived'} {total} rows")
@@ -224,7 +299,9 @@ def main():
 
     try:
         backup = config.get('backup_before_migration', True)
-        data_store = TypedDataStore(data_dir, backup_before_migration=backup)
+        settings = rollups.settings_from_config(config, logger)
+        data_store = TypedDataStore(data_dir, backup_before_migration=backup,
+                                    rollups=rollups.RollupEngine(settings) if settings['enabled'] else None)
         db_path = os.path.join(data_dir, 'metrics.db')
         metrics_db = MetricsDB(db_path, data_dir=data_dir, backup_before_migration=backup) \
             if os.path.exists(db_path) else None

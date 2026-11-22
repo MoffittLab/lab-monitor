@@ -2,7 +2,8 @@
 SQLite file: URIs for a UNC path (\\\\server\\share\\...): `snapshot.py verify` of a
 snapshot on the NAS share (docs/UPGRADE.md Step 4 tells the operator to run it on
 last_snapshot), a snapshot run and the pre-upgrade backup check with a data_dir on
-a share.  pathlib's as_uri() gives file://server/share/..., which SQLite refuses
+a share, and rollups.py --status (it reads every data.db read-only) on such a
+data_dir.  pathlib's as_uri() gives file://server/share/..., which SQLite refuses
 ("invalid uri authority: server") unless it was built with
 SQLITE_ALLOW_URI_AUTHORITY; file:////server/share/... (empty authority) works.
 
@@ -21,6 +22,7 @@ from pathlib import PureWindowsPath
 
 import pytest
 
+import rollups
 import manager as mgr
 import snapshot
 import storage_util
@@ -50,7 +52,7 @@ def unc(monkeypatch):
         return to_unc
 
     def to_unc(path):
-        for mod in (snapshot, storage_util):
+        for mod in (snapshot, storage_util, rollups):
             monkeypatch.setattr(mod, '_WINDOWS', True, raising=False)
             monkeypatch.setattr(mod, 'Path', PureWindowsPath, raising=False)
         return '/' + os.path.abspath(path)
@@ -133,3 +135,27 @@ def test_the_backup_check_reads_a_backup_on_a_share(scratch, unc):
     finally:
         bconn.close()
     assert sorted(os.listdir(os.path.dirname(path))) == ['data.db']     # read-only, no side files
+
+
+def test_rollups_status_reads_a_data_dir_on_a_share(client, data_dir, unc):
+    """rollups.py --status opens each data.db read-only by URI (storage_util.sqlite_uri)."""
+    _seed(client)
+    dbs = [os.path.join(data_dir, d, 'data.db') for d in sorted(os.listdir(data_dir))
+           if os.path.isfile(os.path.join(data_dir, d, 'data.db'))]
+    assert dbs
+    want = {}
+    for path in dbs:
+        conn = rollups._open_read_only(path)
+        try:
+            want[path] = rollups.table_status(conn)
+        finally:
+            conn.close()
+    for path in dbs:
+        conn = rollups._open_read_only(unc(path))
+        try:
+            assert conn.execute('SELECT COUNT(*) FROM system_metrics').fetchone()[0] == 5
+            assert rollups.table_status(conn) == want[path]
+            with pytest.raises(sqlite3.OperationalError, match='readonly'):
+                conn.execute('CREATE TABLE never (v)')
+        finally:
+            conn.close()
