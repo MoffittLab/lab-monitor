@@ -227,3 +227,51 @@ def test_reset_admin_token_resets_and_prints_replay_with_legacy(monkeypatch, tmp
     assert sorted(p.name for p in backups[0].iterdir()) == ['2026-08.jsonl', 'queue.json']
     out = capsys.readouterr().out
     assert 'replay_archives.py' in out and '--include-legacy' in out
+
+
+# --only in run_collectors.py and toggle_collectors.py (same selection as update_collectors.py)
+
+FLEET_CSV = ('ip,username,password,git_path,python_path,platform\n'
+             'triton2.example.org,u,,/g,/py,\n192.168.1.42,u,,/g,/py,\nkraken.example.org,u,,/g,,linux\n')
+
+
+def _run_tool(monkeypatch, tmp_path, module, worker, argv):
+    """Run module.main() with the per-system worker replaced. Returns (exit code, hosts the worker saw)."""
+    csv = tmp_path / 'collectors.csv'
+    csv.write_text(FLEET_CSV)
+    seen = []
+
+    def fake(row, **kw):
+        seen.append(row['ip'])
+        return {'ip': row['ip'], 'status': 'ok', 'output': '', 'error': '', 'elapsed': 0.0,
+                'config_before': {}, 'config_after': {}}
+    monkeypatch.setattr(module, worker, fake)
+    monkeypatch.setattr(module._ssh, 'require_paramiko', lambda: None)
+    monkeypatch.setattr(sys, 'argv', [module.__name__ + '.py', '--csv', str(csv), *argv])
+    with pytest.raises(SystemExit) as info:
+        module.main()
+    return info.value.code, seen
+
+
+@pytest.mark.parametrize('tool, worker, mode', [
+    ('run_collectors', 'run_collection', 'metrics'),
+    ('toggle_collectors', 'toggle_system', 'on'),
+])
+def test_only_in_run_and_toggle(monkeypatch, tmp_path, capsys, tool, worker, mode):
+    import importlib
+    module = importlib.import_module(tool)
+
+    code, seen = _run_tool(monkeypatch, tmp_path, module, worker, ['--mode', mode, '--only', 'kraken'])
+    assert code == 0 and seen == ['kraken.example.org']
+    assert 'Systems: 1 (--only kraken)' in capsys.readouterr().out
+
+    code, seen = _run_tool(monkeypatch, tmp_path, module, worker,
+                           ['--mode', mode, '--only', 'triton2', '--only', '192.168.1.42'])
+    assert code == 0 and seen == ['triton2.example.org', '192.168.1.42']
+
+    code, seen = _run_tool(monkeypatch, tmp_path, module, worker, ['--mode', mode])
+    assert code == 0 and len(seen) == 3                                  # no --only: every system
+
+    code, seen = _run_tool(monkeypatch, tmp_path, module, worker, ['--mode', mode, '--only', 'krakn'])
+    assert code == 1 and seen == []                                      # a typo contacts nobody
+    assert '--only matched no system' in capsys.readouterr().out

@@ -18,6 +18,7 @@ Usage:
     python3 toggle_collectors.py --csv collectors.csv --mode off --dry-run    # preview
     python3 toggle_collectors.py --csv collectors.csv --mode off --timeout 30 # SSH connect timeout
     python3 toggle_collectors.py --csv collectors.csv --mode on --parallel 4  # 4 systems at once
+    python3 toggle_collectors.py --csv collectors.csv --mode off --only triton2  # one system
 
 Requirements:
     pip install paramiko
@@ -256,6 +257,7 @@ def main():
                         help='Limit for each remote config_tool.py call; 0 = no limit (default: 120)')
     parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
                         help='Toggle up to N systems at once (default: 1 = one at a time)')
+    _ssh.add_only_argument(parser, 'Toggle')
     parser.add_argument('--verbose', action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -281,10 +283,12 @@ def main():
         print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
+    rows = _ssh.apply_only(rows, args.only, csv_path)
+
     mode_display = 'ON' if args.mode == 'on' else 'OFF'
     print("=" * 70)
     print(f"Lab Monitor - Toggle Collectors {mode_display}")
-    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Parallel: {args.parallel}  |  "
+    print(f"Systems: {len(rows)}" + (f" (--only {', '.join(args.only)})" if args.only else '') + f"  |  Timeout: {args.timeout}s  |  Parallel: {args.parallel}  |  "
           f"Dry-run: {args.dry_run}")
     print("=" * 70)
     print()

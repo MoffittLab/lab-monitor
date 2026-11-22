@@ -276,6 +276,7 @@ python3 update_collectors.py --csv collectors.csv --only triton2 --only 192.168.
 `--only HOST` selects the rows whose `ip` column is `HOST` (case ignored), or whose host name starts
 with `HOST` followed by a dot (`triton2` selects `triton2.example.org`, not `triton20.example.org`). An IP
 address only matches in full. If a value matches no row, the tool stops before contacting anyone.
+`run_collectors.py` and `toggle_collectors.py` take `--only` the same way.
 
 **What it does:**
 - For each collector, SSHes in and runs `git -C {git_path} pull origin main`
@@ -327,6 +328,7 @@ python3 toggle_collectors.py --csv collectors.csv --mode off
 python3 toggle_collectors.py --csv collectors.csv --mode on
 python3 toggle_collectors.py --csv collectors.csv --mode off --dry-run
 python3 toggle_collectors.py --csv collectors.csv --mode off --timeout 30 --parallel 4
+python3 toggle_collectors.py --csv collectors.csv --mode off --only triton2   # one system (repeatable)
 ```
 
 **What it does:**
@@ -377,6 +379,7 @@ python3 run_collectors.py --csv collectors.csv --mode disk
 python3 run_collectors.py --csv collectors.csv --mode metrics
 python3 run_collectors.py --csv collectors.csv --mode disk --dry-run
 python3 run_collectors.py --csv collectors.csv --mode metrics --timeout 60 --parallel 4
+python3 run_collectors.py --csv collectors.csv --mode metrics --only kraken   # one system (repeatable)
 ```
 
 **What it does:**

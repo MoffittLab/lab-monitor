@@ -192,6 +192,26 @@ def select_rows(rows: list, only: list) -> tuple:
     return selected, unmatched
 
 
+def add_only_argument(parser, verb: str = 'Run on'):
+    """The --only option of the fleet tools (select rows with select_rows / apply_only)."""
+    parser.add_argument('--only', action='append', default=[], metavar='HOST',
+                        help=f'{verb} only this system: its ip column, or the first part of its '
+                             'host name (triton2 selects triton2.example.org). Repeat for more '
+                             'systems. A value that matches no row stops the tool')
+
+
+def apply_only(rows: list, only: list, csv_path) -> list:
+    """The rows --only selects (all rows without --only); exits with code 1 if a value matches none."""
+    if not only:
+        return rows
+    selected, unmatched = select_rows(rows, only)
+    if unmatched:
+        print(f"ERROR: --only matched no system in {csv_path}: {', '.join(unmatched)}")
+        print("       Use the ip column's value, or the first part of a host name.")
+        raise SystemExit(1)
+    return selected
+
+
 def row_value(row: dict, key: str, default: str = '') -> str:
     """Stripped CSV cell value ('' when the column is absent or empty)."""
     value = row.get(key)
