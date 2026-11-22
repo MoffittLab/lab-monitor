@@ -32,7 +32,7 @@ from urllib.parse import quote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
-from flask import Flask, g, render_template, jsonify, redirect, request
+from flask import Flask, g, render_template, jsonify, redirect, request, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -163,6 +163,27 @@ def register_static_types():
 register_static_types()
 
 app = Flask(__name__)
+
+# Part of every static URL the pages use (see static_url).  Bump it when a
+# response HEADER of the static files changes: a browser that revalidates its
+# cached copy gets "304 Not Modified" and keeps the headers it cached, so a
+# corrected Content-Type would otherwise never reach it.
+STATIC_HEADERS_VERSION = 2
+
+
+@app.template_global()
+def static_url(filename: str) -> str:
+    """
+    URL of a static file with a version that changes when the file (or
+    STATIC_HEADERS_VERSION) does, so browsers fetch it afresh instead of
+    reusing a cached copy.
+    """
+    try:
+        st = os.stat(os.path.join(app.static_folder, filename))
+        version = f"{STATIC_HEADERS_VERSION}-{st.st_mtime_ns:x}-{st.st_size:x}"
+    except OSError:
+        version = str(STATIC_HEADERS_VERSION)
+    return url_for('static', filename=filename, v=version)
 
 _config = {}
 _logger = logging.getLogger(__name__)
