@@ -48,6 +48,12 @@ PowerShell. These are the most likely places for a bug, so test them here first,
 - The Manager and Dashboard under waitress on Windows; the single-instance lock in `data_dir\manager.lock`
 - Task Scheduler behaviour, for example an S4U task reaching a UNC `data_dir`
 - Windows NVIDIA GPU stats (WDDM and TCC driver models)
+- Nightly snapshots on Windows: the installer's `-SnapshotDir`, a UNC `snapshot.dest_dir` reached by a
+  stored-password task, the copy to and the `.partial` → `snapshot-<stamp>` rename on an SMB share, pruning
+  (deleting folders) there, and `snapshot.py verify` on a UNC path
+- `is_network_path` on Windows (`GetDriveTypeW` for mapped drives) behind the startup layout warnings
+- The robocopy commands of UPGRADE.md Step 3b (moving the databases to `manager-data`)
+- `rollback_upgrade.py` reading a killed Manager's `-wal` through a copy in `%TEMP%`
 
 ## Your job, in order
 
@@ -77,14 +83,18 @@ PowerShell. These are the most likely places for a bug, so test them here first,
    PowerShell scan, `msvcrt` locking and waitress run on Windows. Stop both servers afterwards and delete
    the scratch folders.
 6. **Step 0 (backup), then Step 1 (`verify_upgrade.py` against the real data)**, exactly as UPGRADE.md
-   says. A local collector writing into the same `data_dir` is the "dual role" case in Step 1c.
+   says. A local collector writing into the same `data_dir` is the "dual role" case in Step 1c: the
+   layout before Step 3b, which moves the databases to a local `manager-data` folder. Note whether
+   `data_dir` is on a share or shared with the collector, and which NAS folder the owner wants for the
+   snapshots (`snapshot.dest_dir`).
 7. **Report to the owner** and wait. Give PASS or FAIL, every non-PASS item with its cause, the
    Windows test and smoke-test results, the measured first-start time, and the free space. Do not
    upgrade anything without the owner's go-ahead.
 8. **With the go-ahead:**
    - Step 2: merging into `main` is the owner's decision.
-   - Step 3: upgrade Dashboard and Manager together with the installer.
-   - Step 4: check the result.
+   - Step 3: move the databases to `manager-data` and turn on snapshots (3b), then upgrade Dashboard and
+     Manager together with the installer.
+   - Step 4: check the result, including a first snapshot (`snapshot.py verify`).
    - Step 5: upgrade the collectors. Do the local one first, then one NAS, then the rest.
    - Watch the first day: metrics every 5 minutes, the 02:00 disk run, no errors in the logs.
 
@@ -109,8 +119,9 @@ boundaries.
 
 ## Feature release (feature/usage-metrics)
 
-A second release, built on top of `fix/review-findings` at `fb6498c`. It adds, without changing what the
-review-fix release stores:
+A second release, built on top of `fix/review-findings` at `fb6498c` and since merged with its final state,
+`160da09` (nightly snapshots, the local `manager-data` layout, which this release keeps). It adds, without
+changing what the review-fix release stores:
 
 - **Collectors:** CPU %, iowait and disk I/O averaged over the whole interval from kernel counters;
   per-user CPU-seconds (also on armv7 NAS units without psutil); per-user GPU memory, busy time and GPUs

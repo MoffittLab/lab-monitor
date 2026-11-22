@@ -29,6 +29,8 @@ E:\Users\lab-monitor\manager-data\     ← Manager only (local disk)
 ├── metrics.db                    ← central summary DB
 │                                   (devices, device_snapshot, device_totals, per-user, dead_letter)
 ├── snapshot-status.json          ← last snapshot success / failure
+├── .snapshot-staging\            ← local copies while a snapshot runs (removed afterwards,
+│                                   and at the next start after a Manager was killed mid-run)
 ├── manager.lock                  ← one Manager per data_dir
 ├── atlantis\                     ← one folder per system
 │   ├── data.db                   ← full history for atlantis
@@ -100,7 +102,8 @@ Manager (task "Lab Monitor Manager")
 Collector removes the acknowledged messages from queue.json; "error" ones stay for the next run
 
 Manager, daily at snapshot.time (03:30)
-  │  online backup of every database into manager-data\.snapshot-staging\, quick_check
+  │  online backup of every database into manager-data\.snapshot-staging\ (every data.db, then
+  │  metrics.db), quick_check; then the retention archives
   ▼  plain file copy + SHA-256 read-back
 \\<nas>\<share>\snapshots\snapshot-<stamp>\   (then old snapshots pruned)
 
@@ -253,11 +256,15 @@ Rough growth per system:
 - `folder_usage`: one scan a day, one row per folder.
 - The collector archive holds every message once more as JSON.
 
-To see the real numbers:
+To see the real numbers (the Manager's databases, the collector's archive and queue, the NAS snapshots):
 ```powershell
+Get-ChildItem E:\Users\lab-monitor\manager-data -Recurse -File | Measure-Object -Property Length -Sum
+Get-ChildItem E:\Users\lab-monitor\manager-data -Recurse -Filter *.db | Sort-Object Length -Descending | Select-Object FullName, Length -First 10
 Get-ChildItem E:\Users\lab-monitor\data -Recurse -File | Measure-Object -Property Length -Sum
-Get-ChildItem E:\Users\lab-monitor\data -Recurse -Filter *.db | Sort-Object Length -Descending | Select-Object FullName, Length -First 10
+Get-ChildItem "<snapshot.dest_dir>" -Recurse -File | Measure-Object -Property Length -Sum
 ```
+Each snapshot is about the size of the databases (`last_bytes` in `GET /api/snapshot`); the staging
+copies need that much free space on the `manager-data` disk while a snapshot runs.
 
 ---
 

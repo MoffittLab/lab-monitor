@@ -184,7 +184,7 @@ data/
   limit; the API returns each scan as the same flat dict the collector sent. `storage_breakdown` is
   narrow too; the API returns each run nested, exactly as sent.
 - The table prefixes `_` and `storage_breakdown_` are reserved: no `data_type` maps to them, and
-  the review-fix Manager (`fb6498c`) ignores such tables after a downgrade.
+  the review-fix Manager (`160da09` / `fb6498c`) ignores such tables after a downgrade.
 - Other data types have one column per payload key. A new key adds a column; earlier rows read
   `NULL` for it ("not measured"), which is different from a measured zero.
 - Every history table has a `msg_id` column with a UNIQUE index for de-duplication.

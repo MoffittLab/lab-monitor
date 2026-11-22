@@ -55,6 +55,7 @@ names; process names, command lines or PIDs (the collector keeps PIDs locally in
 | Manager `metrics.db` `dead_letter` | Raw messages the Manager rejected | Nobody: neither retention nor `DELETE /api/system/<name>` removes them |
 | Manager `data/<system>/archive/*.jsonl` | Rows pruned by retention | Nobody: delete by hand |
 | `*.pre-upgrade-*.bak`, `*.post-upgrade-*` | Full copies of databases from an upgrade or rollback | Delete by hand once you won't roll back |
+| NAS snapshots (`snapshot.dest_dir/snapshot-<stamp>/`) | Nightly copies of `metrics.db`, every `data.db`, the retention archives and `*.post-upgrade-*` files: the same per-user data as above | Pruning after `keep_daily` (14) days, except the newest of each of the last `keep_monthly` (12) months, so up to about a year; the newest good copy of a database that later failed to copy is kept longer. `DELETE /api/system/<name>` and `tools/reset_system.py` do **not** remove a system from snapshots already taken: delete its folder in each snapshot by hand (the `manifest.json` then lists a missing file, so `snapshot.py verify` reports it) |
 
 ## How long it is kept
 
@@ -73,6 +74,9 @@ names; process names, command lines or PIDs (the collector keeps PIDs locally in
   who logged off keeps a last snapshot row; the Dashboard hides rows more than 120 s older than the
   system's latest metrics.
 - **The collectors' archives** are never pruned by Lab Monitor.
+- **NAS snapshots** (when `snapshot.enabled`) keep a copy of everything in the Manager's databases for up
+  to `keep_monthly` months (12 by default). Data deleted or pruned in the live databases stays in the
+  snapshots taken before, until they are pruned.
 
 ## How to record less
 

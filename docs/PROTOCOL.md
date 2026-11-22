@@ -4,7 +4,7 @@ The wire protocol between collectors and the Manager, and the contract of the Ma
 This is the canonical reference: where another document and this one disagree, this one is meant to
 be right, and where this one and the code disagree, the code is right and this file must be fixed.
 
-- Items 1–9 are the contract of the review-fix release (`fb6498c`).
+- Items 1–9 are the contract of the review-fix release (`fb6498c`; `160da09`, the version that is deployed, adds nightly snapshots and changes nothing here).
 - Items 10–18 are added by the usage-metrics release (`feature/usage-metrics`). They are additive:
   items 1–9 are unchanged.
 
@@ -17,7 +17,7 @@ examples in [manager/README.md](../manager/README.md); what is recorded about pe
 | Name | What it is |
 |------|------------|
 | OLD Manager | Commit `f086e7e`, the version that ran before the review-fix release. No `msg_id` dedup; it answers `{"stored": n}`, and a collector keeps the whole batch queued unless `stored` equals the batch size. |
-| CURRENT Manager | The review-fix release, `fb6498c`. Items 1–9 apply. None of items 10–18. |
+| CURRENT Manager | The review-fix release, `160da09` (`fb6498c` behaves the same on the wire and in storage). Items 1–9 apply. None of items 10–18. |
 | NEW | CURRENT plus the usage-metrics release. |
 
 ---
@@ -594,7 +594,7 @@ charted too. `storage_breakdown` is not rolled up.
 | OLD or CURRENT collector → NEW Manager | No new fields arrive. The new central tables stay empty, the Dashboard hides the new sections, `system_metrics` and `user_metrics` are still rolled up. |
 | NEW Dashboard → OLD or CURRENT Manager | The new endpoints answer 404 (the OLD Manager answers `/api/user_metrics/usage` with 200 `[]` through its `<device_name>` route, which the Dashboard also reads as absent); the sections are hidden (R7). `resolution` and `entity` are ignored by those Managers, so charts behave as before, with no band; a per-user chart answers 404 "Per-user history needs a newer Manager" instead of a mixed series. |
 | OLD or CURRENT Dashboard → NEW Manager | New endpoints are unused; new keys in `/api/metrics/all`, `/api/user_metrics/*` and `/api/history` are ignored. Per-user endpoints leave a NULL usage field out, and `/api/metrics/all` passes the item 11 keys through only when the latest message has them, so old data reads back exactly as before. |
-| NEW Manager → CURRENT Manager (downgrade) | Safe: CURRENT reserves the `_` and `storage_breakdown_` table prefixes, so it lists none of NEW's tables, takes no backup and ingests normally. `storage_breakdown` messages it receives go into a new wide table, which the next NEW start migrates (to `storage_breakdown_legacy_1`, ...) after its own backup, skipping runs NEW already holds (same msg_id, or same timestamp as a run stored without one); rows CURRENT stored are rolled up as a gap. While CURRENT runs, it does not show the storage-breakdown runs NEW stored (narrow tables); they are served again after the next upgrade. CURRENT updates per-user snapshot rows without the usage columns, so NEW serves those only once a new reading has them (`usage_timestamp`). Verified over three cycles by `tests/compat/test_new_payloads_old_managers.py`. Never downgrade below `fb6498c`. Going back to CURRENT needs no rollback tool: start the CURRENT code on the same `data_dir`. |
+| NEW Manager → CURRENT Manager (downgrade) | Safe: CURRENT reserves the `_` and `storage_breakdown_` table prefixes, so it lists none of NEW's tables, takes no backup and ingests normally. `storage_breakdown` messages it receives go into a new wide table, which the next NEW start migrates (to `storage_breakdown_legacy_1`, ...) after its own backup, skipping runs NEW already holds (same msg_id, or same timestamp as a run stored without one); rows CURRENT stored are rolled up as a gap. While CURRENT runs, it does not show the storage-breakdown runs NEW stored (narrow tables); they are served again after the next upgrade. CURRENT updates per-user snapshot rows without the usage columns, so NEW serves those only once a new reading has them (`usage_timestamp`). Verified over three cycles by `tests/compat/test_new_payloads_old_managers.py`. Never downgrade below the review-fix release (CURRENT: `160da09`; `fb6498c` writes the same databases). Going back to CURRENT needs no rollback tool: start the CURRENT code on the same `data_dir`. |
 
 **Data already stored:**
 

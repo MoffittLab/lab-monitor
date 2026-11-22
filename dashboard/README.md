@@ -135,7 +135,7 @@ Each appears only when the Manager and the collector provide its data.
 
 ### With an older Manager
 
-Against an OLD (`f086e7e`) or CURRENT (`fb6498c`) Manager the Dashboard works as before. The new endpoints
+Against an OLD (`f086e7e`) or CURRENT (`160da09` / `fb6498c`) Manager the Dashboard works as before. The new endpoints
 answer 404 (the OLD Manager answers `/api/user_metrics/usage` with 200 `[]`, which counts the same), which is
 **not** an error: no banner, the poll is not degraded, and the new sections are simply not shown. Charts have
 no band. Per-user cells don't open charts, and a per-user chart request answers 404 `Per-user history needs a

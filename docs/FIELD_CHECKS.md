@@ -612,14 +612,15 @@ python tools\verify_upgrade.py --manager-config $Repo\manager\config.json --data
 
 ### 29. First start on the CURRENT data
 
-After the review-fix release runs in production, the real `data_dir` is in the CURRENT (`fb6498c`)
-layout. Measure the new Manager's first start on a copy of it:
+After the review-fix release runs in production, the real `data_dir` (`E:\Users\lab-monitor\manager-data`
+after UPGRADE.md Step 3b) is in the CURRENT (`160da09`; `fb6498c` writes the same databases) layout. Measure
+the new Manager's first start on a copy of it:
 
 This is the run of [UPGRADE.md, "Verifying CURRENT → usage-metrics"](UPGRADE.md#verifying-current--usage-metrics)
 with `--keep-work` added, from the `lab-monitor-usage` worktree made there:
 
 ```powershell
-$Current = (git -C $Repo rev-parse HEAD).Trim()             # the commit the server runs (fb6498c or its merge)
+$Current = (git -C $Repo rev-parse HEAD).Trim()             # the commit the server runs (160da09 or its merge)
 python tools\verify_upgrade.py --manager-config $Repo\manager\config.json --old-ref $Current `
        --work-dir F:\verify-current --with-dashboard --keep-work --report F:\verify-current\report.json
 Select-String -Path F:\verify-current\*\logs\new-manager.log -Pattern 'Backed up|backfill complete|migrated'
@@ -639,12 +640,15 @@ Select-String -Path F:\verify-current\*\logs\new-manager.log -Pattern 'Backed up
 
 A scratch Manager on an **empty** `data_dir`, fed one month of a collector's archive twice, once with
 rollups and once without. Any collector's `YYYY-MM.jsonl` works; on atlantis the local collector's
-archive is usually in the Manager's `data_dir` ([ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md)). Pick a
-free port (5099 below) and generate a scratch token:
+archive is in that collector's own `data_dir` (`data_dir` in `collector\local\config.json`, by default
+`E:\Users\lab-monitor\data`, not the Manager's `manager-data`; before UPGRADE.md Step 3b the two could be
+one folder, [ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md)). Pick a free port (5099 below) and generate a
+scratch token:
 
 ```powershell
 $S = 'E:\lm-ingest'; New-Item -ItemType Directory "$S\on", "$S\off" -Force | Out-Null
-Copy-Item "$Data\<a collector name>\<YYYY-MM>.jsonl" "$S\month.jsonl"
+$CollectorData = (Get-Content "$Repo\collector\local\config.json" -Raw | ConvertFrom-Json).data_dir
+Copy-Item "$CollectorData\<the collector's name>\<YYYY-MM>.jsonl" "$S\month.jsonl"
 $Tok = python -c "import secrets; print(secrets.token_hex(32))"
 foreach ($m in 'on', 'off') {
   @{ host = '127.0.0.1'; port = 5099; data_dir = "$S\$m\data"; admin_tokens = @($Tok); read_tokens = @();
@@ -675,6 +679,21 @@ Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 200 | Select-String 'bac
 
 - **Pass:** the backfill finishes (`complete: true` for every system and table) and the Dashboard shows
   the new sections once upgraded collectors report.
+
+**And the snapshots** (larger now, with the rollup tables): after the next nightly run, or take one with
+`POST /api/snapshot` (admin token) as in [UPGRADE.md, Step 4](UPGRADE.md#step-4-check-the-upgraded-server):
+
+```powershell
+$S = Invoke-RestMethod http://localhost:5000/api/snapshot -Headers $H           # read token
+$S | Select-Object last_result, last_success, last_snapshot, last_bytes, last_seconds, last_failed, last_error
+python $Repo\manager\snapshot.py verify $S.last_snapshot
+```
+
+- **Pass:** `last_result` `ok`, `last_success` after the upgrade, `last_bytes` about the size of the
+  databases, `verify` prints `OK`, and no ingest errors in `manager.log` while it ran (`last_seconds` long).
+- **If it fails:** `partial` names the database it could not copy (`last_failed`); `error` with "Not
+  enough free space" means the NAS folder (or the local staging disk) needs room for one more copy of the
+  larger databases.
 
 ---
 

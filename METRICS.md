@@ -463,7 +463,7 @@ on the first start. Long history charts are answered from them. Details:
 [manager/README.md](manager/README.md#rollups).
 
 The Manager reserves the table prefixes `_` and `storage_breakdown_`, so no `data_type` can produce
-such a table, and the review-fix Manager (`fb6498c`) ignores them after a downgrade.
+such a table, and the review-fix Manager (`160da09` / `fb6498c`) ignores them after a downgrade.
 
 ### Central summary: `metrics.db`
 

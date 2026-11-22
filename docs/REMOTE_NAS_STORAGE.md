@@ -15,9 +15,11 @@ You can store the Manager's databases on a NAS share (for example
 `\\triton1.hms.harvard.edu\lab-monitor-data`) instead of the local atlantis drive, so they are
 covered by the NAS's snapshots and backups. This page explains what that requires.
 
-**Default and simplest: a local `data_dir`** (`E:\Users\lab-monitor\data`), backed up by copying
-it (see [Backup & Snapshot Strategy](#backup--snapshot-strategy)). Use a share only if you need
-the NAS to hold the live databases.
+**The default: a local `data_dir` of its own** (`E:\Users\lab-monitor\manager-data`, not the local
+collector's `E:\Users\lab-monitor\data`), copied to the NAS every night by the Manager's
+[snapshots](../manager/README.md#snapshots-to-a-nas). The NAS then holds consistent copies, and
+its own snapshots and replication cover them. Don't use a share for the live databases (see the
+banner above).
 
 ---
 
@@ -145,8 +147,9 @@ drive letter. Use the UNC path instead.
 
 The Manager opens its SQLite databases in WAL mode. SQLite's documentation warns that WAL needs all
 processes using a database to be on the same machine and that network file systems can break
-SQLite's locking. With **exactly one Manager, on one server,** using the share this generally works,
-but a local disk is more robust:
+SQLite's locking. That is what happened on this lab's server, even with exactly one Manager: failed
+transactions and `disk I/O error` (see the banner). Move such an install to a local disk
+([Migration from Remote back to Local](#migration-from-remote-back-to-local)). Until then:
 
 - Never point two Managers (or a Manager and a copy job that writes) at the same files.
 - Network latency makes every write slower. The Manager commits up to `ingest_commit_messages` (100)
@@ -160,19 +163,21 @@ but a local disk is more robust:
 
 ## Backup & Snapshot Strategy
 
-**Option B (Manager on the share):** NAS snapshots capture `metrics.db` and every `data.db`. A
-snapshot that captures a database and its `-wal` file at the same instant is crash-consistent:
-SQLite recovers it on open, as after a power cut.
-
-**Local `data_dir`:** copy it regularly. A consistent copy needs the Manager stopped for the copy
+**Local `data_dir` (the default):** the Manager's nightly [snapshots](../manager/README.md#snapshots-to-a-nas)
+copy every database consistently to `snapshot.dest_dir` on the NAS while it keeps running, verify each
+copy and prune old ones. By hand instead, a consistent copy needs the Manager stopped for the copy
 (collectors queue meanwhile):
 
 ```powershell
 Stop-ScheduledTask -TaskName "Lab Monitor Manager"
 # make sure the python process is gone (see INSTALLATION.md, "Restart a service")
-robocopy E:\Users\lab-monitor\data \\triton1.hms.harvard.edu\lab-monitor-backup\data /MIR /COPY:DAT /R:2 /W:5
+robocopy E:\Users\lab-monitor\manager-data \\triton1.hms.harvard.edu\lab-monitor-backup\data /MIR /COPY:DAT /R:2 /W:5
 Start-ScheduledTask -TaskName "Lab Monitor Manager"
 ```
+
+**Option B (Manager on the share, not recommended):** NAS snapshots capture `metrics.db` and every
+`data.db`. A snapshot that captures a database and its `-wal` file at the same instant is
+crash-consistent: SQLite recovers it on open, as after a power cut.
 
 (`/MIR` deletes files in the destination that no longer exist in the source; use a dated folder and
 `/E` instead if you want to keep every copy.)
@@ -184,12 +189,15 @@ Manager history can be rebuilt from them with `tools/replay_archives.py`.
 
 ## Setup Steps (switching to a share)
 
+Not recommended (see the banner); kept for reference. For a NAS copy of the databases, turn on
+[snapshots](../manager/README.md#snapshots-to-a-nas) instead.
+
 1. **Create the share** on the NAS (e.g. `lab-monitor-data`) with read/write for the account the
    Manager tasks will run as.
 2. **Stop the Manager and Dashboard** and make sure the processes are gone.
 3. **Copy the existing data** (keeps all history):
    ```powershell
-   robocopy E:\Users\lab-monitor\data \\triton1.hms.harvard.edu\lab-monitor-data /E /COPY:DAT /R:2 /W:5
+   robocopy <the current data_dir> \\triton1.hms.harvard.edu\lab-monitor-data /E /COPY:DAT /R:2 /W:5
    ```
    This also copies atlantis's own collector files (`YYYY-MM.jsonl`, `queue.json`); the copies on
    the share are simply not used, and the collector keeps writing locally (Option B). Keep the local
@@ -244,8 +252,20 @@ Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object Comma
 
 ## Migration from Remote back to Local
 
-Stop the Manager, copy the share's contents back to `E:\Users\lab-monitor\data`, set `data_dir` back,
-and re-run the installer (it then uses S4U again).
+Follow [manager/README.md, "Moving `data_dir` off the NAS"](../manager/README.md#moving-data_dir-off-the-nas)
+(during the review-fix upgrade: [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard)):
+
+- Copy the Manager's files only (`metrics.db*`, `<system>\data.db*` with their `.bak` copies,
+  `<system>\archive\`, `<name>\usage.jsonl`), with the Manager stopped, to
+  `E:\Users\lab-monitor\manager-data`. **Not** to `E:\Users\lab-monitor\data`: that is the local
+  collector's folder, and the Manager warns at every start when its databases share it. The share's
+  copies of collector files (`YYYY-MM.jsonl`, `queue.json*`) are not needed.
+- Set `data_dir` to that folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a
+  `snapshots` folder next to the old data).
+- Re-run the installer. With an enabled UNC `snapshot.dest_dir` it keeps a stored password for the
+  tasks (an S4U task could not reach the share); only with snapshots off does it go back to S4U.
+- Keep the share's `data_dir` untouched until a few days of the local one, and a snapshot, have been
+  checked (`GET /api/snapshot`, `snapshot.py verify`); then remove it by hand.
 
 ---
 

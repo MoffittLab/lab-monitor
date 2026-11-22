@@ -122,6 +122,8 @@ to roll back, because the previous Manager knows only that key.
 | `history_retention_days` | `null` | `null` keeps all history forever. A number N archives rows older than N days to `data/<system>/archive/<YYYY-MM>-<data_type>.jsonl` once a day, then deletes them from the database. A rolled-up table is pruned only once its rollups are complete; the hourly and daily rollups themselves are kept forever ([manager/README.md](manager/README.md#retention)) |
 | `rollups` | `{"enabled": true, ...}` | Hourly and daily aggregates of the history. They only add tables; `"enabled": false` stops writing them ([manager/README.md](manager/README.md#rollups)) |
 | `retention_days` | — | Legacy. It only applied to the old `usage.jsonl` reports and has no effect now |
+| `data_dir` | `data` (installer: `E:\Users\lab-monitor\manager-data`) | Keep it on a **local disk**, in a folder nothing else writes to. SQLite is not reliable on a network share (`disk I/O error`, failed transactions); the Manager logs a `WARNING` at every start while it is on a share or holds a collector's files ([manager/README.md](manager/README.md#recommended-layout)) |
+| `snapshot` | off | Nightly consistent copies of every database to `snapshot.dest_dir` (a NAS folder outside `data_dir`), each verified by SHA-256 and `quick_check`; 14 daily and 12 monthly kept. A database that can't be copied is reported (`partial`) while the others still are. The snapshots hold the same per-user data as the databases ([docs/PRIVACY.md](docs/PRIVACY.md)) and are not removed by `DELETE /api/system` ([manager/README.md](manager/README.md#snapshots-to-a-nas)) |
 
 ---
 
