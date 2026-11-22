@@ -626,6 +626,42 @@ that could not be renamed), `2` refused (a Manager is running, bad arguments, no
 `verify_upgrade.py` runs this tool on its migrated copy (check `rollback`), so a PASS there means
 the rollback works on your data.
 
+### 10. `dedupe_history.py` — Remove Duplicate Rows the Old Manager Stored (run on the Manager server)
+
+Before the upgrade, a collector re-sent its whole queue whenever a save failed or a response timed
+out, and the old Manager stored every copy. The new Manager stores each message once, but the copies
+already stored stay until this tool removes them. A duplicate is a row stored before the upgrade
+(`msg_id` NULL) that is identical, in every column but its row id, to an earlier row of the same table;
+the earliest copy is kept. Rows that differ in any value, and everything the new Manager stored, are
+never touched; nor are `folder_usage_legacy`, the device registry, snapshots, lifetime totals or any
+backup. Standard library only; run it from the checkout with the Manager's Python.
+
+```powershell
+python tools\dedupe_history.py --manager-config manager\config.json          # report (read-only)
+Stop-ScheduledTask "Lab Monitor Manager"
+python tools\dedupe_history.py --manager-config manager\config.json --apply --vacuum
+Start-ScheduledTask "Lab Monitor Manager"
+```
+
+- **Report** (default) changes nothing and can run while the Manager runs.
+- **`--apply`** holds `<data_dir>\manager.lock`, so it refuses while a Manager runs. For each database
+  with duplicates it first writes `<db>.pre-dedupe-<stamp>.bak` (backup API, complete or absent), then
+  deletes the duplicates in **one transaction** and checks before committing: every distinct row still
+  there exactly once, rows with a `msg_id` untouched, folder scans without orphaned items,
+  `PRAGMA quick_check` ok. A failed check rolls that database back unchanged (exit code 2).
+- **`--vacuum`** compacts each changed file afterwards (the space is returned; needs free space of
+  about the largest database). `--only <system>` (repeatable; `metrics` for `metrics.db`) limits the run.
+- **Undo:** stop the Manager, delete the database's `-wal`/`-shm` files and copy its `.pre-dedupe-*.bak`
+  over it. Delete the `.bak` files once the Dashboard looks right.
+
+Measured on a copy of a 2.9 GB production `data_dir` (23 systems, about 30 % duplicates): 11 minutes,
+5.4 of them for `metrics.db`; 2.9 GB → 1.7 GB. The Manager answered identically before and after
+except for the removed repeats (same devices, totals and current metrics; every chart series and row
+list with the same distinct entries).
+
+**Exit codes:** `0` done (or nothing to do), `1` refused (Manager running, bad arguments, not enough
+space), `2` a database failed its check and was rolled back (the others were done).
+
 ---
 
 ## Common Workflows
