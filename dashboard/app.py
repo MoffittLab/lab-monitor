@@ -21,6 +21,7 @@ import getpass
 import hashlib
 import logging
 import secrets
+import mimetypes
 import argparse
 import threading
 from collections import namedtuple
@@ -141,6 +142,25 @@ SESSION_KEY_FILE      = Path(__file__).resolve().parent / '.session_key'
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
+
+# Content types of the static files, set here instead of trusting the system:
+# on Windows mimetypes reads the registry, where .js is often "text/plain".
+# Every response carries X-Content-Type-Options: nosniff, so a browser refuses
+# to run a script (or apply a stylesheet) served with the wrong type, and the
+# page stays empty.
+STATIC_TYPES = {
+    '.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+    '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2',
+}
+
+
+def register_static_types():
+    for ext, content_type in STATIC_TYPES.items():
+        mimetypes.add_type(content_type, ext)
+
+
+register_static_types()
 
 app = Flask(__name__)
 
