@@ -904,5 +904,26 @@ def test_static_files_have_the_types_browsers_require_under_nosniff(make_client)
 def test_page_loads_its_script_and_stylesheet_from_static(make_client):
     client, _ = make_client()
     page = client.get('/').get_data(as_text=True)
-    assert '/static/js/dashboard.js' in page and '/static/css/style.css' in page
+    assert '/static/js/dashboard.js?v=' in page and '/static/css/style.css?v=' in page
     assert client.get('/static/js/dashboard.js').headers['Content-Type'].startswith('text/javascript')
+
+
+def test_pages_use_versioned_static_urls_so_cached_copies_are_not_reused(make_client, monkeypatch):
+    import re
+    client, _ = make_client()
+    page = client.get('/').get_data(as_text=True)
+    urls = re.findall(r'(?:src|href)="(/static/[^"]+)"', page)
+    assert len(urls) == 2
+    for url in urls:
+        # A URL no browser has cached: a copy saved with a wrong Content-Type
+        # (kept through "304 Not Modified") is never used again
+        assert re.search(rf'\?v={dash.STATIC_HEADERS_VERSION}-[0-9a-f]+-[0-9a-f]+$', url), url
+        resp = client.get(url)
+        assert resp.status_code == 200
+        resp.close()
+
+    with dash.app.test_request_context():
+        before = dash.static_url('js/dashboard.js')
+        monkeypatch.setattr(dash, 'STATIC_HEADERS_VERSION', dash.STATIC_HEADERS_VERSION + 1)
+        assert dash.static_url('js/dashboard.js') != before
+        assert dash.static_url('no/such/file.js').endswith(f'?v={dash.STATIC_HEADERS_VERSION}')
