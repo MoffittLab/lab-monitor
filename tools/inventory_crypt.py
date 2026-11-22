@@ -171,6 +171,8 @@ def validate(rows: list, fieldnames: list) -> list:
             seen[ip.lower()] = i
         if 'username' in fieldnames and not row.get('username', '').strip():
             problems.append(f"line {i}: {ip or '?'} has an empty username")
+    import _ssh  # the fleet tools' own check of the platform column
+    problems += [f'platform: {p}' for p in _ssh.platform_problems(rows)]
     return problems
 
 

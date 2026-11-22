@@ -130,7 +130,8 @@ def read_inventory(csv_path) -> tuple:
 
     Header names are stripped of whitespace and a UTF-8 BOM (Excel) is
     tolerated. Columns: ip, username, password, git_path, python_path, plus
-    the optional key_filename and port.
+    the optional key_filename, port and platform (an unknown platform value
+    exits with code 1).
 
     A file encrypted with inventory_crypt.py (recognized by its first bytes,
     whatever its name) is decrypted in memory after asking for the passphrase
@@ -148,15 +149,19 @@ def read_inventory(csv_path) -> tuple:
         except (KeyboardInterrupt, EOFError):
             print('\nCancelled.')
             raise SystemExit(1)
-        return rows, fieldnames
-    with open(csv_path, newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        fieldnames = [(n or '').strip() for n in (reader.fieldnames or [])]
-        reader.fieldnames = fieldnames
-        rows = []
-        for row in reader:
-            # Normalize missing cells (short rows) to '' so .strip() is safe.
-            rows.append({k: (v if v is not None else '') for k, v in row.items() if k is not None})
+    else:
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            fieldnames = [(n or '').strip() for n in (reader.fieldnames or [])]
+            reader.fieldnames = fieldnames
+            rows = []
+            for row in reader:
+                # Normalize missing cells (short rows) to '' so .strip() is safe.
+                rows.append({k: (v if v is not None else '') for k, v in row.items() if k is not None})
+    problems = platform_problems(rows)
+    if problems:
+        print(f'ERROR: {csv_path}: ' + '; '.join(problems))
+        raise SystemExit(1)
     return rows, fieldnames
 
 
@@ -193,6 +198,60 @@ def row_value(row: dict, key: str, default: str = '') -> str:
     if value is None:
         return default
     return str(value).strip() or default
+
+
+# ---------------------------------------------------------------------------
+# Linux installs (platform column = linux)
+# ---------------------------------------------------------------------------
+# install-collector-linux.sh puts the collector in fixed places, owned by root,
+# and runs it as the 'labmon' user from systemd timers. The tools reach it with
+# 'sudo -n' (never prompting: a missing sudoers rule fails at once instead of
+# hanging) and the exact commands below, which the sudoers rule in
+# tools/README.md ("Linux collectors") allows. git_path is the administrator's
+# checkout that updates come from; python_path is not used.
+
+PLATFORMS = ('', 'synology', 'windows', 'linux')
+LINUX_PYTHON = '/opt/lab-monitor/venv/bin/python'
+LINUX_CONFIG_TOOL = '/opt/lab-monitor/collector/config_tool.py'
+LINUX_CONFIG = '/etc/lab-monitor/collector.json'
+LINUX_SERVICE_USER = 'labmon'
+LINUX_INSTALLER = 'install-collector-linux.sh'
+SUDO = 'sudo -n'
+
+
+def row_platform(row: dict) -> str:
+    """The platform column, lower case ('' when absent: Synology or Windows, told apart by the paths)."""
+    return row_value(row, 'platform').lower()
+
+
+def is_linux_install(row: dict) -> bool:
+    return row_platform(row) == 'linux'
+
+
+def platform_problems(rows: list) -> list:
+    """Rows whose platform column holds an unknown value."""
+    return [f"{row_value(r, 'ip') or '?'}: unknown platform {row_value(r, 'platform')!r} "
+            f"(use linux for an install-collector-linux.sh install, or leave it empty)"
+            for r in rows if row_platform(r) not in PLATFORMS]
+
+
+def linux_config_tool_command(args: str) -> str:
+    """config_tool.py on a Linux install's config, as root (the config is 0640 root:labmon)."""
+    return f'{SUDO} {LINUX_PYTHON} {LINUX_CONFIG_TOOL} --config {LINUX_CONFIG} {args}'
+
+
+def linux_installer_path(row: dict) -> str:
+    return row_value(row, 'git_path').rstrip('/') + '/' + LINUX_INSTALLER
+
+
+def sudo_hint(text: str) -> str:
+    """A hint to append when sudo refused to run without a password, else ''."""
+    low = (text or '').lower()
+    if 'password is required' in low or 'a terminal is required' in low or 'not allowed to' in low \
+            or 'may not run sudo' in low:
+        return (' -- sudo would need a password for this command: add the fleet sudoers rule on '
+                'that host (tools/README.md, "Linux collectors")')
+    return ''
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,8 @@ atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/Prog
 - `python_path` — path to the Python interpreter in the collector environment
 - `key_filename` — *optional* private key file to offer first
 - `port` — *optional* SSH port (default 22)
+- `platform` — *optional*: `linux` for a system installed with `install-collector-linux.sh`
+  (see [Linux collectors](#linux-collectors-platform--linux)); empty for Synology and Windows
 
 The optional columns can be added to an existing CSV at any time; CSVs without
 them keep working unchanged. A UTF-8 BOM (Excel) is fine.
@@ -86,6 +88,56 @@ python update_collectors.py --csv collectors.csv.enc --dry-run
   and AES-256-GCM, which also detects a damaged or altered file.
 - SSH keys are still better than passwords: with a key in the `key_filename` column (or in
   `ssh-agent`) the `password` column can stay empty.
+
+---
+
+### Linux collectors (`platform` = `linux`)
+
+`install-collector-linux.sh` installs differently from the Synology and Windows installers: the code
+is a root-owned copy in `/opt/lab-monitor` (not a git checkout), the config is
+`/etc/lab-monitor/collector.json` (`0640 root:labmon`), and systemd timers run the collector as the
+`labmon` user. Mark such a system with `platform` = `linux` and set `git_path` to the
+administrator's checkout the installer was run from; `python_path` can stay empty.
+
+```csv
+ip,username,password,git_path,python_path,key_filename,platform
+server1.example.org,admin,,/home/admin/code/lab-monitor,,~/.ssh/id_ed25519,linux
+```
+
+| Tool | On a `linux` row |
+|------|------------------|
+| `update_collectors.py` | `git pull` in `git_path`, then `sudo -n <git_path>/install-collector-linux.sh --non-interactive` (refreshes code, venv and units; keeps the config). `--upgrade-pip` adds nothing: the installer handles the venv |
+| `run_collectors.py` | `sudo -n systemctl start lab-monitor-<mode>.service`: the run gets the unit's user, sandbox and time limit, and returns when it has finished (`sudo journalctl -u lab-monitor-<mode>.service` on the host has its log) |
+| `toggle_collectors.py` | `config_tool.py` on `/etc/lab-monitor/collector.json` as root, so `active` is kept in the config like everywhere else (an update keeps it) |
+| `archive_all_collectors.py` | reads the config as root, then moves the archives as `labmon` (`sudo -n -u labmon /bin/sh -c ...`), which owns `/var/lib/lab-monitor` |
+
+`sudo -n` never asks for a password: without a sudoers rule the step fails at once with a hint,
+instead of hanging. Add the rule on the host with `sudo visudo -f /etc/sudoers.d/lab-monitor-fleet`,
+replacing `ADMIN` with the row's `username` and `CHECKOUT` with its `git_path`:
+
+```
+# lab-monitor fleet tools (tools/*.py): commands ADMIN may run over SSH without a password
+Cmnd_Alias LABMON_RUN = /usr/bin/systemctl start lab-monitor-metrics.service, \
+                        /usr/bin/systemctl start lab-monitor-disk.service
+Cmnd_Alias LABMON_CFG = /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json list --json, \
+                        /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json set active true --json, \
+                        /opt/lab-monitor/venv/bin/python /opt/lab-monitor/collector/config_tool.py --config /etc/lab-monitor/collector.json set active false --json
+Cmnd_Alias LABMON_UPDATE = CHECKOUT/install-collector-linux.sh --non-interactive
+ADMIN ALL=(root) NOPASSWD: LABMON_RUN, LABMON_CFG, LABMON_UPDATE
+ADMIN ALL=(labmon) NOPASSWD: /bin/sh
+```
+
+Check it with `sudo -l -U ADMIN`, then `python run_collectors.py --csv ... --mode metrics --only server1`.
+
+- **What the rule allows.** `LABMON_UPDATE` runs, as root, whatever installer the checkout holds after
+  `git pull`: whoever can push to `main`, or write to `CHECKOUT`, can then run code as root on that
+  host at the next update, with no chance to read it first. It is the same code you would run by
+  hand, but unattended. To keep updates manual, leave `LABMON_UPDATE` out; the update step then
+  fails with the sudo hint and you run the installer yourself. The `(labmon) /bin/sh` line gives
+  ADMIN a shell as the service user, which can read the collector's token and data; ADMIN, a
+  sudo administrator, could do that anyway.
+- `config_tool.py` keeps the config file's owner and mode when it saves, so `labmon` can still read
+  it after a toggle run as root.
 
 ---
 

@@ -60,6 +60,27 @@ def vprint(msg: str):
 DEFAULT_COMMAND_TIMEOUT = {'metrics': 600, 'disk': 0}
 
 
+def build_run_command(row: dict, mode: str) -> str:
+    """The remote command that runs one collection on this system."""
+    if _ssh.is_linux_install(row):
+        # Through systemd, so the run gets the unit's user (labmon), sandbox and
+        # capabilities. The units are oneshot: start returns when the run has
+        # finished, with a non-zero exit if it failed.
+        return f'{_ssh.SUDO} systemctl start lab-monitor-{mode}.service'
+
+    git_path = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path')
+    # Normalize paths: convert backslashes to forward slashes for SSH
+    if is_windows_path(git_path) or is_windows_path(python_path):
+        git_path = git_path.replace('\\', '/')
+        python_path = python_path.replace('\\', '/')
+
+    # Absolute paths: no cd needed; works on both Windows and Unix over SSH
+    collector_py = f"{git_path}/collector/collector.py"
+    config_json = f"{git_path}/collector/local/config.json"
+    return f'"{python_path}" "{collector_py}" --config "{config_json}" --mode {mode}'
+
+
 def run_collection(row: dict, mode: str, dry_run: bool, timeout: int,
                    command_timeout: float = None) -> dict:
     """
@@ -81,18 +102,8 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int,
         'elapsed': 0.0,
     }
 
-    # Normalize paths: convert backslashes to forward slashes for SSH
-    windows = is_windows_path(git_path) or is_windows_path(python_path)
-    if windows:
-        git_path = git_path.replace('\\', '/')
-        python_path = python_path.replace('\\', '/')
-    
-    # Construct absolute paths (no cd needed; works on both Windows and Unix over SSH)
-    collector_py = f"{git_path}/collector/collector.py"
-    config_json = f"{git_path}/collector/local/config.json"
-    
-    # Run Python with absolute paths
-    command = f'"{python_path}" "{collector_py}" --config "{config_json}" --mode {mode}'
+    command = build_run_command(row, mode)
+    linux = _ssh.is_linux_install(row)
 
     if dry_run:
         result['status'] = 'dry-run'
@@ -111,11 +122,16 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int,
 
             if exit_code == 0:
                 result['status'] = 'ok'
-                result['output'] = stdout or '(no output)'
+                result['output'] = stdout or (
+                    f'lab-monitor-{mode}.service finished; its log: '
+                    f'sudo journalctl -u lab-monitor-{mode}.service -n 30' if linux else '(no output)')
             else:
                 result['status'] = 'error'
                 result['output'] = stdout
                 result['error'] = stderr or f'exit code {exit_code}'
+                if linux:
+                    result['error'] += _ssh.sudo_hint(result['error']) or (
+                        f' -- see: sudo journalctl -u lab-monitor-{mode}.service -n 30')
 
         finally:
             client.close()
