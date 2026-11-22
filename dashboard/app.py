@@ -16,20 +16,22 @@ import json
 import math
 import hmac
 import time
+import base64
 import getpass
 import hashlib
 import logging
+import secrets
 import argparse
 import threading
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
-from flask import Flask, Response, render_template, jsonify, request
+from flask import Flask, g, render_template, jsonify, redirect, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -92,15 +94,24 @@ def validate_config(config: dict) -> list:
 
     auth = config.get('auth')
     if auth is not None:
-        if not isinstance(auth, dict) or not auth.get('username') or not auth.get('password_hash'):
+        if not isinstance(auth, dict) or not auth.get('password_hash'):
             raise ValueError(
-                "config 'auth' must be {\"username\": ..., \"password_hash\": ...} "
+                "config 'auth' must be {\"password_hash\": ...} "
                 "(generate the hash with: python app.py --hash-password), or be removed")
         # werkzeug hashes look like "<method>$<salt>$<hash>"
         if str(auth['password_hash']).count('$') < 2:
             raise ValueError(
                 "config 'auth.password_hash' is not a password hash; "
                 "generate one with: python app.py --hash-password")
+        days = auth.get('remember_days', DEFAULT_REMEMBER_DAYS)
+        if isinstance(days, bool) or not isinstance(days, (int, float)) \
+                or not math.isfinite(days) or not (1 <= days <= MAX_REMEMBER_DAYS):
+            raise ValueError(
+                f"config 'auth.remember_days' must be a number from 1 to {MAX_REMEMBER_DAYS} "
+                f"(default {DEFAULT_REMEMBER_DAYS})")
+        if auth.get('username'):
+            warnings.append("auth.username is no longer used: sign-in is by password only "
+                            "(remove it from the config)")
 
     token = str(config.get('manager_token') or '')
     if not token:
@@ -115,6 +126,16 @@ def validate_config(config: dict) -> list:
             f"port {config.get('port', 5001)} can view it. Configure 'auth' "
             f"(python app.py --hash-password) or bind to 127.0.0.1 behind a proxy.")
     return warnings
+
+
+# Sign-in (config "auth"): one shared password, then a signed cookie that keeps
+# the browser signed in.  See the "Sign-in" section below.
+DEFAULT_REMEMBER_DAYS = 180
+MAX_REMEMBER_DAYS     = 3650
+SESSION_COOKIE        = 'lab_monitor_session'
+# Default place of the key that signs the cookies (config auth.session_key_file
+# overrides it).  Created on first start; treat it like config.json.
+SESSION_KEY_FILE      = Path(__file__).resolve().parent / '.session_key'
 
 
 # ---------------------------------------------------------------------------
@@ -183,16 +204,17 @@ class _TTLCache:
 
 _data_cache = _TTLCache()
 
-# Successful basic-auth credentials, stored as keyed digests so that each
-# request doesn't re-run the (deliberately slow) password hash check.
-_auth_lock     = threading.Lock()
-_auth_verified = set()
-_auth_cache_key = os.urandom(32)
-_AUTH_CACHE_MAX = 32
+# Sign-in state.  _signing_key is derived from the key file and the password
+# hash (None while auth is off); _login_failures counts wrong passwords per
+# client address.  Wall clock for cookie ages (patched in tests).
+_signing_key    = None
+_login_lock     = threading.Lock()
+_login_failures = {}
+_now = time.time
 
 
 def init_app(config: dict, logger: logging.Logger):
-    global _config, _logger, _session, _registered_names
+    global _config, _logger, _session, _registered_names, _signing_key
     for warning in validate_config(config):
         logger.warning(warning)
     _config = config
@@ -200,8 +222,9 @@ def init_app(config: dict, logger: logging.Logger):
     with _session_lock:
         _session = None
     _data_cache.clear()
-    with _auth_lock:
-        _auth_verified.clear()
+    with _login_lock:
+        _login_failures.clear()
+    _signing_key = _make_signing_key(config['auth'], logger) if config.get('auth') else None
     _registered_names = frozenset()
 
 
@@ -652,53 +675,263 @@ def downsample(points: list, max_points: int) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Auth (optional HTTP basic auth for the whole dashboard)
+# Sign-in (optional; config "auth": {"password_hash": ...})
+#
+# One shared password.  A correct password sets a cookie that keeps that
+# browser signed in for auth.remember_days (default 180), renewed as it is
+# used, so a computer in regular use is not asked again.  The cookie is
+#     v1.<issued, unix seconds>.<random>.<HMAC-SHA256 of the first three parts>
+# and holds nothing secret.  Its signing key is derived from the key file
+# (.session_key, created on first start) and the password hash, so:
+#   - changing the password signs every browser out;
+#   - deleting the key file and restarting does the same;
+#   - a restart alone keeps everyone signed in.
+# The Dashboard itself speaks plain http: the password crosses the network
+# once per sign-in, the cookie with every request.  Put it behind an HTTPS
+# proxy to protect both (the cookie is then marked Secure).
 # ---------------------------------------------------------------------------
 
-def _check_credentials(username: str, password: str) -> bool:
-    auth_cfg = _config['auth']
-    key = hmac.new(_auth_cache_key,
-                   f"{username}\0{password}".encode('utf-8', 'replace'),
-                   hashlib.sha256).digest()
-    with _auth_lock:
-        if key in _auth_verified:
-            return True
+# Cookies older than this are reissued, so the 180 days count from the last
+# visit, without setting a cookie on every poll
+SESSION_RENEW_SECONDS = 24 * 3600
+# Wrong passwords from one client address: after LOGIN_MAX_FAILURES within
+# LOGIN_WINDOW_SECONDS, sign-in from that address is refused for
+# LOGIN_LOCK_SECONDS (before the password is even checked).  Browsers that are
+# already signed in are not affected.
+LOGIN_MAX_FAILURES   = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_LOCK_SECONDS   = 15 * 60
+_LOGIN_TABLE_MAX     = 2000
+MAX_PASSWORD_LEN     = 1024
 
-    # Always run the hash check so a wrong username costs the same time
-    user_ok = hmac.compare_digest(username.encode('utf-8', 'replace'),
-                                  str(auth_cfg['username']).encode('utf-8', 'replace'))
+# Served without sign-in: /health carries no system data and lets
+# tools/restart_manager_dashboard.py (and load balancers) see a 200; the
+# sign-in page and its form target; static files (stylesheet, script, images:
+# no system data, and the sign-in page needs the stylesheet).
+AUTH_EXEMPT_PATHS = frozenset({'/health', '/login', '/logout'})
+
+
+def _load_session_key(path: Path, logger: logging.Logger) -> bytes:
+    """The key file's content, creating the file (mode 0600) when it doesn't exist."""
     try:
-        pass_ok = check_password_hash(str(auth_cfg['password_hash']), password)
+        key = path.read_bytes().strip()
+        if len(key) >= 32:
+            return key
+        logger.warning(f"{path} is too short to be a sign-in key; writing a new one "
+                       f"(every browser has to sign in again)")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Cannot read the sign-in key {path} ({e}); using a temporary key: "
+                       f"browsers have to sign in again after every Dashboard restart")
+        return secrets.token_hex(32).encode('ascii')
+    key = secrets.token_hex(32).encode('ascii')
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(key + b'\n')
+        logger.info(f"Created the sign-in key {path}")
+    except OSError as e:
+        logger.warning(f"Cannot save the sign-in key to {path} ({e}): browsers have to sign in "
+                       f"again after every Dashboard restart")
+    return key
+
+
+def _make_signing_key(auth_cfg: dict, logger: logging.Logger) -> bytes:
+    path = Path(auth_cfg.get('session_key_file') or SESSION_KEY_FILE)
+    file_key = _load_session_key(path, logger)
+    return hmac.new(file_key, str(auth_cfg['password_hash']).encode('utf-8'), hashlib.sha256).digest()
+
+
+def _remember_seconds() -> int:
+    days = (_config.get('auth') or {}).get('remember_days', DEFAULT_REMEMBER_DAYS)
+    return int(float(days) * 86400)
+
+
+def _sign(payload: str) -> str:
+    mac = hmac.new(_signing_key, payload.encode('ascii'), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode('ascii').rstrip('=')
+
+
+def _new_session_token() -> str:
+    payload = f"v1.{int(_now())}.{secrets.token_urlsafe(12)}"
+    return f"{payload}.{_sign(payload)}"
+
+
+def _session_issued(token):
+    """When a valid, unexpired session cookie was issued (unix seconds), else None."""
+    if not token or _signing_key is None or len(token) > 256:
+        return None
+    try:
+        payload, mac = token.rsplit('.', 1)
+        version, issued, _nonce = payload.split('.')
+        if version != 'v1' or not issued.isdigit():
+            return None
+        if not hmac.compare_digest(mac.encode('ascii', 'replace'), _sign(payload).encode('ascii')):
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    age = _now() - int(issued)
+    # A little clock skew is fine; a cookie from the future is not
+    if age < -300 or age > _remember_seconds():
+        return None
+    return int(issued)
+
+
+def _set_session_cookie(resp):
+    resp.set_cookie(SESSION_COOKIE, _new_session_token(), max_age=_remember_seconds(),
+                    httponly=True, samesite='Lax', path='/',
+                    secure=request.is_secure or bool((_config.get('auth') or {}).get('cookie_secure')))
+    return resp
+
+
+def _check_password(password: str) -> bool:
+    if not password or len(password) > MAX_PASSWORD_LEN:
+        return False
+    try:
+        return check_password_hash(str(_config['auth']['password_hash']), password)
     except (ValueError, TypeError):
         _logger.error("auth.password_hash in config is not a valid werkzeug hash")
-        pass_ok = False
+        return False
 
-    if user_ok and pass_ok:
-        with _auth_lock:
-            if len(_auth_verified) >= _AUTH_CACHE_MAX:
-                _auth_verified.clear()
-            _auth_verified.add(key)
-        return True
+
+def _login_locked_seconds(client: str) -> int:
+    """Seconds this client still has to wait before it may try a password again (0 = may try)."""
+    now = _monotonic()
+    with _login_lock:
+        entry = _login_failures.get(client)
+        if not entry:
+            return 0
+        if entry['locked_until'] > now:
+            return int(math.ceil(entry['locked_until'] - now))
+        if now - entry['first'] > LOGIN_WINDOW_SECONDS:
+            del _login_failures[client]
+        return 0
+
+
+def _login_failed(client: str):
+    now = _monotonic()
+    with _login_lock:
+        if len(_login_failures) >= _LOGIN_TABLE_MAX and client not in _login_failures:
+            # Forget finished entries first; then, rather than grow without
+            # bound, the oldest ones
+            for key in [k for k, e in _login_failures.items()
+                        if e['locked_until'] <= now and now - e['first'] > LOGIN_WINDOW_SECONDS]:
+                del _login_failures[key]
+            while len(_login_failures) >= _LOGIN_TABLE_MAX:
+                del _login_failures[min(_login_failures, key=lambda k: _login_failures[k]['first'])]
+        entry = _login_failures.get(client)
+        if not entry or now - entry['first'] > LOGIN_WINDOW_SECONDS:
+            entry = _login_failures[client] = {'count': 0, 'first': now, 'locked_until': 0.0}
+        entry['count'] += 1
+        if entry['count'] >= LOGIN_MAX_FAILURES:
+            entry['locked_until'] = now + LOGIN_LOCK_SECONDS
+            entry['count'] = 0
+            entry['first'] = now
+            return True
     return False
 
 
-# Served without basic auth: /health carries no system data and lets
-# tools/restart_manager_dashboard.py (and load balancers) see a 200.
-AUTH_EXEMPT_PATHS = frozenset({'/health'})
+def _login_succeeded(client: str):
+    with _login_lock:
+        _login_failures.pop(client, None)
+
+
+def _safe_next(target) -> str:
+    """A path on this site to go to after sign-in ('/' for anything else: no open redirect)."""
+    target = str(target or '')
+    if not target.startswith('/') or target.startswith('//') or '\\' in target \
+            or any(ord(c) < 32 for c in target) or len(target) > 2000:
+        return '/'
+    if urlsplit(target).netloc or target.split('?', 1)[0] in ('/login', '/logout'):
+        return '/'
+    return target
+
+
+def _same_origin() -> bool:
+    """False when a form post names another site as its origin (cross-site request)."""
+    source = request.headers.get('Origin') or request.headers.get('Referer')
+    if not source or source == 'null':
+        return source != 'null'
+    return urlsplit(source).netloc == request.host
+
+
+def _login_page(next_url: str, error: str = None, status: int = 200):
+    resp = app.make_response((render_template(
+        'login.html', next_url=next_url, error=error,
+        remember_days=int(round(_remember_seconds() / 86400))), status))
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.before_request
-def _require_basic_auth():
+def _require_sign_in():
     if not _config.get('auth'):
         return None   # auth not configured - open dashboard (legacy behaviour)
-    if request.path in AUTH_EXEMPT_PATHS:
+    if request.endpoint == 'static' or request.path in AUTH_EXEMPT_PATHS:
         return None
-    creds = request.authorization
-    if creds is not None and (creds.type or '').lower() == 'basic' \
-            and _check_credentials(creds.username or '', creds.password or ''):
+    issued = _session_issued(request.cookies.get(SESSION_COOKIE))
+    if issued is not None:
+        g.renew_session = _now() - issued > SESSION_RENEW_SECONDS
         return None
-    return Response('Authentication required\n', 401,
-                    {'WWW-Authenticate': 'Basic realm="Lab Monitor Dashboard", charset="UTF-8"'})
+    if request.path.startswith('/api/'):
+        # The page's script sends the browser to the sign-in page on this answer
+        resp = jsonify({"success": False, "error": "Sign-in required", "login": "/login"})
+        resp.status_code = 401
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+    target = request.full_path if request.query_string else request.path
+    return redirect('/login' + ('' if target == '/' else '?next=' + quote(target, safe='')))
+
+
+@app.after_request
+def _finish_response(resp):
+    if g.get('renew_session') and resp.status_code < 400:
+        _set_session_cookie(resp)
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    return resp
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if not _config.get('auth'):
+        return redirect('/')
+    next_url = _safe_next(request.values.get('next'))
+    if request.method == 'GET':
+        if _session_issued(request.cookies.get(SESSION_COOKIE)) is not None:
+            return redirect(next_url)
+        return _login_page(next_url)
+
+    client = request.remote_addr or 'unknown'
+    if not _same_origin():
+        return _login_page(next_url, 'That request came from another page. Please try again.', 400)
+    wait = _login_locked_seconds(client)
+    if wait:
+        return _login_page(next_url, 'Too many wrong passwords. Try again in '
+                           f'{int(math.ceil(wait / 60))} minute(s).', 429)
+    if _check_password(request.form.get('password', '')):
+        _login_succeeded(client)
+        _logger.info(f"Sign-in from {client}")
+        return _set_session_cookie(redirect(next_url))
+    locked = _login_failed(client)
+    _logger.warning(f"Wrong Dashboard password from {client}"
+                    + (f"; sign-in from that address is refused for {LOGIN_LOCK_SECONDS // 60} min"
+                       if locked else ''))
+    if locked:
+        return _login_page(next_url, 'Too many wrong passwords. Try again in '
+                           f'{LOGIN_LOCK_SECONDS // 60} minutes.', 429)
+    return _login_page(next_url, 'Wrong password.', 401)
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    if not _same_origin():
+        return _error('Bad request', 400)
+    resp = redirect('/login' if _config.get('auth') else '/')
+    resp.delete_cookie(SESSION_COOKIE, path='/')
+    g.renew_session = False
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +966,8 @@ def _client_config() -> dict:
 
 @app.route('/')
 def index():
-    return render_template('index.html', client_config=_client_config())
+    return render_template('index.html', client_config=_client_config(),
+                           auth_enabled=bool(_config.get('auth')))
 
 
 @app.route('/health')
@@ -843,9 +1077,11 @@ def hash_password_cli() -> int:
     if getpass.getpass("Repeat password: ") != password:
         print("ERROR: passwords do not match", file=sys.stderr)
         return 1
-    print("\nAdd this to dashboard config.json (choose your own username):\n")
-    print(json.dumps({"auth": {"username": "labadmin",
-                               "password_hash": generate_password_hash(password)}}, indent=2))
+    print("\nAdd this to dashboard config.json, then restart the Dashboard:\n")
+    print(json.dumps({"auth": {"password_hash": generate_password_hash(password),
+                               "remember_days": DEFAULT_REMEMBER_DAYS}}, indent=2))
+    print("\nA browser that signs in stays signed in for remember_days. Replacing the hash "
+          "later signs every browser out.")
     return 0
 
 
@@ -888,7 +1124,11 @@ def main():
     logger.info("=" * 60)
     logger.info("Lab Monitor Dashboard starting")
     logger.info(f"Manager URL: {config.get('manager_url', 'http://localhost:5000')}")
-    logger.info(f"Basic auth: {'enabled' if config.get('auth') else 'DISABLED'}")
+    if config.get('auth'):
+        logger.info(f"Sign-in: enabled (password; a browser stays signed in for "
+                    f"{_remember_seconds() // 86400} days)")
+    else:
+        logger.info("Sign-in: DISABLED")
     logger.info("=" * 60)
 
     # Write PID file for process management

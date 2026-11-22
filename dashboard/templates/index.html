@@ -18,6 +18,11 @@
             <div class="header-info">
                 <span class="last-update" id="lastUpdate">Last updated: --</span>
                 <span class="status" id="status">Connecting...</span>
+                {% if auth_enabled %}
+                <form method="post" action="{{ url_for('logout') }}" class="signout-form">
+                    <button type="submit" class="signout-btn" title="Sign out on this browser">Sign out</button>
+                </form>
+                {% endif %}
             </div>
         </header>
 

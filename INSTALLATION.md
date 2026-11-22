@@ -121,7 +121,8 @@ Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 20
 Get-Content E:\Users\lab-monitor\logs\manager-console.log -Tail 20
 ```
 
-**Dashboard login** (recommended when port 5001 is reachable from the network):
+**Dashboard sign-in** (recommended when port 5001 is reachable from the network): one shared
+password; a browser that has signed in stays signed in for 180 days after its last visit.
 ```powershell
 conda activate lab-monitor
 cd E:\Users\lab-monitor\scripts\lab-monitor\dashboard
@@ -129,6 +130,7 @@ python app.py --hash-password
 # paste the printed "auth" block into dashboard\config.json, then:
 Stop-ScheduledTask "Lab Monitor Dashboard"; Start-ScheduledTask "Lab Monitor Dashboard"
 ```
+To change the password, do the same again: replacing the hash signs every browser out.
 
 **Restart a service** (ending the task stops the launcher loop; the PID check makes sure the Python
 process is gone too):
