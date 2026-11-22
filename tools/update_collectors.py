@@ -37,6 +37,8 @@ Usage:
     python3 update_collectors.py --csv collectors.csv --upgrade-pip
     python3 update_collectors.py --csv collectors.csv --upgrade-pip --timeout 60 --verbose
     python3 update_collectors.py --csv collectors.csv --parallel 4
+    # One system first (its ip column, or the first part of its host name):
+    python3 update_collectors.py --csv collectors.csv --only triton2 --dry-run
     # A host that also runs the Manager/Dashboard from the same env:
     python3 update_collectors.py --csv collectors.csv --upgrade-pip --requirements requirements.txt
 
@@ -308,6 +310,10 @@ def main():
                         help='Limit for each remote step (git pull, pip); 0 = no limit (default 600)')
     parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
                         help='Update up to N systems at once (default: 1 = one at a time)')
+    parser.add_argument('--only', action='append', default=[], metavar='HOST',
+                        help='Update only this system: its ip column, or the first part of its '
+                             'host name (triton2 selects triton2.example.org). Repeat for more '
+                             'systems. A value that matches no row stops the tool')
     parser.add_argument('--verbose',  action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -333,6 +339,13 @@ def main():
         print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
+    if args.only:
+        rows, unmatched = _ssh.select_rows(rows, args.only)
+        if unmatched:
+            print(f"ERROR: --only matched no system in {csv_path}: {', '.join(unmatched)}")
+            print("       Use the ip column's value, or the first part of a host name.")
+            sys.exit(1)
+
     if 'python_path' not in fields and args.upgrade_pip:
         print("ERROR: 'python_path' column not found but --upgrade-pip was requested.")
         print("       Add python_path to your CSV to enable pip operations.")
@@ -342,7 +355,7 @@ def main():
     steps_desc = 'git pull' + (f' + pip install -r {args.requirements}' if args.upgrade_pip else '')
     print("=" * 62)
     print("Lab Monitor — Remote Update")
-    print(f"Systems : {len(rows)}")
+    print(f"Systems : {len(rows)}" + (f" (--only {', '.join(args.only)})" if args.only else ''))
     print(f"Steps   : {steps_desc}")
     print(f"Timeout : {args.timeout}s connect, "
           f"{f'{args.command_timeout}s' if args.command_timeout else 'no limit'} per step")
