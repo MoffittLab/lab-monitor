@@ -1,5 +1,14 @@
 # Remote NAS Storage Configuration
 
+> **Superseded.** Don't put the Manager's `data_dir` on a NAS share. SQLite (in WAL mode above all)
+> is not reliable over SMB; in practice it produced thousands of failed transactions a day
+> (`cannot commit - no transaction is active`, `disk I/O error`) and, through collector retries,
+> duplicate rows. Keep `data_dir` on a local disk (`E:\Users\lab-monitor\manager-data`) and let the
+> Manager copy it to the NAS every night: [manager/README.md, "Snapshots to a
+> NAS"](../manager/README.md#snapshots-to-a-nas). To move an existing NAS `data_dir`:
+> ["Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas). The rest of
+> this page is kept for installs that still run this way.
+
 ## Overview
 
 You can store the Manager's databases on a NAS share (for example

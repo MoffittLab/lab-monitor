@@ -310,8 +310,10 @@ Get-Content E:\Users\lab-monitor\logs\collector.log -Tail 20 -Wait
   hardware RAID controller show with blank counters.
 - The storage breakdown on Windows has bytes, file counts and cold data, no owners.
 
-On the Manager server itself (atlantis), the collector uses the same checkout and, by default, the
-same `data` folder as the Manager; see [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md).
+On the Manager server itself (atlantis), the collector uses the same checkout but its own data
+folder: the collector writes to `E:\Users\lab-monitor\data`, the Manager keeps its databases in
+`E:\Users\lab-monitor\manager-data` and snapshots them to the NAS each night (installer option
+`-SnapshotDir \\server\share\...`); see [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md).
 
 ---
 

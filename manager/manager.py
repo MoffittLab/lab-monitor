@@ -31,6 +31,7 @@ from functools import wraps
 import re
 
 import rollups
+import snapshot
 from metrics import MetricsDB
 from data_store import (
     TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE, table_for_data_type,
@@ -207,6 +208,7 @@ _logger = logging.getLogger('manager')
 _metrics_db = None
 _data_store = None
 _user_metrics = None   # initialised in init_app()
+_snapshots = None      # snapshot.SnapshotRunner, initialised in init_app()
 _auth = None
 _cors_enabled = False
 _rollup_backfill = None   # rollups.BackfillThread, started by main()
@@ -408,6 +410,10 @@ def validate_config(config: dict, logger: logging.Logger) -> _AuthConfig:
             raise ConfigError(f"{key} must be a positive integer")
     if not isinstance(config.get('backup_before_migration', True), bool):
         raise ConfigError("backup_before_migration must be true or false")
+    try:
+        snapshot.settings_from_config(config)
+    except ValueError as e:
+        raise ConfigError(str(e))
     # Optional feature settings: a bad value is logged and replaced by its
     # default, never a reason to refuse to start
     rollups.settings_from_config(config, logger)
@@ -452,9 +458,107 @@ def ingest_commit_messages(config: dict, logger: logging.Logger = None) -> int:
     return value
 
 
+# --------------------------------------------------------------------------- #
+# Recommended data layout                                                     #
+#   <root>\manager-data   this Manager's databases: a local disk, used by     #
+#                         nothing else                                        #
+#   <root>\data           a collector on the same machine (archive, queue)    #
+#   snapshot.dest_dir     nightly copy on a NAS share                         #
+# --------------------------------------------------------------------------- #
+
+# Files only a collector writes into its data_dir/<name>/ folder
+_COLLECTOR_FILES = ('queue.json', 'queue.json.lock', 'network_snapshot.json',
+                    'perf_snapshot.json', 'perf_snapshot.json.lock', 'sessions_state.json',
+                    'storage_health_state.json', 'storage_breakdown_state.json')
+_COLLECTOR_ARCHIVE_RE = re.compile(r'^\d{4}-\d{2}\.jsonl$')
+
+
+def is_network_path(path: str) -> bool:
+    """
+    True for a UNC path (\\\\server\\share, \\\\?\\UNC\\...), a mapped network drive
+    (Windows), or a path on an NFS / SMB / sshfs mount (Linux).  False when
+    it can't tell.
+    """
+    p = str(path).strip()
+    if re.match(r'^[\\/]{2}[?.][\\/]UNC[\\/]', p, re.I):
+        return True
+    if re.match(r'^[\\/]{2}(?![?.][\\/])', p):
+        return True
+    if os.name == 'nt':
+        m = re.match(r'^(?:[\\/]{2}[?.][\\/])?([A-Za-z]):', p) or \
+            re.match(r'^([A-Za-z]):', os.path.abspath(p))
+        if m:
+            try:
+                import ctypes
+                return ctypes.windll.kernel32.GetDriveTypeW(f"{m.group(1)}:\\") == 4  # DRIVE_REMOTE
+            except Exception:
+                return False
+        return False
+    try:
+        target = os.path.realpath(p)
+        best, fstype = '', ''
+        with open('/proc/mounts', 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    mnt = parts[1].replace('\\040', ' ')
+                    if (target == mnt or target.startswith(mnt.rstrip('/') + '/')) and len(mnt) > len(best):
+                        best, fstype = mnt, parts[2]
+        return fstype.startswith(('nfs', 'cifs', 'smb', 'fuse.sshfs', '9p'))
+    except OSError:
+        return False
+
+
+def collector_folders_in(data_dir: str) -> list:
+    """Sub-folders of data_dir holding a collector's own files (queue, monthly JSONL archive)."""
+    found = []
+    try:
+        names = sorted(os.listdir(data_dir))
+    except OSError:
+        return found
+    for name in names:
+        sub = os.path.join(data_dir, name)
+        if not os.path.isdir(sub):
+            continue
+        try:
+            files = os.listdir(sub)
+        except OSError:
+            continue
+        if any(f in _COLLECTOR_FILES or _COLLECTOR_ARCHIVE_RE.match(f) for f in files):
+            found.append(name)
+    return found
+
+
+def data_layout_warnings(config: dict) -> list:
+    """What differs from the recommended layout (see above); [] when it matches."""
+    data_dir = config.get("data_dir", "data")
+    out = []
+    if is_network_path(data_dir):
+        out.append(
+            f"data_dir {data_dir!r} is on a network share. SQLite is not reliable there "
+            f"(failed transactions, 'disk I/O error'). Keep data_dir on a local disk and copy it "
+            f"to the share with snapshot.dest_dir (manager/README.md, 'Moving data_dir off the NAS').")
+    shared = collector_folders_in(data_dir)
+    if shared:
+        out.append(
+            f"data_dir {data_dir!r} is also a collector's data_dir (collector files in: "
+            f"{', '.join(shared[:5])}{', ...' if len(shared) > 5 else ''}). It works, but keep the "
+            f"Manager's databases in a folder of their own (e.g. ...\\lab-monitor\\manager-data).")
+    snap = snapshot.settings_from_config(config)
+    if not snap['enabled']:
+        out.append(
+            "Snapshots are disabled: the databases have no copy on another machine. Set "
+            "snapshot.enabled and snapshot.dest_dir (manager/README.md, 'Snapshots to a NAS').")
+    elif not is_network_path(snap['dest_dir']):
+        out.append(
+            f"snapshot.dest_dir {snap['dest_dir']!r} is not on a network share: a disk failure "
+            f"on this machine could take the snapshots with it.")
+    return out
+
+
 def init_app(config: dict, logger: logging.Logger = None):
     """Initialize app with config. Raises ConfigError for unsafe config."""
-    global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled
+    global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled, _snapshots
     global _usage_cache_seconds, _ingest_commit_messages
     logger = logger or logging.getLogger('manager')
 
@@ -474,6 +578,8 @@ def init_app(config: dict, logger: logging.Logger = None):
 
     data_dir = config.get("data_dir", "data")
     os.makedirs(data_dir, exist_ok=True)
+    for warning in data_layout_warnings(config):
+        logger.warning(warning)
 
     # Databases written by an older Manager are migrated once when opened;
     # by default each is first copied to <db>.pre-upgrade-<stamp>.bak.
@@ -511,6 +617,12 @@ def init_app(config: dict, logger: logging.Logger = None):
     # User metrics store (per-user CPU/RAM snapshots and history)
     _user_metrics = _metrics_db.users
     logger.info("User metrics store initialized")
+
+    # Nightly snapshots to a second location (scheduled by main(), not here)
+    if _snapshots is not None:
+        _snapshots.stop()
+    _snapshots = snapshot.SnapshotRunner(data_dir, snapshot.settings_from_config(config),
+                                         logging.getLogger('snapshot'))
 
     for name in _metrics_db.get_all_systems():
         if not is_valid_device_name(name):
@@ -1980,6 +2092,43 @@ def delete_system(name: str):
 
 
 # ---------------------------------------------------------------------------
+# Snapshots to a second location (off unless snapshot.enabled)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/snapshot', methods=['GET'])
+@require_scope('read')
+def get_snapshot_status():
+    """
+    Snapshot settings and the outcome of the last runs:
+        {"enabled", "dest_dir", "time", "keep_daily", "keep_monthly",
+         "running", "running_since", "next_run", "last_attempt",
+         "last_success", "last_snapshot", "last_bytes", "last_files",
+         "last_seconds", "last_failure", "last_error", "hours_since_success"}
+    Times are UTC ISO-8601.  A last_failure newer than last_success means the
+    most recent run failed (last_error says why).
+    """
+    return jsonify(_snapshots.describe()), 200
+
+
+@app.route('/api/snapshot', methods=['POST'])
+@require_scope('admin')
+def run_snapshot():
+    """Start a snapshot now, in the background (admin token).  202, or 409."""
+    if not _snapshots.settings['enabled']:
+        return _error(409, "Snapshots are disabled (set snapshot.enabled and snapshot.dest_dir)")
+    if _snapshots._thread is None or not _snapshots._thread.is_alive():
+        # Not started by main() (e.g. under a test client): run on a one-off thread
+        if _snapshots.running_since is not None:
+            return _error(409, "A snapshot is already running")
+        threading.Thread(target=_snapshots.run, args=('manual',),
+                         name='nas-snapshot-manual', daemon=True).start()
+    elif not _snapshots.trigger():
+        return _error(409, "A snapshot is already running")
+    _logger.info(f"Snapshot requested via POST /api/snapshot from {request.remote_addr}")
+    return jsonify({"status": "started", "dest_dir": _snapshots.settings['dest_dir']}), 202
+
+
+# ---------------------------------------------------------------------------
 # History retention (off unless history_retention_days is set)
 # ---------------------------------------------------------------------------
 
@@ -2096,6 +2245,7 @@ def main():
 
     start_retention_thread(config, logger)
     start_rollup_backfill_thread(config, logger)
+    _snapshots.start()
 
     host = config.get("host", "0.0.0.0")
     port = config.get("port", 5000)

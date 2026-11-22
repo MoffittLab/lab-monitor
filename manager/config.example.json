@@ -1,7 +1,7 @@
 {
   "host": "0.0.0.0",
   "port": 5000,
-  "data_dir": "E:\\Users\\lab-monitor\\data",
+  "data_dir": "E:\\Users\\lab-monitor\\manager-data",
 
   "admin_tokens": ["GENERATE-RANDOM-ADMIN-TOKEN"],
   "read_tokens": ["GENERATE-RANDOM-READ-TOKEN-FOR-DASHBOARD"],
@@ -19,6 +19,14 @@
   "usage_cache_seconds": 300,
   "ingest_commit_messages": 100,
   "threads": 8,
+
+  "snapshot": {
+    "enabled": false,
+    "dest_dir": "\\\\nas.example.org\\lab-monitor\\snapshots",
+    "time": "03:30",
+    "keep_daily": 14,
+    "keep_monthly": 12
+  },
 
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
   "log_level": "INFO",
