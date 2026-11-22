@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Build a realistic CURRENT-format Manager data_dir: what the review-fix
-release (160da09, or fb6498c) leaves on a server after it upgraded an OLD installation
+release (e5cd699 as deployed, or 160da09 / fb6498c) leaves on a server after it upgraded an OLD installation
 and ran for a while.  It is the data_dir the next upgrade (CURRENT -> the
 usage-metrics release) starts from.
 

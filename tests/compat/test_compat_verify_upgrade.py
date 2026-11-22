@@ -383,12 +383,26 @@ def verified_orphans(orphans_data_dir, old_code, compat_dir):
     return {'rc': rc, 'report': data, 'text': text, 'before': before, 'after': snapshot(orphans_data_dir)}
 
 
+def _at_rest(path):
+    """
+    A read-only connection to a database of a session fixture that nothing
+    writes: immutable=1 creates no -wal or -shm next to it (a plain or mode=ro
+    connection to a WAL database does, and a connection left open keeps them
+    there until the garbage collector closes it, e.g. in the middle of the
+    next test's before/after comparison).  Without a -wal file, immutable=1
+    reads exactly what is stored.
+    """
+    assert not os.path.exists(str(path) + '-wal'), path
+    return sqlite3.connect('file:%s?immutable=1' % Path(path).as_posix(), uri=True)
+
+
 def test_orphans_variant_is_what_an_old_manager_left(orphans_data_dir):
     d = orphans_data_dir
+    before = snapshot(d)
     assert (d / 'retired_nas' / 'data.db').is_file() and not (d / 'ghost_pc').exists()
     assert (d / 'gone_ws').is_dir() and not (d / 'gone_ws' / 'data.db').exists()
     assert (d / 'typo_host' / 'data.db').is_file()
-    conn = sqlite3.connect(str(d / 'metrics.db'))
+    conn = _at_rest(d / 'metrics.db')
     try:
         devices = {r[0] for r in conn.execute('SELECT name FROM devices')}
         user_devices = {r[0] for r in conn.execute('SELECT DISTINCT device_name FROM user_metrics_history')}
@@ -396,9 +410,15 @@ def test_orphans_variant_is_what_an_old_manager_left(orphans_data_dir):
         conn.close()
     assert 'ghost-pc' in devices and not {'retired-nas', 'gone-ws', 'typo-host'} & devices
     assert {'retired-nas', 'gone-ws', 'ghost-pc'} <= user_devices
-    tables = sqlite3.connect(str(d / 'typo_host' / 'data.db')).execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+    conn = _at_rest(d / 'typo_host' / 'data.db')
+    try:
+        tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+    finally:
+        conn.close()
     assert tables == 0
+    # test_orphans_variant_passes compares this data_dir before and after its verify run:
+    # looking at the fixture must leave no file (a -wal or -shm) behind
+    assert snapshot(d) == before
 
 
 def test_orphans_variant_passes(verified_orphans):

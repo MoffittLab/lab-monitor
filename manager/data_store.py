@@ -92,10 +92,12 @@ when a database is first opened are rolled up by the background backfill
 (rollups.start_backfill_thread).  The _rollup_* tables are created after a
 needed migration has run (never while it is held back), only in a database
 that has a rolled-up table, and only ever added to.  Adding them is a schema
-change, so a database that already holds rows gets a pre-upgrade backup
-first (_rollup_backup), unless the migration of the same open already took
-one; a database this Manager creates gets them with its first rolled-up
-row, no backup.
+change, so a database that already has a table gets a pre-upgrade backup
+first (_rollup_backup), even if no table holds a row (what history retention
+leaves of a silent system), unless the migration of the same open already
+took one.  A database with no table at all (one this Manager creates, or the
+empty data.db an f086e7e Manager created on a read) gets them with its first
+rolled-up row, no backup: nothing is stored in it.
 
 History reads (get_field_series) of a rolled-up field may be answered from
 its rollups: resolution 'auto' picks raw rows, hourly or daily rollups from
@@ -983,14 +985,16 @@ class TypedDataStore:
         """
         Whether the _rollup_* tables may be added to this database now (by
         RollupEngine.init_db, or with the first row of `adding`, a rolled-up
-        table it doesn't have yet).  A database that holds rows and has no
-        rollup tables gets one pre-upgrade backup first (CLAUDE.md: schema
-        changes add tables only after a backup_database copy), unless this
-        open's migration already decided its backup.  False (rollups wait,
-        retried after rollups.INIT_RETRY_SECONDS) while that backup fails;
-        ingest is never blocked by it.  A copy already taken of the layout
-        the database has now, without rollup tables, is reused, so a retry
-        never takes a second one.
+        table it doesn't have yet).  A database that has a table (even one
+        holding no row) and no rollup tables gets one pre-upgrade backup first
+        (CLAUDE.md: schema changes add tables only after a backup_database
+        copy), unless this open's migration already decided its backup.  Only
+        a database with no table at all needs none: nothing is stored in it
+        (tools/verify_upgrade.py `backups` holds the Manager to the same
+        rule).  False (rollups wait, retried after rollups.INIT_RETRY_SECONDS)
+        while that backup fails; ingest is never blocked by it.  A copy
+        already taken of the layout the database has now, without rollup
+        tables, is reused, so a retry never takes a second one.
         """
         if db.rollup_backup_done:
             return True
@@ -1003,9 +1007,12 @@ class TypedDataStore:
                 return True
             if not ({adding} | tables) & set(rollup_engine.TABLE_ORDER):
                 return True            # nothing to add yet (decided again when a rolled-up table comes)
-            if not any(conn.execute(f'SELECT 1 FROM "{_quote_col(t)}" LIMIT 1').fetchone()
-                       for t in tables if not t.startswith('sqlite_')):
-                db.rollup_backup_done = True     # nothing stored yet: nothing to back up
+            if not tables:
+                # No table at all (a database this Manager is creating, or an empty
+                # data.db from the f086e7e days): nothing stored, nothing to back up.
+                # Tables without rows still get their copy: adding the rollup tables
+                # is a schema change of an existing database.
+                db.rollup_backup_done = True
                 return True
             reason = 'adding the rollup tables (_rollup_*)'
             if not self.backup_before_migration:

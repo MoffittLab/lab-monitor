@@ -129,7 +129,7 @@ def test_old_central_db_gains_the_usage_columns_and_tables_once(make_client, dat
 
 
 def test_current_central_db_is_backed_up_before_the_usage_columns(make_client, data_dir):
-    """A metrics.db the CURRENT Manager (160da09 / fb6498c) wrote has dead_letter and msg_id, but not the new layout."""
+    """A metrics.db the CURRENT Manager (e5cd699 / 160da09 / fb6498c) wrote has dead_letter and msg_id, but not the new layout."""
     user = make_msg('user_metrics', {'username': 'alice', 'cpu_percent': 3.0, 'ram_bytes': 7, 'ram_formatted': '7 B'},
                     ts='2026-08-04T07:00:00.000000Z')
     gets = ['/api/user_metrics/all', '/api/user_metrics/Triton', '/api/user_metrics/history/Triton/alice',

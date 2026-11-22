@@ -98,12 +98,12 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage_util import format_timestamp, is_transient_db_error, parse_timestamp, utc_now  # noqa: E402
+from storage_util import (format_timestamp, is_transient_db_error, parse_timestamp,  # noqa: E402
+                          sqlite_uri, utc_now)
 
 logger = logging.getLogger(__name__)
 
@@ -806,9 +806,10 @@ def _open_read_only(path: str) -> sqlite3.Connection:
     """
     A connection that can't change the database (mode=ro): no backup,
     migration or table is ever made through it.  SQLite may still create
-    the -wal / -shm side files of a WAL database to read it.
+    the -wal / -shm side files of a WAL database to read it.  sqlite_uri:
+    a data_dir on a share (UNC path) gets a URI SQLite accepts.
     """
-    conn = sqlite3.connect(Path(os.path.abspath(path)).as_uri() + '?mode=ro', uri=True, timeout=30)
+    conn = sqlite3.connect(sqlite_uri(path, 'mode=ro'), uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 

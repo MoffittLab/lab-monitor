@@ -28,7 +28,9 @@ One run:
      <db>.post-upgrade-<stamp> files tools/rollback_upgrade.py set aside.
   3. Staged databases and those files are copied to
      <dest_dir>/snapshot-<UTC stamp>.partial/ with a plain file copy (SQLite
-     never opens a file on the share), hashing as they go.
+     never opens a file on the share), hashing as they go.  The run creates
+     that folder itself with an atomic mkdir (the next second's if it exists:
+     two Managers sharing dest_dir never write into the same one).
   4. With verify_copy (default) every copied file is read back from the
      destination and its SHA-256 compared.
   5. manifest.json (files, sizes, hashes, row counts, and the databases that
@@ -64,7 +66,11 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+
+# file: URIs that also work for a UNC path (`verify` of a snapshot on the NAS
+# share, staging from a data_dir on one); storage_util is standard library
+# only, like this module
+from storage_util import sqlite_uri
 
 logger = logging.getLogger('snapshot')
 
@@ -328,8 +334,7 @@ def _stage_database(src_path: str, staged: str) -> dict:
     """
     os.makedirs(os.path.dirname(staged), exist_ok=True)
     # mode=rw: never create a database that has just been deleted
-    uri = Path(os.path.abspath(src_path)).as_uri() + '?mode=rw'
-    src = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_S)
+    src = sqlite3.connect(sqlite_uri(src_path, 'mode=rw'), uri=True, timeout=BUSY_TIMEOUT_S)
     dst = None
     try:
         src.execute(f'PRAGMA busy_timeout = {BUSY_TIMEOUT_S * 1000}')
@@ -577,16 +582,28 @@ class SnapshotRunner:
     def _new_stamp(self, dest_dir: str, started: float) -> tuple:
         """
         (stamp, final folder, .partial folder) for a run started at `started`.
-        A folder of that second may exist already (a manual run right after
-        another one): wait for the next second rather than fail.
+        The .partial folder is created here, with os.mkdir, which is atomic
+        (also on an SMB share): of two Managers sharing dest_dir that start in
+        the same second only one gets it, so a run only ever writes into and
+        removes a .partial folder it created itself.  A folder of that second
+        may exist already (a manual run right after another one, or another
+        Manager's run): take the next second rather than fail.
         """
         t = started
         for _ in range(5):
             stamp = utc_stamp(t)
             final = os.path.join(dest_dir, PREFIX + stamp)
             part = final + PARTIAL_SUFFIX
-            if not os.path.exists(final) and not os.path.exists(part):
-                return stamp, final, part
+            if not os.path.exists(final):
+                try:
+                    os.mkdir(part)
+                except FileExistsError:
+                    pass
+                else:
+                    if not os.path.exists(final):
+                        return stamp, final, part
+                    # its owner renamed that second's .partial meanwhile: ours is still empty
+                    os.rmdir(part)
             time.sleep(max(0.0, int(t) + 1 - time.time()) + 0.01)
             t = time.time()
         raise FileExistsError(f"{final} already exists")
@@ -625,14 +642,12 @@ class SnapshotRunner:
             raise OSError(f"Not enough free space in {dest_dir}: "
                           f"{free_dest:,} bytes free, about {need:,} needed")
 
-        stamp, final, part = self._new_stamp(dest_dir, started)
+        stamp, final, part = self._new_stamp(dest_dir, started)     # creates `part`: ours
         staging = os.path.join(staging_root, stamp)
-
-        self.log.info(f"Snapshot {stamp} ({reason}): {len(databases)} database(s) from "
-                      f"{self.data_dir} to {dest_dir}")
         files, failed = [], []
         try:
-            os.makedirs(part)
+            self.log.info(f"Snapshot {stamp} ({reason}): {len(databases)} database(s) from "
+                          f"{self.data_dir} to {dest_dir}")
             owner = os.path.join(part, PARTIAL_OWNER)
             with open(owner, 'w', encoding='utf-8') as f:
                 json.dump(dict(self._owner(), stamp=stamp), f)
@@ -709,7 +724,7 @@ class SnapshotRunner:
                 os.fsync(f.fileno())
             _rename_dir(part, final)
         except BaseException:
-            if os.path.isdir(part):
+            if os.path.isdir(part):         # this run's own (_new_stamp created it)
                 _rmtree(part)
             raise
         finally:
@@ -899,8 +914,7 @@ def verify_snapshot(path: str) -> list:
             continue
         if entry.get('kind') == 'db':
             try:
-                conn = sqlite3.connect(Path(os.path.abspath(p)).as_uri() + '?mode=ro&immutable=1',
-                                       uri=True)
+                conn = sqlite3.connect(sqlite_uri(p, 'mode=ro&immutable=1'), uri=True)
                 try:
                     res = conn.execute('PRAGMA quick_check').fetchall()
                 finally:

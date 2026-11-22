@@ -99,7 +99,7 @@ data/
 
 **storage_breakdown** is stored narrow as well: `storage_breakdown_msgs` (one row per run; the top-level keys in `meta_json`) and `storage_breakdown_rows` (`scope` folder or device, `path`, `kind` total, owner or other, `owner`, `bytes`, `files`, `cold_1y_bytes`, `cold_3y_bytes`, `owner_count`, `folder_owner`, `ord`, `extra_json`). `ord` and `extra_json` let the read API rebuild each run exactly as sent: list order, `owners` null versus `[]` versus absent, and keys a later collector adds. `/api/data/<system>/storage_breakdown` returns the runs nested. A wide `storage_breakdown` table (made when a new collector reported to an OLD or CURRENT Manager, or by CURRENT after a [downgrade](#upgrading-to-the-usage-metrics-release)) is copied into the narrow tables on first open, after the pre-upgrade backup, in one transaction; the table is renamed to `storage_breakdown_legacy` (`_legacy_1`, ... for later ones) and never dropped. msg_ids are kept. Row ids are kept only by the first copy (while the narrow tables are empty); a later one gives its runs new ids and skips the runs the narrow tables already hold (the same msg_id, or the same timestamp as a run stored without one), because CURRENT stores a run again after a lost ACK or an archive replay. Skipped rows stay in the renamed table. If the copy (or the backup before it) fails, it is retried after 300 s and at every start, without a second backup, and only new storage_breakdown messages get `error` (every message of that system, if the backup failed). Meanwhile, a first copy's wide table keeps being served; a later copy's wide table is not: until it succeeds, `/api/data`, history and `/api/storage/breakdown/<name>` show only the runs stored narrow, without the ones CURRENT stored. Nothing is lost either way.
 
-**Reserved table prefixes:** `_` and `storage_breakdown_` (as well as `sqlite_` and `folder_usage_`). No `data_type` maps to them, so the rollup tables and the narrow breakdown tables are never listed as data types or served through `/api/data` / `/api/history` as tables of their own. The CURRENT Manager (`fb6498c`) has the same reservation, which makes a downgrade safe.
+**Reserved table prefixes:** `_` and `storage_breakdown_` (as well as `sqlite_` and `folder_usage_`). No `data_type` maps to them, so the rollup tables and the narrow breakdown tables are never listed as data types or served through `/api/data` / `/api/history` as tables of their own. The CURRENT Manager (`e5cd699`, as `fb6498c` before it) has the same reservation, which makes a downgrade safe.
 
 **Other data types** get one column per payload key. When a message has a key the table hasn't seen, the column is added. Earlier rows read back `NULL` for it, meaning "not measured", which is different from a measured zero.
 - SQLite column names are case-insensitive. A key that differs only in case from an existing column is stored in that column. A payload with two keys that differ only in case is rejected.
@@ -483,9 +483,10 @@ and add nothing to the new fields.
 `_rollup_day` (series, bucket → n, vsum, vmin, vmax; WITHOUT ROWID), `_rollup_state` (per table: version,
 newest row id rolled up, `frozen_before`) and `_rollup_pending` (row-id ranges still to do). They are created
 only once a database is fully migrated and holds a rolled-up table, and are only ever added to. Adding them to a
-database that already holds rows takes one pre-upgrade backup first (none when the migration of the same start
-took one, and none for a database this Manager creates); while that backup fails, history is stored and served as
-usual, and rolled up once a retry (every 60 s) succeeds.
+database that already has a table takes one pre-upgrade backup first, even if no table holds a row any more (what
+history retention leaves of a silent system): none when the migration of the same start took one, and none for a
+database with no table at all (one this Manager creates, or an empty `data.db` an `f086e7e` Manager left); while
+that backup fails, history is stored and served as usual, and rolled up once a retry (every 60 s) succeeds.
 Size: one device-year of `system_metrics` (105,000 rows × 22 fields) gave 192,500 hour rows and 8,030 day rows.
 
 **Lifecycle:**
@@ -566,7 +567,7 @@ The live databases belong on a local disk; the Manager copies them to a second l
 **What one run does.**
 1. Each database is copied with SQLite's online backup API to `<data_dir>\.snapshot-staging\`: every `<system>/data.db` first, `metrics.db` last. Each is a consistent copy of that database, taken while the Manager keeps storing messages. The staged copy is written without `fsync` (it is temporary and checked before use, and syncing it made every request wait for the disk), made self-contained (`journal_mode=DELETE`, no `-wal` file) and checked with `PRAGMA quick_check`. Nothing goes to `dest_dir` before every database is staged.
 2. Then the other stored files are listed and copied: the retention archives under `<system>/archive/` (a `.jsonl` up to its last complete line, in case retention is appending to it), the previous Manager's `<name>/usage.jsonl`, and the `<db>.post-upgrade-<stamp>` files `tools/rollback_upgrade.py` set aside. Listing them only after the databases are staged means a row that history retention moved out of a database during the run is in the snapshot's database or in its archive file, never in neither.
-3. Everything goes to `<dest_dir>\snapshot-<UTC stamp>.partial\` as plain files, so SQLite never opens anything on the share. Each one is read back and compared by SHA-256. `manifest.json` (files, sizes, hashes, row counts per table, and any database that could not be copied) is written, and the folder is renamed to `snapshot-<stamp>`. **A folder without `.partial` holds every file its manifest lists.**
+3. Everything goes to `<dest_dir>\snapshot-<UTC stamp>.partial\` as plain files, so SQLite never opens anything on the share. The run creates that folder itself (an atomic `mkdir`; if it exists, the next second's), so two Managers sharing `dest_dir` never write into, or remove, each other's folder. Each one is read back and compared by SHA-256. `manifest.json` (files, sizes, hashes, row counts per table, and any database that could not be copied) is written, and the folder is renamed to `snapshot-<stamp>`. **A folder without `.partial` holds every file its manifest lists.**
 
 **The databases of one snapshot are not of one instant.** `metrics.db` is taken last, so it can be a little newer than the `data.db` copies. That is the direction a replay repairs: the Manager commits `metrics.db` before a system's `data.db`, so every message in a copied `data.db` also has its central rows (per-user history, device card, totals) in the copied `metrics.db`; a message only `metrics.db` has is stored again in `data.db` by the collectors' re-sends or `tools/replay_archives.py` after a restore, and re-applying its central rows changes nothing.
 
@@ -576,7 +577,7 @@ The live databases belong on a local disk; the Manager copies them to a second l
 
 **Pruning** deletes only this Manager's own snapshots: folders named `snapshot-<stamp>` whose `manifest.json` names this host and this `data_dir`, outside the keep rules, and its own `.partial` folders older than a day. Snapshots another Manager wrote to the same `dest_dir` (a test Manager given a copy of this config), or this one before its `data_dir` was moved, are never deleted; the log says how many there are. Nothing else in `dest_dir` is touched.
 
-**Checking.** `GET /api/snapshot` (read token) shows the last run: `last_result` is `ok`, `partial` or `error`. A `last_failure` newer than `last_success` means the last run failed or was partial; `last_error` says why. `POST /api/snapshot` (admin token) takes one now (a second request while one is pending or running gets `409`; a run in the same second as the previous one waits for the next second). To check a snapshot's files against its manifest and run `quick_check` on each database (read-only; nothing is written next to it; a database the manifest lists as failed is reported too):
+**Checking.** `GET /api/snapshot` (read token) shows the last run: `last_result` is `ok`, `partial` or `error`. A `last_failure` newer than `last_success` means the last run failed or was partial; `last_error` says why. `POST /api/snapshot` (admin token) takes one now (a second request while one is pending or running gets `409`; a run in the same second as the previous one waits for the next second). To check a snapshot's files against its manifest and run `quick_check` on each database (read-only; nothing is written next to it; a database the manifest lists as failed is reported too; a UNC path works):
 
 ```powershell
 python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapshot-20261122T083000Z
@@ -607,8 +608,10 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
    `robocopy E:\Users\lab-monitor\data E:\Users\lab-monitor\manager-data metrics.db* data.db* usage.jsonl /S /COPY:DAT /R:1 /W:1` (plus `archive\` folders if `history_retention_days` was used). [docs/UPGRADE.md, Step 3b](../docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard) has the commands for both cases.
 3. In `manager\config.json` set `data_dir` to the local folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a `snapshots` folder next to the old data).
 4. Re-run the installer. It sees the UNC `dest_dir` and registers the tasks with a stored password, because an S4U task can't reach a share.
-5. Start the Manager. Check `/health` and the Dashboard, then `POST /api/snapshot` and `GET /api/snapshot` until `last_success` is set, and `snapshot.py verify` the new folder.
+5. Start the Manager. Check `/health` and the Dashboard, then `POST /api/snapshot` and `GET /api/snapshot` until `running` is false and `last_result` is `ok`, and `snapshot.py verify` the new folder.
 6. Keep the old NAS `data_dir` untouched until you have checked a few days; then remove it by hand.
+
+During the upgrade from the previous Manager, do this **before** the installer runs ([docs/UPGRADE.md, Step 3b](../docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard)), so the first start backs up and migrates the databases on the local disk.
 
 ## Upgrading from the previous Manager
 
@@ -623,6 +626,7 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
   - **What changes:** each wide `folder_usage` table is copied to the narrow layout and the old table is kept as `folder_usage_legacy`. `msg_id` columns are added to the existing history tables. `metrics.db` gains `dead_letter`, `device_totals.network_last_updated` (seeded from the time of the last counter reading, `device_snapshot.metrics_timestamp`, else `last_updated`) and `user_metrics_history.msg_id`. Existing rows are never rewritten or deleted.
   - **Before the first change:** each database is copied with SQLite's online backup API to `data.db.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` or `metrics.db.pre-upgrade-<…>.bak` next to it, and the copy is logged. A copy is taken once per database: a database that already has the new schema gets none, and none is taken for new databases. A database that an earlier start already partly migrated gets no further copy (its first copy has the pre-upgrade layout), and neither does one whose data is unchanged since its last copy. Each copy is the size of its database, so check free space first. Delete the copies once you have checked the upgrade.
   - **When it happens:** at startup, for every existing database, before the Manager starts listening. On a large or networked `data_dir` the first start takes longer.
+  - **Where:** move the databases to a local folder of their own and turn on snapshots **before** that first start ([docs/UPGRADE.md, Step 3b](../docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard); [Moving `data_dir` off the NAS](#moving-data_dir-off-the-nas)), so the backups and the migration run on the local disk, not on a share.
   - **If a copy fails** (disk full, permissions), that database is **not** migrated, and an error says why. Its data stays readable on the Dashboard and through the API. New messages for it get `error`, so collectors keep them queued. On the next write after 5 minutes the backup is tried again and, if it works, the migration runs. To migrate without a copy, set `"backup_before_migration": false`.
   - **If the folder_usage copy fails** (another program holds the database open for writing, disk full), it is rolled back: the wide table stays and keeps serving the old folder history. New folder_usage messages for that system get `error` (collectors keep them) until the copy succeeds, on the next one after 5 minutes or at the next start; the narrow tables are never started next to an unmigrated wide table. Other data types are stored normally.
 - **Messages the previous Manager stored aren't stored twice when they are re-sent after the upgrade.** This covers old collectors' queues, upgraded collectors re-sending entries an old collector queued, messages a collector upgraded before the Manager delivered to the previous Manager (re-sent after a lost ACK, or by `tools/replay_archives.py`), and `tools/replay_archives.py --include-legacy`. They are matched to the previous Manager's rows by timestamp (and user name).
@@ -634,7 +638,7 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
 - **ACK:** responses gain `received`, `counts` and `results`. The top-level `stored` now also counts duplicates and rejected messages, which lets old collectors with stuck queues drain. Rejected messages are kept in `dead_letter`.
 - **CORS is off unless `cors_origins` is set.** Existing configs that list origins keep them.
 - **Large backlogs from old collectors:** an old collector posts its whole `queue.json` in one request and keeps all of it on any non-200 reply. If its queue grows past `max_request_bytes` (32 MiB by default, typically a few weeks of backlog; for example while the new Manager refused to start over a placeholder token), every run gets `413` and nothing from that device arrives. The Manager logs a warning with this remedy each time. Fix: raise `max_request_bytes` until the queue drains (it can take a few runs; a very large batch may outlast the collector's 30 s timeout, but it is stored anyway and the next run comes back as duplicates), or upgrade the collector, which sends batches of 100. The message-count cap never applies to old collectors.
-- **Task Scheduler account:** the installer now registers the tasks with S4U (no stored password). S4U has no network access. If `data_dir` or a log file is on a UNC path, the installer asks for the account's password instead. See [Running from Task Scheduler](#running-from-task-scheduler).
+- **Task Scheduler account:** the installer now registers the tasks with S4U (no stored password). S4U has no network access. If `data_dir`, a log file or an enabled `snapshot.dest_dir` is on a UNC path, the installer asks for the account's password instead. See [Running from Task Scheduler](#running-from-task-scheduler).
 - **`POST /api/usage/report` is gone.** Nothing in the repository used it. The other `/api/usage/*` GET endpoints remain.
 - `retention_days` no longer does anything. History is never deleted unless you set `history_retention_days`.
 
@@ -642,8 +646,8 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
 
 ## Upgrading to the usage-metrics release
 
-This release goes on top of the review-fix release (CURRENT: `fix/review-findings`, `160da09`, or its merge on
-`main`; `fb6498c` writes the same databases), once that one has been verified and deployed, with the databases
+This release goes on top of the review-fix release (CURRENT: `fix/review-findings`, `e5cd699`, or its merge on
+`main`; the earlier `160da09` and `fb6498c` write the same databases), once that one has been verified and deployed, with the databases
 in a local `manager-data` folder and nightly snapshots ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
 
 - **Order:** the installer upgrades the Manager and the Dashboard together; the new Dashboard works with both
@@ -656,8 +660,9 @@ in a local `manager-data` folder and nightly snapshots ([docs/UPGRADE.md](../doc
     and `user_metrics_history` (NULL in existing rows), plus `usage_timestamp` in `device_user_snapshot` (when
     its usage columns were written; see "Going back to CURRENT" below). From CURRENT this takes **one** `metrics.db` backup;
     from OLD it is part of the usual migration.
-  - Every `data.db` from CURRENT that holds rows gets **one** backup before the rollup tables are added (a
-    schema change, so CLAUDE.md's backup rule applies). If it holds a wide `storage_breakdown` table (a new
+  - Every `data.db` from CURRENT that has a table gets **one** backup before the rollup tables are added (a
+    schema change, so CLAUDE.md's backup rule applies), also when retention has deleted all its rows; only an
+    empty `data.db` with no table needs none. If it holds a wide `storage_breakdown` table (a new
     collector reported to CURRENT), that same copy also covers its migration to the narrow layout; the table is
     kept as `storage_breakdown_legacy`. The copies need free space about the size of the `data_dir` and make
     the first start take longer, as the review-fix upgrade did.
@@ -676,7 +681,7 @@ in a local `manager-data` folder and nightly snapshots ([docs/UPGRADE.md](../doc
   applies only to the old versions listed for it in `INTENDED_SIDES`: with CURRENT as the old side, the
   entries that describe changes CURRENT already made itself (N2, N5, N7, N8, N11, N13) are not applied, and
   a run that would need one of them FAILs.
-- **Going back to CURRENT (the commit recorded before the upgrade: `160da09` or its merge; not `fb6498c`, which
+- **Going back to CURRENT (the commit recorded before the upgrade: `e5cd699` or its merge; not `fb6498c`, which
   stores the same way but takes no snapshots)** needs no rollback: stop the Manager, check out that commit and start it on
   the same `data_dir`. CURRENT reserves the `_` and `storage_breakdown_` table prefixes, so it ignores the
   rollup and narrow tables, takes no backup and ingests normally. While it runs it does not show the

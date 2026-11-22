@@ -128,7 +128,7 @@ Keep collector `data_dir`s local; their archives can be copied to the NAS separa
 
 **A UNC `data_dir` needs a task with a stored password.** The installer registers the Manager and
 Dashboard tasks with S4U (no stored password) by default, and an S4U task has **no network access**.
-When `data_dir` or a log file is a UNC path, `install-manager-dashboard-taskscheduler.ps1` asks for the
+When `data_dir`, a log file or an enabled `snapshot.dest_dir` is a UNC path, `install-manager-dashboard-taskscheduler.ps1` asks for the
 account's password (or takes `-TaskCredential (Get-Credential)`) and registers the tasks with it. The
 account needs read/write access to the share. Re-run the installer whenever that password changes,
 or the tasks stop starting.
@@ -138,8 +138,8 @@ or the tasks stop starting.
 "data_dir": "Z:\\lab-monitor-data"
 ```
 Scheduled tasks don't see drive mappings, so the Manager would not find `Z:`. The installer stops
-with an error (before changing anything) when `data_dir` or a log file uses a mapped or missing
-drive letter. Use the UNC path instead.
+with an error (before changing anything) when `data_dir`, a log file or an enabled `snapshot.dest_dir`
+uses a mapped or missing drive letter. Use the UNC path instead.
 
 ---
 
@@ -253,7 +253,8 @@ Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object Comma
 ## Migration from Remote back to Local
 
 Follow [manager/README.md, "Moving `data_dir` off the NAS"](../manager/README.md#moving-data_dir-off-the-nas)
-(during the review-fix upgrade: [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard)):
+(during the review-fix upgrade: [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard),
+before the installer):
 
 - Copy the Manager's files only (`metrics.db*`, `<system>\data.db*` with their `.bak` copies,
   `<system>\archive\`, `<name>\usage.jsonl`), with the Manager stopped, to

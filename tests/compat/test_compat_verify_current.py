@@ -1,7 +1,8 @@
 """
 Upgrade compatibility: tools/verify_upgrade.py for the next real upgrade,
-CURRENT (the review-fix release, 160da09) -> NEW (this checkout).
-fb6498c, which writes the same databases, is covered too (SAME_FORMAT_REFS).
+CURRENT (the review-fix release as deployed, e5cd699) -> NEW (this checkout).
+The earlier review-fix commits 160da09 and fb6498c, which write the same
+databases, are covered too (SAME_FORMAT_REFS).
 
 The fixture is the data_dir a server has after the CURRENT release upgraded
 its OLD data and ran for a while (make_current_fixture.py: the CURRENT
@@ -121,7 +122,7 @@ def test_current_fixture_is_what_the_review_fix_release_leaves(current_data_dir)
 
 
 def test_current_fixture_has_what_the_snapshots_leave(current_data_dir, current_code):
-    """160da09's nightly snapshot ran on it, and another one was killed while it staged a database."""
+    """The CURRENT nightly snapshot ran on it, and another one was killed while it staged a database."""
     if not (current_code / 'manager' / 'snapshot.py').is_file():
         pytest.skip('this CURRENT has no snapshots')
     d = current_data_dir
@@ -675,29 +676,56 @@ def test_n22_accepts_only_storage_breakdown_runs_that_are_no_longer_shown():
 
 
 # --------------------------------------------------------------------------- #
-# The review-fix release as deployed (160da09) and fb6498c write one format   #
+# The review-fix release as deployed (e5cd699), 160da09 and fb6498c write one #
+# format                                                                      #
 # --------------------------------------------------------------------------- #
 
 # What may differ between the review-fix commits without changing what is stored
 _NOT_STORAGE = ('manager/manager.py', 'manager/snapshot.py', 'manager/README.md',
                 'manager/config.example.json', 'manager/config.windows.json')
+# Differs only by sqlite_uri (e5cd699: UNC-safe file: URIs, used to open backups
+# read-only); compared with that change undone (_without_sqlite_uri)
+_URI_ONLY = 'manager/storage_util.py'
+
+
+def _without_sqlite_uri(text):
+    """storage_util.py with e5cd699's sqlite_uri change undone (its import, the function, its one use)."""
+    text = text.replace('from urllib.parse import quote\n', '', 1)
+    start = text.find('# Windows path rules for sqlite_uri')
+    if start >= 0:
+        text = text[:start] + text[text.index('def _open_backup_ro', start):]
+    return text.replace("sqlite_uri(path, 'mode=ro&immutable=1')",
+                        "Path(os.path.abspath(path)).as_uri() + '?mode=ro&immutable=1'")
+
+
+def _git_show(ref, path):
+    r = subprocess.run(['git', '-C', str(REPO), 'show', '%s:%s' % (ref, path)],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        pytest.skip('git show %s:%s: %s' % (ref, path, r.stderr.decode('utf-8', 'replace')[:300]))
+    return r.stdout.decode('utf-8')
 
 
 @pytest.mark.parametrize('ref', SAME_FORMAT_REFS)
 def test_the_review_fix_commits_store_data_the_same_way(ref):
     """
-    CURRENT_REF (160da09) is fb6498c plus nightly snapshots and the manager-data layout.
-    Every collector, Dashboard and storage module is identical, so the CURRENT fixtures
-    (written by 160da09) are fb6498c-format data; manager.py differs only outside storage
-    (checked by the end-to-end run below with fb6498c as the old side).
+    CURRENT_REF (e5cd699) is fb6498c plus nightly snapshots, the manager-data layout and
+    the review's fixes; 160da09 is the same without those fixes.  Every collector,
+    Dashboard and storage module is identical (storage_util.py apart from sqlite_uri,
+    which only builds the URI backups are read through), so the CURRENT fixtures (written
+    by e5cd699) are fb6498c-format data; manager.py differs only outside storage (checked
+    by the end-to-end run below with each of them as the old side).
     """
-    paths = ['collector', 'dashboard', 'manager'] + [':(exclude)%s' % p for p in _NOT_STORAGE]
+    paths = ['collector', 'dashboard', 'manager'] + [':(exclude)%s' % p for p in _NOT_STORAGE + (_URI_ONLY,)]
     r = subprocess.run(['git', '-C', str(REPO), 'diff', '--stat', ref, CURRENT_REF, '--'] + paths,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         pytest.skip('git diff %s %s: %s' % (ref, CURRENT_REF, r.stderr.decode('utf-8', 'replace')[:300]))
     assert r.stdout.decode('utf-8') == '', 'storage code differs between %s and %s:\n%s' % (
         ref, CURRENT_REF, r.stdout.decode('utf-8'))
+    assert 'def sqlite_uri' in _git_show(CURRENT_REF, _URI_ONLY)
+    assert _without_sqlite_uri(_git_show(CURRENT_REF, _URI_ONLY)) == _git_show(ref, _URI_ONLY), (
+        '%s differs between %s and %s by more than sqlite_uri' % (_URI_ONLY, ref, CURRENT_REF))
 
 
 def _extract(ref, dest):
@@ -716,13 +744,18 @@ def _extract(ref, dest):
 
 @pytest.mark.parametrize('ref', SAME_FORMAT_REFS)
 def test_verify_passes_on_data_written_by_an_earlier_review_fix_commit(ref, old_data_for_current, compat_dir):
-    """A data_dir written by fb6498c itself, verified with fb6498c as the old side (and the way back)."""
+    """
+    A data_dir written by an earlier review-fix commit itself (160da09: with its own
+    snapshot and a killed one's staging leftover; fb6498c: no snapshots), verified with
+    that commit as the old side (and the way back).
+    """
     import verify_upgrade as vu
     code = _extract(ref, compat_dir / ('code-' + ref))
     assert vu.detect_old_version(code) == 'current'
     data = compat_dir / ('fixture-' + ref) / 'data'
     summary = build_current_fixture(code, old_data_for_current, data, '--days', '1')
-    assert 'snapshot' not in summary and not (data / 'snapshot-status.json').exists()
+    has_snapshots = (code / 'manager' / 'snapshot.py').is_file()
+    assert ('snapshot' in summary) == has_snapshots == (data / 'snapshot-status.json').exists()
     work = compat_dir / ('work-' + ref)
     work.mkdir()
     report = compat_dir / ('verify-report-%s.json' % ref)
@@ -741,7 +774,7 @@ def test_verify_passes_on_data_written_by_an_earlier_review_fix_commit(ref, old_
 # --------------------------------------------------------------------------- #
 
 def _snapshot_layout(root):
-    """A data_dir as a 160da09 Manager with snapshots leaves it: status file, staging leftovers."""
+    """A data_dir as a review-fix Manager with snapshots leaves it: status file, staging leftovers."""
     src = root / 'data'
     (src / 'atlantis').mkdir(parents=True)
     for db in (src / 'metrics.db', src / 'atlantis' / 'data.db'):
@@ -784,6 +817,37 @@ def test_a_killed_snapshots_staging_files_are_never_copied(tmp_path):
     scratch = sum(f['size'] for k, f in fp['files'].items() if k.startswith('.snapshot-staging/'))
     assert scratch > 0
     assert v.report['space']['source_bytes'] == sum(f['size'] for f in fp['files'].values()) - scratch
+
+
+@pytest.mark.parametrize('live', [True, False])
+def test_the_live_current_managers_lock_file_by_old_side(tmp_path, live):
+    """
+    manager.lock is written by the review-fix Manager at each start.  With that release
+    as the old side it is the live Manager's own file, like its databases: a rewritten
+    lock is a WARN while it answers /health and a FAIL when nothing should run.  With
+    f086e7e as the old side (which never writes it) the same change is always a FAIL
+    (test_compat_verify_snapshot_files.py).
+    """
+    import verify_upgrade as vu
+    src, _staged = _snapshot_layout(tmp_path)
+    lock = src / 'manager.lock'
+    lock.write_bytes(b'\npid=4242 started=2026-11-21T10:00:00Z\n')
+    before = vu.fingerprint(str(src))
+    lock.write_bytes(b'\npid=4343 started=2026-11-22T10:00:00Z\n')         # the live Manager restarted
+    for old_version, want in (('current', 'WARN' if live else 'FAIL'), ('old', 'FAIL')):
+        v = vu.Verifier(types.SimpleNamespace())
+        v.old_version = old_version
+        v.fp_before, v.fp_after, v.live_manager = before, vu.fingerprint(str(src)), live
+        v.check_source_unchanged()
+        assert v.checks['source']['status'] == want, (old_version, v.checks['source'])
+    # unchanged: PASS, and the summary says how the lock and the staging files were compared
+    v = vu.Verifier(types.SimpleNamespace())
+    v.old_version = 'current'
+    v.fp_before = v.fp_after = vu.fingerprint(str(src))
+    v.live_manager = live
+    v.check_source_unchanged()
+    assert v.checks['source']['status'] == 'PASS'
+    assert 'snapshot staging files and manager.lock: size, mtime' in v.checks['source']['summary']
 
 
 @pytest.mark.parametrize('live', [True, False])

@@ -26,7 +26,14 @@ For metrics.db and every <system>\data.db with a pre-upgrade backup:
 Nothing is deleted: the .bak stays where it is, and the moved-aside files
 keep everything the new Manager stored after the upgrade (the collectors'
 archives hold those messages too), so a rollback can itself be undone by
-renaming the files back.
+renaming the files back.  The choice and the check below read only the
+backups.  A current database is never written: it is only renamed together
+with its side files (the usage-metrics check further down reads it
+read-only, or a private copy of it and its -wal), so what a killed Manager
+(Task Scheduler's End, Stop-Process -Force) left only in a -wal file stays
+readable in the moved-aside files.
+The new Manager's snapshot status file (snapshot-status.json) and staging
+folder (.snapshot-staging) hold no data and are left as they are.
 
 Which backup: the NEWEST pre-upgrade backup of each database that still has
 the layout the old Manager wrote (each one is taken just before the new
@@ -40,7 +47,7 @@ would not show the folder history in it.  If no backup has the old layout the
 newest is used, with a warning.  --use-oldest picks the oldest instead.
 
 Not for going back from the usage-metrics release to the review-fix release
-(160da09, or fb6498c): that needs no restore, the review-fix code is started
+(e5cd699 as deployed, or 160da09 / fb6498c): that needs no restore, the review-fix code is started
 on the same data_dir (docs/UPGRADE.md, "Going back from the usage-metrics
 release to CURRENT").  After f086e7e -> review-fix -> usage-metrics, the
 backups with the old layout are the ones taken before the review-fix upgrade,
@@ -56,9 +63,10 @@ ran (refused without --past-review-fix).
 
 Databases WITHOUT a backup are left as they are and listed: databases the
 new Manager created after the upgrade (systems first seen since), or ones it
-never had to change.  The old Manager can open them; history the new Manager
-stored in their folder_usage_msgs / folder_usage_items tables is not shown by
-the old code.
+never had to change (such as an empty data.db with no table, which the old
+Manager created when something read a system that had no history).  The old
+Manager can open them; history the new Manager stored in their
+folder_usage_msgs / folder_usage_items tables is not shown by the old code.
 
 After the rollback (see also docs/UPGRADE.md):
   - check out the old code in the installation (git checkout <old commit>)
@@ -87,6 +95,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 BACKUP_INFIX = '.pre-upgrade-'           # manager/storage_util.py BACKUP_INFIX
 MOVED_INFIX = '.post-upgrade-'
@@ -133,8 +142,29 @@ def find_databases(data_dir):
     return dbs
 
 
+# Windows path rules for _file_uri (a module setting so tests can try them on Linux)
+_WINDOWS = os.name == 'nt'
+
+
+def _file_uri(path, query=''):
+    """
+    file: URI of `path` (with `query`).  A UNC path (a data_dir on a share, a
+    TEMP folder on one) becomes file:////server/share/...: SQLite refuses
+    pathlib's file://server/share/... ("invalid uri authority").  The same as
+    manager/storage_util.py sqlite_uri and tools/verify_upgrade.py ro_uri
+    (this tool stays standalone, so it has its own copy).
+    """
+    p = os.path.abspath(path)
+    if _WINDOWS and (p.startswith('\\\\') or p.startswith('//')):
+        uri = 'file://' + quote(p.replace('\\', '/'), safe='/:')
+    else:
+        uri = Path(p).as_uri()
+    return uri + ('?' + query if query else '')
+
+
 def _ro_uri(path):
-    return Path(os.path.abspath(path)).as_uri() + '?mode=ro&immutable=1'
+    """Read-only file: URI that never creates side files (UNC-safe, see _file_uri)."""
+    return _file_uri(path, 'mode=ro&immutable=1')
 
 
 def has_old_layout(path, central):
@@ -193,7 +223,7 @@ def _tables_with_wal(db):
         copy = os.path.join(tmp, 'check.db')
         shutil.copyfile(db, copy)
         shutil.copyfile(db + '-wal', copy + '-wal')
-        return _tables(Path(copy).as_uri())        # SQLite replays the -wal into this copy only
+        return _tables(_file_uri(copy))        # SQLite replays the -wal into this copy only
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

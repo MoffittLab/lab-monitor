@@ -778,7 +778,7 @@ armv7 Synology, then the Windows servers, then the rest, each after its checks i
 [docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md) have passed. **Never point a new collector at an OLD
 (`f086e7e`) Manager:** it works, but the OLD Manager backfills each new column with a full-table UPDATE (slow
 on a large `user_metrics` table, so a batch can time out and, without dedup, be stored twice). A CURRENT
-(`160da09` / `fb6498c`) Manager stores the new messages in wide tables, which a later NEW Manager migrates.
+(`e5cd699`, `160da09` or `fb6498c`) Manager stores the new messages in wide tables, which a later NEW Manager migrates.
 
 What changes on a collector:
 

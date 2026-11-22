@@ -184,7 +184,7 @@ data/
   limit; the API returns each scan as the same flat dict the collector sent. `storage_breakdown` is
   narrow too; the API returns each run nested, exactly as sent.
 - The table prefixes `_` and `storage_breakdown_` are reserved: no `data_type` maps to them, and
-  the review-fix Manager (`160da09` / `fb6498c`) ignores such tables after a downgrade.
+  the review-fix Manager (`e5cd699`, `160da09`, `fb6498c`) ignores such tables after a downgrade.
 - Other data types have one column per payload key. A new key adds a column; earlier rows read
   `NULL` for it ("not measured"), which is different from a measured zero.
 - Every history table has a `msg_id` column with a UNIQUE index for de-duplication.
@@ -226,10 +226,10 @@ version, it copies it to `<db>.pre-upgrade-<stamp>.bak`, then migrates it (narro
 `msg_id` columns, new central tables and columns; with the usage-metrics release also the new
 per-user columns and snapshot tables in `metrics.db`, and a wide `storage_breakdown` table).
 Existing rows are never rewritten or deleted. This happens at startup, before the Manager listens.
-Adding the rollup tables to a database that already holds rows is a schema change too, so it gets the
-same one-time copy first (one per database, taken with the migration when there is one); if that copy
-fails, history is stored and served as usual and is rolled up once a retry succeeds. See
-[UPGRADE.md](UPGRADE.md).
+Adding the rollup tables to a database that already has a table (even one without rows) is a schema
+change too, so it gets the same one-time copy first (one per database, taken with the migration when
+there is one); if that copy fails, history is stored and served as usual and is rolled up once a retry
+succeeds. See [UPGRADE.md](UPGRADE.md).
 
 **Retention.** History is kept forever unless `history_retention_days` is set; then rows older
 than that are archived to JSONL and deleted once a day. A rolled-up table is pruned only once its

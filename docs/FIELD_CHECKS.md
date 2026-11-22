@@ -613,14 +613,14 @@ python tools\verify_upgrade.py --manager-config $Repo\manager\config.json --data
 ### 29. First start on the CURRENT data
 
 After the review-fix release runs in production, the real `data_dir` (`E:\Users\lab-monitor\manager-data`
-after UPGRADE.md Step 3b) is in the CURRENT (`160da09`; `fb6498c` writes the same databases) layout. Measure
+after UPGRADE.md Step 3b) is in the CURRENT (`e5cd699`; `160da09` and `fb6498c` write the same databases) layout. Measure
 the new Manager's first start on a copy of it:
 
 This is the run of [UPGRADE.md, "Verifying CURRENT → usage-metrics"](UPGRADE.md#verifying-current--usage-metrics)
 with `--keep-work` added, from the `lab-monitor-usage` worktree made there:
 
 ```powershell
-$Current = (git -C $Repo rev-parse HEAD).Trim()             # the commit the server runs (160da09 or its merge)
+$Current = (git -C $Repo rev-parse HEAD).Trim()             # the commit the server runs (e5cd699 or its merge)
 python tools\verify_upgrade.py --manager-config $Repo\manager\config.json --old-ref $Current `
        --work-dir F:\verify-current --with-dashboard --keep-work --report F:\verify-current\report.json
 Select-String -Path F:\verify-current\*\logs\new-manager.log -Pattern 'Backed up|backfill complete|migrated'
@@ -630,9 +630,10 @@ Select-String -Path F:\verify-current\*\logs\new-manager.log -Pattern 'Backed up
   `timings_seconds.new_manager_first_start` in the report; the `Backed up` lines; the
   `backfill complete (... s)` line.
 - **Pass:** the run is PASS (what that proves is listed under "PASS means" in UPGRADE.md; the `backups`
-  check enforces exactly one new backup of `metrics.db` and one of each `data.db` that holds rows, identical
-  to the original); `backfill complete` present. Proposed: the first start (blocking) under 60 s, plus the
-  time to copy the databases. Delete `F:\verify-current` afterwards (it holds full copies of the data).
+  check enforces exactly one new backup of `metrics.db` and one of each `data.db` that has a table (even
+  one without rows), identical to the original); `backfill complete` present. Proposed: the first start
+  (blocking) under 60 s, plus the time to copy the databases. Delete `F:\verify-current` afterwards (it
+  holds full copies of the data).
 - **If it fails** (first start far over a minute): plan the upgrade for a quiet hour and tell the owner
   how long the Manager will be down; there is no setting that shortens the migration.
 

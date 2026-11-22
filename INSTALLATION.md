@@ -21,7 +21,9 @@ and deployed ([docs/UPGRADE.md](docs/UPGRADE.md#the-usage-metrics-release)). Ord
 
 1. **Manager and Dashboard** together: re-run `install-manager-dashboard-taskscheduler.ps1`. The new
    Dashboard works with the old and the new Manager. The Manager's first start backs up `metrics.db`
-   once and starts the rollup backfill in the background.
+   and each system's `data.db` once (before it adds the new tables; a `data.db` with no table needs
+   none), so it needs free space about the size of the `data_dir`, and then starts the rollup backfill
+   in the background.
 2. **Collectors**, one platform at a time, each after its checks in
    [docs/FIELD_CHECKS.md](docs/FIELD_CHECKS.md): one Linux GPU server, then one x86 Synology, then one
    armv7 Synology, then the Windows servers, then everything else.
@@ -76,7 +78,8 @@ certificate).
    (see [Network paths](#data_dir-on-a-network-share)). A mapped drive letter stops the install here,
    before anything is installed or written. For a kept config whose `data_dir` is on a share or is the
    local collector's folder it prints a `[NOTE]` with the recommended layout; it never moves anything
-   ([manager/README.md, "Moving `data_dir` off the NAS"](manager/README.md#moving-data_dir-off-the-nas)).
+   ([manager/README.md, "Moving `data_dir` off the NAS"](manager/README.md#moving-data_dir-off-the-nas);
+   during the upgrade from the previous Manager: [docs/UPGRADE.md, Step 3b](docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard)).
 7. Installs `requirements.txt` (Flask, waitress, requests, paramiko; all pinned).
 8. Validates the Manager config it is about to use (`manager.py --check-config`; touches no
    database and no log file) and the Python packages. **If the Manager would refuse the config,

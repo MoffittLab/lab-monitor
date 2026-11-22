@@ -141,5 +141,5 @@ Tests: `python -m pytest` (see `pytest.ini`).
 - [collector/README.md](collector/README.md) — Collector reference
 - [dashboard/README.md](dashboard/README.md) — Dashboard reference
 - [tools/README.md](tools/README.md) — Fleet management tools
-- [docs/REMOTE_NAS_STORAGE.md](docs/REMOTE_NAS_STORAGE.md) — Manager data on a network share
+- [docs/REMOTE_NAS_STORAGE.md](docs/REMOTE_NAS_STORAGE.md) — Manager data on a network share (superseded: keep `data_dir` on a local disk and snapshot it to the NAS)
 - [docs/ATLANTIS_DUAL_ROLE.md](docs/ATLANTIS_DUAL_ROLE.md) — Manager and collector on one server

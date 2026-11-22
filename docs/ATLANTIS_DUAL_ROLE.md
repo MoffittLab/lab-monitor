@@ -18,7 +18,9 @@ This is the layout the installer creates and the one the Manager checks at start
 warning if its `data_dir` is on a network share, holds a collector's files, or has no snapshot to
 another machine. Older installs used one shared `E:\Users\lab-monitor\data` (that still works) or a
 `data_dir` on a NAS share (SQLite is not reliable there: failed transactions and `disk I/O error`).
-To move: [manager/README.md, "Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas).
+To move: [manager/README.md, "Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas);
+during the upgrade from the previous Manager, [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard),
+before the installer, so the first start migrates the databases on the local disk.
 
 ---
 
@@ -218,7 +220,8 @@ Manager reads metrics.db (and data.db for history charts)
 - `tools\verify_upgrade.py` reads the Manager's `data_dir` and fingerprints every file. In an older
   shared `data` folder the collector's own archive and queue changing during the run show up as a
   `source` difference (see [UPGRADE.md](UPGRADE.md#step-1-verify-against-your-real-data)); with a
-  separate `manager-data` they don't.
+  separate `manager-data` they don't. The Manager's `snapshot-status.json`, `.snapshot-staging\`
+  and `manager.lock` are never copied by it.
 - Re-running `install-collector-windows.ps1` resets the permissions of everything under
   `E:\Users\lab-monitor` (SYSTEM and Administrators get full control, Users read), including the
   Manager's databases. The data itself is not changed; the Manager tasks run elevated as an
@@ -239,7 +242,7 @@ Manager reads metrics.db (and data.db for history charts)
 |------|-----------|
 | Collector archives `data\atlantis\YYYY-MM.jsonl` | Forever (never deleted by the collector) |
 | Manager history (`data.db`, `user_metrics_history`) | Forever by default. With `history_retention_days` set, rows older than that are appended to `manager-data\<system>\archive\<YYYY-MM>-<data_type>.jsonl` and then deleted, once a day |
-| Snapshots on the NAS (`snapshot-<stamp>\`) | The newest `keep_daily` (14) plus the newest of each of the last `keep_monthly` (12) months |
+| Snapshots on the NAS (`snapshot-<stamp>\`) | The newest `keep_daily` (14) plus the newest of each of the last `keep_monthly` (12) months, and the newest good copy of a database a later run could not copy (`partial`). Only this Manager's own snapshots are pruned |
 | Manager snapshots and totals (`metrics.db`) | One row per system, always current |
 | Pre-upgrade backups (`*.pre-upgrade-*.bak`) | Until you delete them (after the upgrade is confirmed) |
 | Queue `queue.json` | Until acknowledged (usually seconds) |

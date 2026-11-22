@@ -6,7 +6,7 @@ The oracle everywhere is a brute-force GROUP BY over the raw table with the
 same SQL bucketing (UTC hour / day of strftime('%s', timestamp)) and the same
 "numeric values only" rule: the rollup tables must hold exactly that, however
 the rows got there (live ingest, backfill of OLD-format data written by the
-f086e7e code itself, CURRENT-format data written by the 160da09 code, a
+f086e7e code itself, CURRENT-format data written by the e5cd699 code, a
 restart or kill in the middle of a backfill, a downgrade gap).
 """
 import glob
@@ -522,7 +522,7 @@ def test_backfill_of_old_format_data(old_fixture, make_client, data_dir):
 
 
 def _build_current(data_dir, msgs_by_name):
-    """CURRENT-format databases written by the CURRENT (160da09) Manager itself."""
+    """CURRENT-format databases written by the CURRENT (e5cd699) Manager itself."""
     posts = []
     for name, msgs in msgs_by_name.items():
         for i in range(0, len(msgs), 100):
@@ -601,6 +601,38 @@ def test_rollup_tables_added_by_a_first_rolled_up_row_are_backed_up_first(make_c
     assert post_all(client, [seed_message('Atlas')], name='Atlas') == ['stored']
     atlas = os.path.join(data_dir, 'atlas', 'data.db')
     assert '_rollup_state' in tables_of(atlas) and not backups(atlas)
+
+
+def test_a_database_whose_tables_hold_no_rows_is_backed_up_before_the_rollup_tables(make_client, data_dir):
+    """
+    CURRENT-format data whose tables hold no row (what history retention leaves of a
+    silent system): adding the rollup tables still changes the schema of an existing
+    database, so it gets its one copy first, as tools/verify_upgrade.py `backups`
+    requires.  Only a database with no table at all (the empty data.db an f086e7e
+    Manager created on a read) needs none.
+    """
+    _build_current(data_dir, {'Triton': [seed_message()] + random_messages(seed=47, n=10)})
+    path = os.path.join(data_dir, 'triton', 'data.db')
+    con = sqlite3.connect(path)
+    for t in sorted(tables_of(path)):
+        if not t.startswith('sqlite_'):
+            con.execute(f'DELETE FROM "{t}"')          # as archive_metrics' retention deletes them
+    con.commit()
+    con.close()
+    before = _layout(path)
+    assert 'system_metrics' in before and not [t for t in before if t.startswith('_')]
+    ghost = os.path.join(data_dir, 'ghost', 'data.db')
+    os.makedirs(os.path.dirname(ghost))
+    con = sqlite3.connect(ghost)
+    con.execute('PRAGMA journal_mode=WAL')                # what the f086e7e Manager's read leaves
+    con.close()
+    client = make_client()
+    (bak,) = backups(path)
+    assert _layout(bak) == before and '_rollup_state' in tables_of(path)
+    assert post_all(client, [seed_message('Ghost')], name='Ghost') == ['stored']
+    assert '_rollup_state' in tables_of(ghost) and not backups(ghost)
+    make_client()                                   # a restart takes no second copy
+    assert backups(path) == [bak] and not backups(ghost)
 
 
 def _layout(path):
@@ -775,7 +807,7 @@ def test_spec_version_change_rolls_up_again(client, data_dir, monkeypatch):
 
 
 # =========================================================================== #
-# Downgrade NEW -> CURRENT (160da09) -> NEW                                   #
+# Downgrade NEW -> CURRENT (e5cd699) -> NEW                                   #
 # =========================================================================== #
 
 def test_downgrade_to_current_manager_and_back(make_client, data_dir):

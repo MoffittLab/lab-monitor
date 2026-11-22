@@ -3,7 +3,8 @@ Fixtures for the upgrade-compatibility tests.
 
   old_code      the OLD code (base commit f086e7e) extracted with git archive
   current_code  collector/, manager/ and dashboard/ of the CURRENT release
-                (160da09), extracted the same way
+                (e5cd699, the review-fix release as deployed), extracted the
+                same way
   old_data_dir  an OLD-format Manager data_dir written by that code
                 (make_old_fixture.py: the old collector feeding the old
                 Manager through its HTTP routes); built once per session
@@ -57,7 +58,7 @@ def old_code(compat_dir):
 
 @pytest.fixture(scope='session')
 def current_code(compat_dir):
-    """The CURRENT release (160da09: collector, manager, dashboard) extracted with git archive."""
+    """The CURRENT release (e5cd699: collector, manager, dashboard) extracted with git archive."""
     dest = compat_dir / 'current-code'
     try:
         tar = subprocess.run(['git', '-C', str(REPO), 'archive', '--format=tar', CURRENT_REF,
