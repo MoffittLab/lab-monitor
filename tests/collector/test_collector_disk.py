@@ -33,7 +33,7 @@ def _write(path, size):
 def _capture_disk_message(collector, monkeypatch):
     captured = []
     monkeypatch.setattr(collector, '_record_and_sync',
-                        lambda cfg, n, i, entries, log: captured.extend(entries) or True)
+                        lambda cfg, n, i, entries, log, sync=True: captured.extend(entries) or True)
     return captured
 
 

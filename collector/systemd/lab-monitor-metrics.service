@@ -50,6 +50,13 @@ ProtectHostname=yes
 # IPv4/IPv6, name resolution needs AF_UNIX (nscd, systemd-resolved), and so
 # does NVML (the nvidia-persistenced socket).
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Network: the Manager only. Everything is denied here; the installer's
+# drop-in lab-monitor-metrics.service.d/50-network.conf allows the addresses
+# manager_url resolves to (and the name servers), so without it this unit
+# reaches nothing: a missing drop-in fails closed. Loopback stays open for the
+# local resolver (systemd-resolved, 127.0.0.53).
+IPAddressDeny=any
+IPAddressAllow=localhost
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

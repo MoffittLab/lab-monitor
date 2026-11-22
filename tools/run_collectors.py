@@ -124,7 +124,10 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int,
                 result['status'] = 'ok'
                 result['output'] = stdout or (
                     f'lab-monitor-{mode}.service finished; its log: '
-                    f'sudo journalctl -u lab-monitor-{mode}.service -n 30' if linux else '(no output)')
+                    f'sudo journalctl -u lab-monitor-{mode}.service -n 30'
+                    + ('. The disk unit has no network: the next metrics run (within 5 minutes) '
+                       'sends the result' if mode == 'disk' else '')
+                    if linux else '(no output)')
             else:
                 result['status'] = 'error'
                 result['output'] = stdout

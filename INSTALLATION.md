@@ -323,6 +323,11 @@ acknowledged it. On a server with an NVIDIA driver it also installs nvidia-ml-py
 `labmon` ([GPU servers](collector/README.md#gpu-servers)). Re-running it upgrades code, venv and units and keeps the config (flags change only the keys
 they name). Details: [collector/README.md](collector/README.md#linux--ubuntu).
 
+**Network and file access:** the metrics service may only reach the Manager (the addresses `manager_url`
+resolves to when the installer runs, and the name servers): re-run the installer if the Manager's address
+changes. The disk service can read every folder it measures but has no network at all; the next metrics run
+sends its results. Details: [collector/README.md](collector/README.md#linux--ubuntu) ("Sandbox").
+
 **Shared storage:** folders on NFS/SMB or cluster filesystems (Lustre, GPFS, ...) are not scanned by
 default, so a server whose `/home` is an NFS mount reports `/home` in the disk scan's errors instead of
 walking the shared tree every night. Measure shared storage on its file server, or set

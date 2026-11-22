@@ -5,8 +5,6 @@
 [Unit]
 Description=Lab Monitor collector - disk usage
 Documentation=file:///opt/lab-monitor/collector/README.md
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 Type=oneshot
@@ -17,12 +15,14 @@ WorkingDirectory=/var/lib/lab-monitor
 # /var/lib/lab-monitor, and a venv with system site-packages (the installer's
 # offline fallback) would otherwise run any .pth file put under
 # $HOME/.local - in the disk unit, with CAP_DAC_READ_SEARCH.
-ExecStart=/opt/lab-monitor/venv/bin/python -s /opt/lab-monitor/collector/collector.py --config /etc/lab-monitor/collector.json --mode disk
+# --no-sync: archive and queue the result only. This unit has no network (see
+# below); the next metrics run, which has no capabilities, sends the queue.
+ExecStart=/opt/lab-monitor/venv/bin/python -s /opt/lab-monitor/collector/collector.py --config /etc/lab-monitor/collector.json --mode disk --no-sync
 SyslogIdentifier=lab-monitor-disk
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
 # The collector stops scanning after total_timeout_seconds (10800 s = 3 h in
 # the installer's config) and then reports what it has; 1 h more covers volume
-# capacity and the upload. install-collector-linux.sh rewrites this value from
+# capacity. install-collector-linux.sh rewrites this value from
 # the config in lab-monitor-disk.service.d/50-timeout.conf on every run.
 TimeoutStartSec=4h
 UMask=0027
@@ -37,11 +37,26 @@ CPUSchedulingPolicy=batch
 IOSchedulingClass=idle
 
 # --- Sandboxing ---------------------------------------------------------------
-# Must READ every file under scan_paths, whoever owns it, without being root:
-# CAP_DAC_READ_SEARCH bypasses read/search permission checks only (it grants
-# no write access), and is the only capability this service can ever hold.
+# Must list and stat every folder under scan_paths, whoever owns it, without
+# being root (home folders are 0750 on Ubuntu). Linux has no permission for
+# "list and stat, but don't open": CAP_DAC_READ_SEARCH, the smallest grant
+# that does it, also lets the process read file contents. The scanner never
+# opens a file it measures (scandir + lstat only), but the capability doesn't
+# enforce that. So this unit is contained instead: no network at all, nothing
+# writable outside its own data and log folders, and the system's own
+# secrets hidden. It is the only capability this service can ever hold, and
+# it grants no write access.
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+# No network: an empty network namespace (loopback only), no IP sockets, and
+# no IP traffic even if one were opened. AF_UNIX stays for the journal and
+# user/group name lookups.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+# Never scanned, and of no use to a disk scan: password hashes, SSH host keys,
+# sudo rules, root's home folder. ('-': fine if one doesn't exist.)
+InaccessiblePaths=-/root -/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/ssh -/etc/sudoers -/etc/sudoers.d
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/lab-monitor /var/log/lab-monitor
@@ -54,7 +69,6 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

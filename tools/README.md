@@ -107,7 +107,7 @@ server1.example.org,admin,,/home/admin/code/lab-monitor,,~/.ssh/id_ed25519,linux
 | Tool | On a `linux` row |
 |------|------------------|
 | `update_collectors.py` | `git pull` in `git_path`, then `sudo -n <git_path>/install-collector-linux.sh --non-interactive` (refreshes code, venv and units; keeps the config). `--upgrade-pip` adds nothing: the installer handles the venv |
-| `run_collectors.py` | `sudo -n systemctl start lab-monitor-<mode>.service`: the run gets the unit's user, sandbox and time limit, and returns when it has finished (`sudo journalctl -u lab-monitor-<mode>.service` on the host has its log) |
+| `run_collectors.py` | `sudo -n systemctl start lab-monitor-<mode>.service`: the run gets the unit's user, sandbox and time limit, and returns when it has finished (`sudo journalctl -u lab-monitor-<mode>.service` on the host has its log). A disk run only queues its result (the disk unit has no network); the next metrics run, within 5 minutes, sends it |
 | `toggle_collectors.py` | `config_tool.py` on `/etc/lab-monitor/collector.json` as root, so `active` is kept in the config like everywhere else (an update keeps it) |
 | `archive_all_collectors.py` | reads the config as root, then moves the archives as `labmon` (`sudo -n -u labmon /bin/sh -c ...`), which owns `/var/lib/lab-monitor` |
 
