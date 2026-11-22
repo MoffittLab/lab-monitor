@@ -24,6 +24,20 @@ Everything else happens on two copies under --work-dir:
           default f086e7e, or --old-code DIR)
   copy B  served by the NEW Manager (this checkout, or --new-code DIR), which
           migrates it on first start exactly as it will migrate production.
+The OLD code is the code the live Manager runs: f086e7e, or the review-fix
+release (fb6498c) once that is deployed.  Which one is detected from the old
+code (--old-version overrides it), and the data_dir must be in the layout that
+code writes.  With the review-fix release as the old side every check keeps
+its name, with that release's expectations (tools/README.md, section 8): rows
+are compared with their msg_id, folder_usage is the data type it serves from
+its narrow tables (folder_usage_msgs / _items / _legacy are storage, checked
+row by row), /api/dead_letter and /api/usage/history are compared, re-sends
+of stored messages carry their own msg_id and go to both Managers, every
+changed database needs exactly one pre-upgrade copy, and the rollback check
+starts the review-fix Manager on the migrated data (copy C, the documented
+way back) instead of restoring backups, and that Manager must also store and
+serve new data there.  Only the intended differences that
+apply to that old side (INTENDED_SIDES) are normalized.
 Both run as subprocesses on free 127.0.0.1 ports with generated configs and
 tokens; the code is copied into the work directory first, so PID files and
 logs never touch the real installation.
@@ -36,7 +50,11 @@ What is checked (each check is PASS / FAIL / WARN in the summary and report):
               there (row counts and content hashes per table); the old wide
               folder_usage table is kept as folder_usage_legacy with identical
               content; folder_usage_msgs has one row per original folder row and
-              folder_usage_items one row per measured (row, folder) cell
+              folder_usage_items one row per measured (row, folder) cell.  Again
+              after the ingest and re-send checks: the rows of every table that
+              ingest only appends to (all history tables, user_metrics_history,
+              dead_letter, the narrow folder tables) are still the original rows,
+              unchanged, followed by the new ones; *_legacy tables got none
   endpoints   every read endpoint the Dashboard and tools use, OLD vs NEW:
               /health, /api/systems, /api/devices, /api/metrics/all,
               /api/usage/all, /api/totals, /api/user_metrics/all, and per
@@ -57,13 +75,17 @@ What is checked (each check is PASS / FAIL / WARN in the summary and report):
   ingest      one new-format system_metrics + folder_usage message per device
               into copy B (and A): totals continue from the old values, the new
               points appear after the old history, a re-send is a duplicate
-              (two old spellings of one device: under the current one, N16)
+              (two old spellings of one device: under the current one, N16);
+              the central registry / snapshot / totals rows of every other
+              device stay unchanged
   legacy-resend  stored messages re-sent the way an OLD collector does (no
               msg_id), and again with a new collector's random msg_id, are
-              duplicates; a scan the old Manager only kept in the central
-              snapshot (its history insert failed) is stored now
-  backups     every database the NEW Manager changed has a pre-upgrade backup
-              (*.bak) with exactly the original content
+              duplicates and change no central row; a scan the old Manager only
+              kept in the central snapshot (its history insert failed) is
+              stored now
+  backups     every database the NEW Manager changed (its tables, columns,
+              indexes, triggers or views) has a pre-upgrade backup (*.bak) with
+              exactly the original content
   rollback    tools/rollback_upgrade.py --apply on the migrated copy B (after
               the new-message checks): every database holds its original
               content again, and the OLD Manager started on it gives the same
@@ -241,7 +263,105 @@ INTENDED = OrderedDict([
              'accepted only if that table holds every original row unchanged. (c) /api/data/<system>/'
              'storage_breakdown returns the lists and objects the old Manager returned as JSON text decoded: '
              'accepted only where the decoded OLD text equals the NEW value.')),
+    ('N22', ('back on the review-fix release: storage_breakdown runs the new Manager moved are not shown',
+             'Only with the review-fix release as the old side, in the rollback check: its Manager started on '
+             'the migrated data, the documented way back (docs/UPGRADE.md). The new Manager moves a wide '
+             'storage_breakdown table (a usage-metrics collector reported to the review-fix Manager, which '
+             'the rollout order forbids) into its narrow tables and keeps the original as '
+             'storage_breakdown_legacy; the review-fix release reserves those names and shows none of these '
+             'runs until the next upgrade. Accepted only for that system, only when storage_breakdown_legacy '
+             'holds every original row, and only as "not shown": /api/data/<system> lists the same data types '
+             'without storage_breakdown, and its rows and history come back empty.')),
 ])
+
+# The old sides each intended difference is accepted for: 'old' (f086e7e) and
+# 'current' (the review-fix release, fb6498c).  With the review-fix release as
+# the old side, the differences that release made itself (msg_id on rows,
+# narrow folder rows, scaled formatted sizes, the counters of
+# /api/metrics/all, ...) are not normalized: the OLD and NEW answers must
+# agree exactly there.  Applying one outside its sides makes the run FAIL.
+INTENDED_SIDES = {
+    'N1': ('old', 'current'), 'N2': ('old',), 'N3': ('old', 'current'), 'N4': ('old', 'current'),
+    'N5': ('old',), 'N6': ('old', 'current'), 'N7': ('old',), 'N8': ('old',), 'N9': ('old', 'current'),
+    'N10': ('old', 'current'), 'N11': ('old',), 'N12': ('old', 'current'), 'N13': ('old',),
+    'N14': ('old', 'current'), 'N15': ('old', 'current'), 'N16': ('old', 'current'),
+    'N17': ('old', 'current'), 'N18': ('old', 'current'), 'N19': ('old', 'current'),
+    'N20': ('old', 'current'), 'N21': ('old', 'current'), 'N22': ('current',),
+}
+
+# What the old code is (detect_old_version, or --old-version)
+OLD_VERSIONS = OrderedDict([
+    ('old', 'f086e7e or older: wide folder_usage tables, no msg_id'),
+    ('current', 'the review-fix release (fb6498c): narrow folder_usage tables, msg_id, dead_letter'),
+])
+# manager/data_store.py _INTERNAL_TABLE_RE of the review-fix release (the new
+# Manager keeps it): storage tables that are never listed or read as a data type
+CURRENT_INTERNAL_TABLE_RE = re.compile(
+    r'sqlite_.*|folder_usage_(?:msgs|items|legacy(?:_\d+)?)|storage_breakdown_.*|_.*')
+# manager/storage_util.py INSTANCE_LOCK_NAME: the running Manager's lock file
+# (not data; on Windows its locked byte can't even be read)
+INSTANCE_LOCK_NAME = 'manager.lock'
+
+
+def is_lock_file(rel):
+    """
+    The running Manager's lock file, or a collector's lock next to its queue
+    or state file (<device>/queue.json.lock, perf_snapshot.json.lock in a
+    data_dir the collector shares with the Manager).  Lock files hold no
+    data, and on Windows a held lock's byte can't be read.
+    """
+    return rel == INSTANCE_LOCK_NAME or rel.endswith('.json.lock')
+# Tables ingest only appends rows to (the storage check after the ingest and
+# re-send checks): every table of a system database except sqlite_* and the
+# NEW Manager's "_" tables (rollup buckets are updated in place), and these of
+# metrics.db.  The other metrics.db tables (devices, device_snapshot,
+# device_totals, device_user_snapshot, the NEW snapshot tables) are updated in
+# place: their rows may change only for a device that was sent new data
+# (Verifier._central_rows).
+CENTRAL_APPEND_ONLY = ('user_metrics_history', 'dead_letter')
+# A migrated wide table kept with every row (folder_usage, storage_breakdown):
+# nothing is ever added to it
+LEGACY_TABLE_RE = re.compile(r'(?:folder_usage|storage_breakdown)_legacy(?:_\d+)?')
+# What a usage-metrics collector sends (spec Appendix A, shortened): after
+# the documented way back to the review-fix release the upgraded collectors
+# keep running, so that Manager must store these on the migrated data too
+# (Verifier._back_ingest).  Values are made up; the user is a probe.
+NEW_COLLECTOR_PAYLOADS = (
+    {'data_type': 'system_metrics', 'cpu_percent': 23.4, 'cpu_percent_unit': '%', 'ram_percent': 41.0,
+     'ram_percent_unit': '%', 'interval_s': 300.2, 'interval_s_unit': 's', 'cpu_count': 32,
+     'cpu_iowait_percent': 1.2, 'cpu_iowait_percent_unit': '%', 'cpu_steal_percent': 0.0,
+     'proc_cpu_coverage_percent': 96.5, 'disk_read_bytes_per_s': 1250000, 'disk_write_bytes_per_s': 310000,
+     'disk_read_iops': 41.2, 'disk_write_iops': 12.0, 'disk_await_ms': 6.3, 'disk_busy_max_percent': 17.0,
+     'disk_busy_max_name': 'sata2', 'gpu_sample_seconds': 300.2, 'gpu_count': 1,
+     'gpus': [{'index': 0, 'name': 'probe GPU', 'gpu_percent': 87, 'vram_used_bytes': 2147483648,
+               'vram_total_bytes': 51527024640, 'process_source': 'nvml', 'util_split': 'single_user',
+               'users': [{'username': 'verify-upgrade-probe', 'vram_bytes': 2147483648, 'util_percent': 87.0,
+                          'processes': 1}], 'users_truncated': 0}]},
+    {'data_type': 'user_metrics', 'username': 'verify-upgrade-probe', 'cpu_percent': 12.5, 'ram_bytes': 8589934592,
+     'ram_formatted': '8.0 GB', 'cpu_seconds': 1200.4, 'cpu_cores': 4.0, 'interval_s': 300.2, 'process_count': 17,
+     'gpu_vram_bytes': 2147483648, 'gpu_util_percent': 87.0, 'gpu_busy_seconds': 261.2, 'gpus_held': 1,
+     'gpu_held_seconds': 300.2, 'gpu_processes': 1},
+    {'data_type': 'sessions', '_schema': 1, '_unit': 'count', '_detail': 'full', '_sources': {'tcp': 'ok'},
+     '_list_state': 'full', '_list_hash': '3f9a1c2b7d4e5f60', 'clients_total': 1, 'users_total': 1,
+     'ssh_clients': 1, 'ssh_users': 1, 'sessions_truncated': False,
+     'sessions': [{'service': 'ssh', 'username': 'verify-upgrade-probe', 'client': '127.0.0.1', 'connections': 1,
+                   'source': 'utmp'}]},
+    {'data_type': 'storage_health', '_schema': 1, 'trigger': 'change', 'overall_status': 'ok',
+     'overall_status_code': 0, 'status_reasons': [], 'sources': {'md': 'ok'},
+     'arrays': [{'id': 'md2', 'kind': 'md', 'level': 'raid5', 'state': 'active', 'status': 'ok',
+                 'members_total': 4, 'members_active': 4, 'degraded': 0, 'members': ['sata1', 'sata2']}],
+     'disks': [{'id': 'sata1', 'status': 'ok', 'media': 'hdd', 'size_bytes': 8001563222016, 'arrays': ['md2']}],
+     'volumes': [{'id': '/volume1', 'fs': 'btrfs', 'read_only': False, 'status': 'ok'}],
+     'disk_sata1_status_code': 0, 'array_md2_status_code': 0, 'volume_volume1_status_code': 0},
+    {'data_type': 'storage_breakdown', '_schema': 1, '_unit': 'bytes', 'cold_thresholds_days': [365, 1095],
+     'owner_source': 'posix_uid', 'age_source': 'mtime', 'top_owners': 10, 'owners_truncated': False,
+     'folders': [{'path': '/volume1/verify-upgrade-probe', 'folder_owner': 'verify-upgrade-probe', 'bytes': 5000,
+                  'files': 120, 'cold_1y_bytes': 3000, 'cold_3y_bytes': 1000,
+                  'owners': [{'owner': 'verify-upgrade-probe', 'bytes': 5000, 'files': 120, 'cold_1y_bytes': 3000,
+                              'cold_3y_bytes': 1000}]}],
+     'device': {'bytes': 5000, 'files': 120, 'cold_1y_bytes': 3000, 'cold_3y_bytes': 1000},
+     '_timed_out': [], '_errors': []},
+)
 
 # N21: manager/metrics.py SYSTEM_METRICS_EXTRA plus disk_busy_max_name, the
 # keys /api/metrics/all passes through from the latest message
@@ -538,15 +658,28 @@ def utc_now_ts() -> str:
 # ---- normalization ---- #
 
 class Applied:
-    """Counts how often each intended difference was applied."""
+    """
+    Counts how often each intended difference was applied.  side is the old
+    side's version: a difference INTENDED_SIDES does not allow for it is
+    counted in disallowed instead, and the run FAILs ("normalizations").
+    """
 
     def __init__(self):
         self.counts = Counter()
         self.enabled = True
+        self.side = 'old'
+        self.disallowed = Counter()
+
+    def allows(self, nid):
+        return self.side in INTENDED_SIDES.get(nid, ())
 
     def add(self, nid, n=1):
-        if self.enabled:
+        if not self.enabled:
+            return
+        if self.allows(nid):
             self.counts[nid] += n
+        else:
+            self.disallowed[nid] += n
 
 
 def canon_num(v, applied=None):
@@ -732,18 +865,20 @@ def describe_diffs(d):
     return '%d difference(s): %s%s' % (len(d), paths, ' ...' if len(d) > 4 else '')
 
 
-def norm_row(row, table, applied=None):
+def norm_row(row, table, applied=None, exact=False):
     """
     One /api/data row: N1/N3/N4, drop msg_id (N2), folder null/'' keys (N5),
-    storage_breakdown JSON text decoded (N21).
+    storage_breakdown JSON text decoded (N21).  exact (the review-fix release
+    is the old side: both Managers store msg_id and narrow folder rows):
+    msg_id is compared and no folder key is dropped.
     """
     if not isinstance(row, dict):
         return canon(row, applied)
-    folder = table == 'folder_usage'
+    folder = table == 'folder_usage' and not exact
     r = {}
     dropped = 0
     for k, v in row.items():
-        if k == 'msg_id':
+        if k == 'msg_id' and not exact:
             if applied:
                 applied.add('N2')
             continue
@@ -839,7 +974,12 @@ def points_of(data):
 # --------------------------------------------------------------------------- #
 
 def fingerprint(root):
-    """{'files': {rel: {size, mtime_ns, sha256}}, 'dirs': [rel]} for every file under root."""
+    """
+    {'files': {rel: {size, mtime_ns, sha256}}, 'dirs': [rel]} for every file
+    under root.  Lock files (is_lock_file: manager.lock, a collector's
+    *.json.lock) get size and mtime only: on Windows a held lock's byte can't
+    be read.
+    """
     files, dirs = {}, []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -851,7 +991,8 @@ def fingerprint(root):
             rel = os.path.relpath(p, root).replace(os.sep, '/')
             try:
                 st = os.stat(p)
-                files[rel] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'sha256': sha256_file(p)}
+                files[rel] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns,
+                              'sha256': None if is_lock_file(rel) else sha256_file(p)}
             except OSError as e:
                 files[rel] = {'error': '%s: %s' % (type(e).__name__, e)}
     return {'files': files, 'dirs': dirs}
@@ -942,7 +1083,12 @@ def backup_sqlite(src, dst, staging):
 
 
 def copy_data_dir(src, dst, staging):
-    """Copy src -> dst: databases via the backup API, other files with shutil.copy2."""
+    """
+    Copy src -> dst: databases via the backup API, other files with
+    shutil.copy2.  Lock files (is_lock_file) are not copied: they hold no
+    data, each Manager and collector writes its own, and on Windows a held
+    lock's byte can't be read.
+    """
     copied = []
     os.makedirs(dst, exist_ok=True)
     for dirpath, dirnames, filenames in os.walk(src):
@@ -958,6 +1104,9 @@ def copy_data_dir(src, dst, staging):
                          if fn.endswith(s) and fn[:-len(s)] in names), None)
             if side and is_sqlite(os.path.join(dirpath, side)):
                 continue                      # copied together with its database
+            if is_lock_file(rel):
+                copied.append({'file': rel, 'kind': 'lock', 'method': 'not copied'})
+                continue
             t = os.path.join(target_dir, fn)
             if is_sqlite(p):
                 method = backup_sqlite(p, t, staging)
@@ -989,19 +1138,40 @@ def quick_check(path) -> str:
 # Inventory of the original databases (direct SQL on pristine copy A)         #
 # --------------------------------------------------------------------------- #
 
-def table_hash(conn, table, cols):
+def table_hash(conn, table, cols, limit=None):
+    """
+    (sha256, rows) of a table's content over cols, in rowid order (a WITHOUT
+    ROWID table: in column order).  limit: only the first `limit` rows, the
+    rows the table had before rows were appended, which hash as the whole
+    table did then.  The WITHOUT ROWID tables of a system database
+    (folder_usage_items, storage_breakdown_rows) start with msg_row_id, the
+    growing id of their run, so appended rows sort after those too.
+    """
     h = hashlib.sha256()          # content only (a renamed table hashes the same)
     h.update(('%s\0' % '\0'.join(cols)).encode('utf-8', 'backslashreplace'))
     sel = ', '.join(qi(c) for c in cols)
+    cut = '' if limit is None else ' LIMIT %d' % int(limit)
     try:
-        cur = conn.execute('SELECT %s FROM %s ORDER BY rowid' % (sel, qi(table)))
+        cur = conn.execute('SELECT %s FROM %s ORDER BY rowid%s' % (sel, qi(table), cut))
     except sqlite3.OperationalError:          # WITHOUT ROWID
-        cur = conn.execute('SELECT %s FROM %s ORDER BY %s' % (sel, qi(table), sel))
+        cur = conn.execute('SELECT %s FROM %s ORDER BY %s%s' % (sel, qi(table), sel, cut))
     n = 0
     for row in cur:              # repr() of floats round-trips exactly; bytes repr is deterministic
         h.update(repr(row).encode('utf-8', 'backslashreplace'))
         n += 1
     return h.hexdigest(), n
+
+
+def schema_objects(conn):
+    """Every index, trigger and view of a database: [[type, name, table, sql]] by type and name."""
+    return [list(r) for r in conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') "
+        "ORDER BY type, name")]
+
+
+def schema_digest(conn) -> str:
+    """Digest of a database's whole schema (sqlite_master: tables, indexes, triggers, views)."""
+    return digest(conn.execute('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').fetchall())
 
 
 def db_tables(conn):
@@ -1038,7 +1208,105 @@ def combine_hash(per_table):
     return digest(sorted(per_table.items()))
 
 
-def inventory_db(path, kind, window_cells, want_hash):
+def time_windows(conn, table, ncols, window_cells):
+    """
+    ([(start, end), ...], min_ts, max_ts) covering every row of table by its
+    timestamp, about window_cells (rows x ncols) per window.
+    """
+    per = max(100, min(50000, window_cells // max(1, ncols)))
+    bounds, i, tmin, tmax = [], 0, None, None
+    for (ts,) in conn.execute('SELECT timestamp FROM %s ORDER BY timestamp' % qi(table)):
+        c = canon_ts(ts)
+        if isinstance(c, str) and parse_ts(c) is not None:
+            tmin = c if tmin is None or c < tmin else tmin
+            tmax = c if tmax is None or c > tmax else tmax
+            if i and i % per == 0:
+                bounds.append(c)
+        i += 1
+    edges = [LOW_TS] + sorted(set(bounds)) + [HIGH_TS]
+    return [(edges[k], edges[k + 1]) for k in range(len(edges) - 1)], tmin, tmax
+
+
+def _newest(conn, table, where=''):
+    cur = conn.execute('SELECT * FROM %s %s ORDER BY timestamp DESC, rowid DESC LIMIT 1' % (qi(table), where))
+    row = cur.fetchone()
+    return dict(zip([c[0] for c in cur.description], row)) if row else None
+
+
+def current_data_types(conn, tables, window_cells):
+    """
+    The data types a database in the review-fix layout serves
+    (/api/data/<system>): every table that is not internal
+    (CURRENT_INTERNAL_TABLE_RE), and folder_usage from folder_usage_msgs /
+    _items (a wide folder_usage table whose migration is still held back is
+    served as it is).  Each info has what the OLD inventory has for a table
+    (columns, types, rows, windows, min_ts / max_ts, newest_row; for
+    folder_usage the 'folder' summary) plus the rows legacy-resend re-sends:
+    newest_with_id (the newest with a msg_id), newest_legacy_id (the newest
+    whose msg_id the Manager derived for a message without one,
+    "legacy-<sha1>"), newest_pre_upgrade (msg_id NULL: stored before the
+    review-fix upgrade) and, for folder_usage, newest_legacy_row (the newest
+    row of the wide table kept as folder_usage_legacy).
+    """
+    out = OrderedDict()
+    for t, info in tables.items():
+        if CURRENT_INTERNAL_TABLE_RE.fullmatch(t) or 'timestamp' not in info['columns']:
+            continue
+        d = dict(info, table=t)          # windows, min_ts / max_ts, newest_row: inventory_db
+        if t != 'folder_usage' and info['rows']:
+            if 'msg_id' in {c.lower() for c in info['columns']}:
+                d['newest_with_id'] = _newest(conn, t, "WHERE msg_id IS NOT NULL AND msg_id NOT LIKE 'legacy-%'")
+                d['newest_legacy_id'] = _newest(conn, t, "WHERE msg_id LIKE 'legacy-%'")
+                d['newest_pre_upgrade'] = _newest(conn, t, 'WHERE msg_id IS NULL')
+        out[t] = d
+    if 'folder_usage_msgs' in tables and 'folder_usage_items' in tables and 'folder_usage' not in out:
+        keys, meta_types, items, timestamps = Counter(), {}, 0, set()
+        rows = conn.execute('SELECT COUNT(*) FROM folder_usage_msgs').fetchone()[0]
+        for ts, meta_json in conn.execute('SELECT timestamp, meta_json FROM folder_usage_msgs'):
+            if isinstance(ts, str):
+                timestamps.add(canon_ts(ts))
+            try:
+                meta = json.loads(meta_json or '{}')
+            except ValueError:
+                meta = {}
+            for k, v in (meta.items() if isinstance(meta, dict) else ()):
+                num = isinstance(v, (int, float)) and not isinstance(v, bool)
+                meta_types[k] = 'REAL' if num and meta_types.get(k, 'REAL') == 'REAL' else 'TEXT'
+        for key, value in conn.execute('SELECT key, value FROM folder_usage_items'):
+            items += 1
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                keys[key] += 1
+        cols = ['id', 'msg_id', 'timestamp', 'device_type'] + sorted(set(keys) | set(meta_types))
+        d = {'table': 'folder_usage_msgs', 'columns': cols, 'rows': rows,
+             'types': dict(meta_types, id='INTEGER', msg_id='TEXT', timestamp='TEXT', device_type='TEXT'),
+             'folder': {'expected_items': items, 'keys': dict(keys), 'meta_columns': sorted(meta_types),
+                        'data_columns': cols[4:], 'timestamps': sorted(timestamps)}}
+        d['windows'], d['min_ts'], d['max_ts'] = time_windows(conn, 'folder_usage_msgs', len(cols), window_cells)
+        for k, where in (('newest_with_id', "WHERE msg_id IS NOT NULL AND msg_id NOT LIKE 'legacy-%'"),
+                         ('newest_legacy_id', "WHERE msg_id LIKE 'legacy-%'"),
+                         ('newest_pre_upgrade', 'WHERE msg_id IS NULL')):
+            m = _newest(conn, 'folder_usage_msgs', where)
+            if m is not None:
+                try:
+                    meta = json.loads(m.pop('meta_json') or '{}')
+                except ValueError:
+                    meta = {}
+                m.update(meta if isinstance(meta, dict) else {})
+                m.update(dict(conn.execute('SELECT key, value FROM folder_usage_items WHERE msg_row_id = ?',
+                                           (m['id'],)).fetchall()))
+            d[k] = m
+        legacy = sorted(x for x in tables if x == 'folder_usage_legacy' or x.startswith('folder_usage_legacy_'))
+        d['newest_legacy_row'] = _newest(conn, legacy[-1]) if legacy and tables[legacy[-1]].get('rows') else None
+        out['folder_usage'] = d
+    return OrderedDict(sorted(out.items()))
+
+
+def inventory_db(path, kind, window_cells, want_hash, layout='old'):
+    """
+    Tables, row counts, content hashes and time windows of one pristine
+    database.  layout 'current' (the review-fix release wrote it): also the
+    data types it serves, under 'types' (current_data_types).
+    """
     conn = ro_connect(path, immutable=True)       # pristine copy, nobody writes it yet
     try:
         tables = db_tables(conn)
@@ -1048,22 +1316,9 @@ def inventory_db(path, kind, window_cells, want_hash):
             if want_hash:
                 info['hash'] = table_hash(conn, t, cols)[0]
             if kind == 'system' and 'timestamp' in cols and t != 'sqlite_sequence':
-                per = max(100, min(50000, window_cells // max(1, len(cols))))
-                bounds, i, tmin, tmax = [], 0, None, None
-                for (ts,) in conn.execute('SELECT timestamp FROM %s ORDER BY timestamp' % qi(t)):
-                    c = canon_ts(ts)
-                    if isinstance(c, str) and parse_ts(c) is not None:
-                        tmin = c if tmin is None or c < tmin else tmin
-                        tmax = c if tmax is None or c > tmax else tmax
-                        if i and i % per == 0:
-                            bounds.append(c)
-                    i += 1
                 if t != 'folder_usage' and info['rows']:
-                    cur = conn.execute('SELECT * FROM %s ORDER BY timestamp DESC, rowid DESC LIMIT 1' % qi(t))
-                    info['newest_row'] = dict(zip([c[0] for c in cur.description], cur.fetchone()))
-                edges = [LOW_TS] + sorted(set(bounds)) + [HIGH_TS]
-                info['windows'] = [(edges[k], edges[k + 1]) for k in range(len(edges) - 1)]
-                info['min_ts'], info['max_ts'] = tmin, tmax
+                    info['newest_row'] = _newest(conn, t)
+                info['windows'], info['min_ts'], info['max_ts'] = time_windows(conn, t, len(cols), window_cells)
             if kind == 'system' and t == 'folder_usage':
                 data_cols = [c for c in cols if c.lower() not in INTERNAL_COLS]
                 keys, items, meta = Counter(), 0, set()
@@ -1082,7 +1337,9 @@ def inventory_db(path, kind, window_cells, want_hash):
                                   'meta_columns': sorted(meta), 'data_columns': data_cols,
                                   'timestamps': sorted({canon_ts(r[0]) for r in conn.execute(
                                       'SELECT timestamp FROM folder_usage') if isinstance(r[0], str)})}
-        result = {'kind': kind, 'tables': tables}
+        result = {'kind': kind, 'tables': tables, 'schema': schema_objects(conn)}
+        if kind == 'system' and layout == 'current':
+            result['types'] = current_data_types(conn, tables, window_cells)
         if kind == 'central':
             result['devices'] = []
             if 'devices' in tables:
@@ -1158,6 +1415,53 @@ def _backup_belongs(f, rel):
     stem = rbase.rsplit('.', 1)[0]
     same_tree = fdir == rdir or (fdir.startswith(rdir + '/') if rdir else '/' not in fdir)
     return same_tree and stem in fbase
+
+
+def detect_old_version(code):
+    """
+    Which release a checkout is, from its files: 'usage-metrics' (it has
+    manager/rollups.py), 'current' (the review-fix release: narrow
+    folder_usage_msgs tables and /api/dead_letter) or 'old' (f086e7e and
+    before).
+    """
+    m = Path(code) / 'manager'
+    if (m / 'rollups.py').is_file():
+        return 'usage-metrics'
+    try:
+        ds = (m / 'data_store.py').read_text(encoding='utf-8', errors='replace')
+        mgr = (m / 'manager.py').read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return 'old'
+    return 'current' if 'folder_usage_msgs' in ds and '/api/dead_letter' in mgr else 'old'
+
+
+def data_layout(root, sqlite_files):
+    """
+    ('current', evidence) if the review-fix release (or a later one) has
+    written this data_dir: metrics.db has a dead_letter table, or a
+    <system>/data.db has folder_usage_msgs or a msg_id column.  ('old', [])
+    otherwise.  sqlite_files: relative paths; backups are not looked at.
+    """
+    evidence = []
+    for rel in sqlite_files:
+        parts = rel.split('/')
+        central = rel == 'metrics.db'
+        if not central and not (len(parts) == 2 and parts[1] == 'data.db'):
+            continue
+        conn = ro_connect(Path(root) / rel, immutable=True)
+        try:
+            tables = db_tables(conn)
+        finally:
+            conn.close()
+        if central:
+            if 'dead_letter' in tables:
+                evidence.append('metrics.db: dead_letter')
+            continue
+        for t, info in tables.items():
+            if t == 'folder_usage_msgs' or 'msg_id' in {c.lower() for c in info['columns']}:
+                evidence.append('%s: %s' % (rel, t))
+                break
+    return ('current' if evidence else 'old'), evidence
 
 
 class Resp:
@@ -1317,6 +1621,11 @@ class Verifier:
         self.name_rejected = set()      # (endpoint pattern, registered name) the NEW Manager refused
         self.old_answers = OrderedDict()    # OLD answers before any write: replayed after the rollback
         self.report = OrderedDict()
+        self.old_version = 'old'            # what the old code is: 'old' (f086e7e) or 'current' (review-fix)
+        self.exact = False                  # old side 'current': rows compared with msg_id, nothing dropped
+        self.breakdown_migrated = set()     # system dirs whose wide storage_breakdown table was moved (N21 b)
+        self.copy_c = None                  # 'current': copy B after the first start, for the rollback check
+        self.rows_baseline = {}             # {db: {table: info}} append-only tables the NEW Manager added
 
     # ---------------- recording ---------------- #
 
@@ -1339,7 +1648,13 @@ class Verifier:
     def ok(self, pattern):
         self.ep(pattern)['equal'] += 1
 
-    def intended(self, pattern, nid):
+    def intended(self, pattern, nid, request='-', system=None):
+        """An intended difference accepted; one INTENDED_SIDES does not allow here is a difference."""
+        if not self.applied.allows(nid):
+            self.applied.add(nid)
+            self.diff(pattern, request, 'intended difference %s (%s) does not apply with %s as the old side'
+                      % (nid, INTENDED[nid][0], self.old_version), system=system)
+            return
         self.ep(pattern)['intended'][nid] += 1
         self.applied.add(nid)
 
@@ -1359,10 +1674,10 @@ class Verifier:
         self.warnings.append(text)
         say('[WARN] ' + text)
 
-    def remember(self, key, pattern, path, params, normalize, status, obj):
+    def remember(self, key, pattern, path, params, normalize, status, obj, admin=False):
         """Record a NEW response (normalized) so it can be replayed after the restart."""
         self.digests[key] = {'digest': digest(obj), 'pattern': pattern, 'path': path, 'params': params,
-                             'normalize': normalize, 'status': status}
+                             'normalize': normalize, 'status': status, 'admin': admin}
 
     def replay_after_restart(self):
         """Ask the restarted NEW Manager every NEW request of the comparison again: same answers?"""
@@ -1370,7 +1685,7 @@ class Verifier:
         self.applied.enabled = False
         try:
             for key, rec in self.digests.items():
-                r = self.new.get(rec['path'], rec['params'])
+                r = (self.new_admin if rec.get('admin') else self.new).get(rec['path'], rec['params'])
                 if r.status != rec['status']:
                     self.digest_changes.append((key, 'HTTP %s -> %s' % (rec['status'], r.status)))
                 elif r.status == 200 and digest(rec['normalize'](r.data)) != rec['digest']:
@@ -1437,6 +1752,7 @@ class Verifier:
         total = sum(f.get('size', 0) for f in fp['files'].values())
         dbs = sum(f.get('size', 0) for rel, f in fp['files'].items() if rel.endswith('.db'))
         # copy A + copy B + B's pre-upgrade backups + narrow folder tables + the rollback's restored copies
+        # (with the review-fix release as the old side: its copy C of the migrated databases instead)
         need = int(total * 2 + dbs * 2.5) + 64 * 1024 * 1024
         free = shutil.disk_usage(str(self.work)).free
         self.report['space'] = {'source_bytes': total, 'database_bytes': dbs, 'estimated_need': need, 'free': free}
@@ -1490,6 +1806,7 @@ class Verifier:
         if not (old / 'manager' / 'manager.py').is_file():
             raise SetupError('%s has no manager/manager.py' % old)
         self.old_code = old
+        info['old']['version'] = self.resolve_old_version(old)
 
         src_new = Path(a.new_code).resolve() if a.new_code else REPO_ROOT
         new = self.work / 'new-code'
@@ -1512,6 +1829,44 @@ class Verifier:
             pass
         info['new'] = ninfo
         self.report['code'] = info
+
+    def resolve_old_version(self, old):
+        """
+        What the old code is: detected from its files (detect_old_version), or
+        --old-version.  'current' (the review-fix release) switches every check
+        to the expectations for that old side (tools/README.md).
+        """
+        detected = detect_old_version(old)
+        want = self.args.old_version
+        if want == 'auto':
+            if detected not in OLD_VERSIONS:
+                raise SetupError('the old code (%s) is already a usage-metrics release (it has manager/rollups.py); '
+                                 'this tool verifies upgrades from f086e7e or from the review-fix release. '
+                                 'Pass --old-version current to compare it as a review-fix release anyway.' % old)
+            version = detected
+        else:
+            version = want
+            if detected != want:
+                self.warn('--old-version %s, but the old code looks like %s' % (want, detected))
+        self.old_version = version
+        self.exact = version == 'current'
+        self.applied.side = version
+        say('OLD side: %s (%s)' % (version, OLD_VERSIONS[version]))
+        return {'name': version, 'detected': detected, 'description': OLD_VERSIONS[version]}
+
+    def check_layout(self):
+        """The data_dir must be in the layout the old code writes (copy A, read only)."""
+        layout, evidence = data_layout(self.copy_a, [c['file'] for c in self.copied if c['kind'] == 'sqlite'])
+        self.report['data_layout'] = {'layout': layout, 'evidence': evidence[:10]}
+        if layout == 'current' and self.old_version == 'old':
+            raise SetupError(
+                'the data_dir was written by the review-fix release or a later one (%s), but the old code is '
+                'f086e7e or older: pass --old-ref <the commit the live Manager runs> (git -C <its checkout> '
+                'rev-parse HEAD; e.g. fb6498c), see tools/README.md' % ', '.join(evidence[:3]))
+        if layout == 'old' and self.old_version == 'current':
+            raise SetupError(
+                'the data_dir is still in the layout the f086e7e Manager wrote, but the old code is the '
+                'review-fix release: verify that upgrade with the default --old-ref f086e7e')
 
     def preflight_config(self):
         if self.manager_config is None:
@@ -1587,7 +1942,8 @@ class Verifier:
             ('max_folders', a.max_folders), ('window_cells', a.window_cells),
             ('tail_limit', a.tail_limit), ('folder_tail_limit', a.folder_tail_limit),
             ('user_history_limit', a.user_history_limit), ('with_dashboard', a.with_dashboard),
-            ('old_history_windows', a.old_history_windows), ('python', sys.version.split()[0]),
+            ('old_history_windows', a.old_history_windows), ('old_version', a.old_version),
+            ('python', sys.version.split()[0]),
             ('platform', sys.platform),
         ])
         try:
@@ -1632,6 +1988,7 @@ class Verifier:
         else:
             self.check('copies', 'PASS', '%d files copied (%s)' % (
                 len(self.copied), ', '.join('%s: %d' % kv for kv in sorted(methods.items()))))
+        self.check_layout()
         shutil.copytree(str(self.copy_a), str(self.copy_b))
         self.b_files_initial = list_files(self.copy_b)
 
@@ -1657,6 +2014,8 @@ class Verifier:
         say('Restarting the NEW Manager on copy B (migration must be idempotent) ...')
         self.stop(self.new_proc)
         self.scan_log('new-manager.log', 'first start')
+        if self.exact:
+            self._timed('rollback_copy', self.make_rollback_copy)
         self.new_proc, t_new2 = self.start_manager('new', self.copy_b)
         self.timings['new_manager_restart'] = round(t_new2, 1)
         for h in (self.new, self.new_admin):
@@ -1664,6 +2023,7 @@ class Verifier:
             h.port = self.new_proc.port
         self.pass_no = 2
         self._timed('storage_after_restart', self.check_storage, 'after restart')
+        self._timed('rows_baseline', self.record_rows_baseline)
         self._timed('replay_after_restart', self.replay_after_restart)
         if self.digest_changes:
             self.check('restart', 'FAIL', '%d answers changed after restarting the NEW Manager'
@@ -1673,12 +2033,13 @@ class Verifier:
                        'all %d NEW answers identical' % len(self.digests))
 
         self._timed('ingest', self.check_ingest)
-        self._timed('legacy_resend', self.check_legacy_resend)
+        self._timed('legacy_resend', self.check_resend_current if self.exact else self.check_legacy_resend)
         self.stop_all()
         self.scan_log('new-manager.log', 'whole run')
+        self._timed('storage_after_writes', self.check_stored_rows)
         self._timed('backups', self.check_backups)
         self.check_other_files()
-        self._timed('rollback', self.check_rollback)
+        self._timed('rollback', self.check_back_to_current if self.exact else self.check_rollback)
 
         say('Fingerprinting the source data_dir again ...')
         self.fp_after = self._timed('fingerprint_after', fingerprint, str(self.data_dir))
@@ -1706,7 +2067,8 @@ class Verifier:
                 kind = 'system'
             else:
                 kind = 'other'
-            inv['dbs'][rel] = inventory_db(self.copy_a / rel, kind, self.args.window_cells, want_hash)
+            inv['dbs'][rel] = inventory_db(self.copy_a / rel, kind, self.args.window_cells, want_hash,
+                                           layout='current' if self.exact else 'old')
         central = inv['dbs'].get('metrics.db') or {'devices': [], 'metrics_json': {}, 'users': [], 'totals': {}}
         inv['central'] = central
         dirs = {rel.split('/')[0] for rel, d in inv['dbs'].items() if d['kind'] == 'system'}
@@ -1806,15 +2168,19 @@ class Verifier:
     # ---------------- storage checks (copy B) ---------------- #
 
     def check_storage(self, phase):
-        problems, notes = [], []
+        problems, notes, added = [], [], {}
         for rel, dbinv in self.inv['dbs'].items():
             path = self.copy_b / rel
             if not path.is_file():
                 problems.append('%s: database missing in copy B' % rel)
                 continue
-            conn = ro_connect(path)
+            # a backup nobody has open is read without creating side files next to it
+            conn = ro_connect(path, immutable=dbinv['kind'] == 'other' and not os.path.exists(str(path) + '-wal'))
             try:
                 btables = db_tables(conn)
+                new_tables = sorted(set(btables) - set(dbinv['tables']))
+                if new_tables:
+                    added[rel] = new_tables
                 for t, info in dbinv['tables'].items():
                     if t == 'sqlite_sequence':
                         continue
@@ -1843,11 +2209,16 @@ class Verifier:
                                             % (rel, t))
             finally:
                 conn.close()
+        if self.exact and added:
+            notes.append('tables added in %d databases, e.g. %s: %s' % (
+                len(added), sorted(added)[0], ', '.join(added[sorted(added)[0]][:6])))
         if problems:
-            self.check('storage', 'FAIL', '%s: %s' % (phase, '; '.join(problems[:6])), problems=problems)
+            self.check('storage', 'FAIL', '%s: %s' % (phase, '; '.join(problems[:6])), problems=problems,
+                       added_tables=added)
         else:
             self.check('storage', 'PASS', '%s: every original table and row is intact in copy B%s'
-                       % (phase, ' (%s)' % '; '.join(notes[:3]) if notes else ''), notes=notes)
+                       % (phase, ' (%s)' % '; '.join(notes[:3]) if notes else ''), notes=notes,
+                       added_tables=added)
 
     def _check_renamed_storage(self, rel, conn, btables, t, info, problems, notes):
         """
@@ -1866,6 +2237,7 @@ class Verifier:
                 continue
             notes.append('%s: %s migrated, kept as %s with every row' % (rel, t, legacy))
             self.applied.add('N21')
+            self.breakdown_migrated.add(rel.split('/')[0])
             return
         problems.append('%s: table %s is gone (no %s_legacy table holds its %d rows unchanged)'
                         % (rel, t, t, info['rows']))
@@ -1906,6 +2278,139 @@ class Verifier:
                             % (rel, items, expected))
         notes.append('%s: %d folder rows x %d columns -> %d narrow items' % (
             rel.split('/')[0], info['rows'], len(info['folder']['data_columns']), items))
+
+    @staticmethod
+    def _append_only(kind, table) -> bool:
+        """A table ingest only appends rows to (CENTRAL_APPEND_ONLY)."""
+        if table.startswith(('sqlite_', '_')):
+            return False
+        return kind != 'central' or table in CENTRAL_APPEND_ONLY
+
+    def record_rows_baseline(self):
+        """
+        After the restart: the append-only tables of the system databases that
+        the NEW Manager added while migrating (the narrow folder_usage and
+        storage_breakdown tables holding the migrated rows), with their rows
+        now, for check_stored_rows.  The original tables are checked against
+        the inventory itself.
+        """
+        for rel, dbinv in self.inv['dbs'].items():
+            path = self.copy_b / rel
+            if dbinv['kind'] != 'system' or not path.is_file():
+                continue
+            conn = ro_connect(path)
+            try:
+                for t, info in db_tables(conn).items():
+                    if t in dbinv['tables'] or not self._append_only('system', t):
+                        continue
+                    base = {'columns': info['columns'],
+                            'rows': conn.execute('SELECT COUNT(*) FROM %s' % qi(t)).fetchone()[0]}
+                    if not self.args.no_hash:
+                        base['hash'] = table_hash(conn, t, info['columns'])[0]
+                    self.rows_baseline.setdefault(rel, {})[t] = base
+            finally:
+                conn.close()
+
+    def check_stored_rows(self):
+        """
+        storage, after the ingest and re-send checks (every Manager stopped):
+        every row stored before the upgrade is still there, unchanged.  For
+        each table ingest only appends to, its first rows in rowid order
+        (table_hash limit; as many as it had) must hash as the original
+        table did, and a
+        *_legacy table or another database file must be exactly the
+        original.  A table the NEW Manager moved (folder_usage on f086e7e
+        data, a wide storage_breakdown) is checked in the *_legacy table that
+        holds it; the narrow tables it filled are checked against their rows
+        after the restart.  The in-place central tables (registry,
+        snapshots, totals) are checked by ingest and legacy-resend.
+        """
+        problems, checked = [], 0
+        for rel, dbinv in self.inv['dbs'].items():
+            path = self.copy_b / rel
+            if not path.is_file():
+                problems.append('%s: database missing in copy B' % rel)
+                continue
+            kind = dbinv['kind']
+            # nobody has it open now; a -wal holds what a Manager wrote last (immutable would skip it)
+            conn = ro_connect(path, immutable=not os.path.exists(str(path) + '-wal'))
+            try:
+                btables = db_tables(conn)
+                expected = [(t, info, kind == 'other' or bool(LEGACY_TABLE_RE.fullmatch(t)), 'the original')
+                            for t, info in dbinv['tables'].items() if kind == 'other' or self._append_only(kind, t)]
+                expected += [(t, info, bool(LEGACY_TABLE_RE.fullmatch(t)), 'its rows after the restart')
+                             for t, info in (self.rows_baseline.get(rel) or {}).items()]
+                for t, info, exact, what in expected:
+                    target = t
+                    if t not in btables:
+                        # moved by the migration: the *_legacy table that holds every row
+                        moved = [x for x in sorted(btables) if LEGACY_TABLE_RE.fullmatch(x) and x.startswith(t + '_')
+                                 and not [c for c in info['columns'] if c not in btables[x]['columns']]]
+                        target, exact = (moved[0] if len(moved) == 1 else None), True
+                        if len(moved) > 1:
+                            ok = [x for x in moved if conn.execute('SELECT COUNT(*) FROM %s' % qi(x)).fetchone()[0]
+                                  == info['rows'] and ('hash' not in info or
+                                                       table_hash(conn, x, info['columns'])[0] == info['hash'])]
+                            target = ok[0] if ok else None
+                        if target is None:
+                            problems.append('%s: table %s is gone (no %s_legacy table holds its %d rows)'
+                                            % (rel, t, t, info['rows']))
+                            continue
+                    missing = [c for c in info['columns'] if c not in btables[target]['columns']]
+                    if missing:
+                        problems.append('%s: %s lost columns %s' % (rel, target, missing[:5]))
+                        continue
+                    n = conn.execute('SELECT COUNT(*) FROM %s' % qi(target)).fetchone()[0]
+                    checked += 1
+                    if n < info['rows'] or (exact and n != info['rows']):
+                        problems.append('%s: %s has %d rows, %s %d' % (rel, target, n, what, info['rows']))
+                        continue
+                    if 'hash' in info and table_hash(conn, target, info['columns'],
+                                                     limit=info['rows'])[0] != info['hash']:
+                        problems.append('%s: %s: rows stored before were changed (its first %d rows no longer '
+                                        'hash as %s)' % (rel, target, info['rows'], what))
+            finally:
+                conn.close()
+        if problems:
+            self.check('storage', 'FAIL', 'after ingest and re-sends: %s' % '; '.join(problems[:6]),
+                       problems=problems)
+        else:
+            self.check('storage', 'PASS', 'after ingest and re-sends: the rows stored before are unchanged in '
+                       'all %d tables that ingest only appends to' % checked)
+
+    def _central_rows(self):
+        """
+        {table: Counter((device name, row))} of copy B's metrics.db tables
+        that ingest updates in place (not _append_only): the registry,
+        snapshots and totals.  Read while the NEW Manager runs (read only).
+        """
+        path = self.copy_b / 'metrics.db'
+        if not path.is_file():
+            return {}
+        conn = ro_connect(path)
+        try:
+            out = {}
+            for t, info in db_tables(conn).items():
+                if t.startswith(('sqlite_', '_')) or self._append_only('central', t):
+                    continue
+                cols = info['columns']
+                i = cols.index('name') if 'name' in cols else None
+                out[t] = Counter((r[i] if i is not None else None, repr(tuple(r)))
+                                 for r in conn.execute('SELECT * FROM %s' % qi(t)))
+            return out
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _central_changes(before, after, allowed):
+        """Central in-place rows that changed between before and after and belong to no name in allowed."""
+        out = set()
+        for t in sorted(set(before) | set(after)):
+            b, a = before.get(t, Counter()), after.get(t, Counter())
+            for name, _row in (b - a) + (a - b):
+                if name is None or name not in allowed:
+                    out.add('%s: the row of %r changed' % (t, name))
+        return sorted(out)
 
     # ---------------- endpoint comparison ---------------- #
 
@@ -1976,9 +2481,30 @@ class Verifier:
         """System name to send to the NEW Manager for this endpoint."""
         return d if (pattern, name) in self.name_rejected else name
 
+    def record_old(self, key, pattern, path, params, normalize, resp, meta=None):
+        """
+        Keep an OLD answer given before any write (pass 1) for the rollback
+        check, which asks the old Manager again.  meta: what the answer is
+        about ({'dir', 'data_type', 'kind'}: N22); for a data type listing
+        ('kind': 'listing') the normalized answer itself is kept.
+        """
+        if self.pass_no != 1:
+            return
+        was, self.applied.enabled = self.applied.enabled, False     # not counted twice
+        try:
+            norm = normalize(resp.data) if resp.status == 200 else None
+            rec = {'pattern': pattern, 'path': path, 'params': params, 'normalize': normalize,
+                   'status': resp.status, 'digest': digest(norm) if resp.status == 200 else None,
+                   'meta': dict(meta or {})}
+            if rec['meta'].get('kind') == 'listing':
+                rec['meta']['answer'] = norm
+            self.old_answers[('old',) + tuple(key)] = rec
+        finally:
+            self.applied.enabled = was
+
     def compare_simple(self, pattern, path, normalize, params=None, system=None, fix=None,
                        allow_old_error=False, hint=None, key=None, new_path=None, oracle=None,
-                       alt_new_path=None, accept=None):
+                       alt_new_path=None, accept=None, meta=None):
         o, n = self.get_pair(path, params, new_path=new_path)
         st = self.ep(pattern)
         st['requests'] += 1
@@ -1987,14 +2513,7 @@ class Verifier:
             n = self.new.get(alt_new_path[1], params)
             request = alt_new_path[1] + ('?' + urlencode(params) if params else '')
         outcome = self.status_outcome(pattern, request, o, n, system, allow_old_error, hint)
-        if self.pass_no == 1:
-            was, self.applied.enabled = self.applied.enabled, False     # not counted twice
-            try:
-                self.old_answers[('old',) + tuple(key or ('simple', request))] = {
-                    'pattern': pattern, 'path': path, 'params': params, 'normalize': normalize,
-                    'status': o.status, 'digest': digest(normalize(o.data)) if o.status == 200 else None}
-            finally:
-                self.applied.enabled = was
+        self.record_old(key or ('simple', request), pattern, path, params, normalize, o, meta)
         if outcome is None:
             return o, n
         if outcome == 'same-error':
@@ -2065,7 +2584,7 @@ class Verifier:
         def n_totals(d):
             d = canon(d or {}, ap)
             for row in (d.get('devices') or {}).values():
-                if isinstance(row, dict) and 'network_last_updated' in row:
+                if isinstance(row, dict) and 'network_last_updated' in row and not self.exact:
                     row.pop('network_last_updated')
                     ap.add('N2')
             return d
@@ -2080,14 +2599,38 @@ class Verifier:
                     for k, v in d.items()}
 
         self.compare_simple('/api/user_metrics/all', '/api/user_metrics/all', n_users, key=('global', 'users_all'))
-        r = self.new_admin.get('/api/dead_letter')
-        self.ep('/api/dead_letter (new only)')['requests'] += 1
-        if r.status == 200 and isinstance((r.data or {}).get('dead_letters'), list):
-            self.ok('/api/dead_letter (new only)')
+        if self.exact:
+            self.compare_dead_letters()
         else:
-            self.diff('/api/dead_letter (new only)', '/api/dead_letter', 'admin read failed', 200, r.status)
+            r = self.new_admin.get('/api/dead_letter')
+            self.ep('/api/dead_letter (new only)')['requests'] += 1
+            if r.status == 200 and isinstance((r.data or {}).get('dead_letters'), list):
+                self.ok('/api/dead_letter (new only)')
+            else:
+                self.diff('/api/dead_letter (new only)', '/api/dead_letter', 'admin read failed', 200, r.status)
         if self.pass_no == 1:
             self.check_presence_and_totals()
+
+    def compare_dead_letters(self):
+        """The review-fix release as the old side: every dead letter it kept, OLD vs NEW (admin)."""
+        pattern, params = '/api/dead_letter', {'limit': 10000}
+        o = self.old.get('/api/dead_letter', params)
+        n = self.new_admin.get('/api/dead_letter', params)
+        self.ep(pattern)['requests'] += 1
+
+        def norm(d):
+            return sorted(canon((d or {}).get('dead_letters') or [], self.applied), key=lambda r: str(r.get('id')))
+
+        self.record_old(('dead_letter',), pattern, pattern, params, norm, o)
+        if self.status_outcome(pattern, pattern, o, n) != 'both-ok':
+            return
+        self.remember(('dead_letter',), pattern, pattern, params, norm, n.status, norm(n.data), admin=True)
+        a, b = norm(o.data), norm(n.data)
+        d = diff_obj(a, b)
+        if d:
+            self.diff(pattern, pattern, describe_diffs(d), d[0][1], d[0][2], count=len(d))
+        else:
+            self.ok(pattern)
 
     def fix_metrics(self, a, b):
         """N11: accept the new current counters / total_ram_bytes when they equal the stored message."""
@@ -2099,7 +2642,7 @@ class Verifier:
                 continue
             raw = mj.get(name, {})
             passthrough_added(ra, rb, raw, self.applied)
-            for k in ('network_bytes_in', 'network_bytes_out', 'total_ram_bytes'):
+            for k in (() if self.exact else ('network_bytes_in', 'network_bytes_out', 'total_ram_bytes')):
                 if k in ra and k in rb and not same_scalar(ra[k], rb[k]):
                     v = raw.get(k)
                     expect = canon_num(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -2159,7 +2702,7 @@ class Verifier:
     def compare_device(self, s):
         name, d = s['name'], s['dir']
         ap = self.applied
-        dot_name = not old_name_ok(name)
+        dot_name = not old_name_ok(name) and not self.exact      # N7: the review-fix release serves them
 
         # /api/metrics/nas/<n>: old rejected "." names (N7) -> check against /api/metrics/all
         self.compare_simple(
@@ -2184,7 +2727,8 @@ class Verifier:
                 '/api/data/<system>', seg('api', 'data', name),
                 lambda x: {'data_types': sorted((x or {}).get('data_types') or [])},
                 system=name, allow_old_error=dot_name, hint='name-rejected',
-                oracle=lambda: {'data_types': self._old_data_types(d)}, key=('data_types', name))
+                oracle=lambda: {'data_types': self._old_data_types(d)}, key=('data_types', name),
+                meta={'dir': d, 'kind': 'listing'})
             self.compare_usage_history(name, d)
 
         users = [(u, c) for dev, u, c in self.inv['central']['users'] if dev == name]
@@ -2209,12 +2753,24 @@ class Verifier:
         db = self.inv['dbs'].get(rel)
         return [(rel, db)] if db else []
 
+    def _types_of(self, dbinv):
+        """
+        {data type: info} of a system database: its tables (f086e7e old side),
+        or the data types it serves (review-fix old side: current_data_types).
+        """
+        if not dbinv:
+            return {}
+        return dbinv.get('types', {}) if self.exact else dbinv['tables']
+
     def _old_data_types(self, d):
         r = self.old.get(seg('api', 'data', d))
         return sorted((r.data or {}).get('data_types') or []) if r.status == 200 else None
 
     def compare_usage_history(self, name, d):
-        """/api/usage/history: old always failed (N7); new rows must equal the folder rows."""
+        """
+        /api/usage/history: old always failed (N7); new rows must equal the folder rows.
+        The review-fix release as the old side serves it: OLD and NEW records must be identical too.
+        """
         pattern = '/api/usage/history/<system>'
         path = seg('api', 'usage', 'history', name)
         params = {'days': 36500, 'limit': NEW_MAX_LIMIT}
@@ -2222,24 +2778,37 @@ class Verifier:
         self.ep(pattern)['requests'] += 1
         if self.rejected(pattern, name, d, o, n, path):
             n = self.new.get(seg('api', 'usage', 'history', d), params)
-        outcome = self.status_outcome(pattern, path, o, n, name, allow_old_error=True, hint='name-rejected')
+
+        def norm_records(x):
+            return [norm_row(r, 'folder_usage', None, self.exact) for r in (x or {}).get('records') or []]
+
+        if self.exact:
+            self.record_old(('usage_hist', name), pattern, path, params, norm_records, o,
+                            {'dir': d, 'data_type': 'folder_usage', 'kind': 'rows'})
+        outcome = self.status_outcome(pattern, path, o, n, name, allow_old_error=not self.exact,
+                                      hint='name-rejected')
         if outcome not in ('old-error-ok', 'both-ok'):
             return
-        info = (self.inv['dbs'].get('%s/data.db' % d) or {}).get('tables', {}).get('folder_usage')
+        info = self._types_of(self.inv['dbs'].get('%s/data.db' % d)).get('folder_usage')
         records = (n.data or {}).get('records') or []
         expect_rows = info['rows'] if info else 0
         # rows older than 100 years are outside days=36500; the fixture/real data never are
         self.remember(('usage_hist', name), pattern, seg('api', 'usage', 'history', self.new_sys(pattern, name, d)),
-                      params, lambda x: [norm_row(r, 'folder_usage') for r in (x or {}).get('records') or []],
-                      n.status, [norm_row(r, 'folder_usage') for r in records])
+                      params, norm_records, n.status, norm_records(n.data))
         if len(records) != expect_rows:
             self.diff(pattern, path, 'record count vs original folder rows', expect_rows, len(records),
                       hint='folder', system=name)
             return
+        if outcome == 'both-ok':
+            dd = diff_obj(norm_records(o.data), norm_records(n.data))
+            if dd:
+                self.diff(pattern, path, 'records differ from the OLD answer: %s' % describe_diffs(dd),
+                          dd[0][1], dd[0][2], hint='folder', system=name, count=len(dd))
+                return
         known = self.folder_row_digests.get(d, {})
         bad = 0
         for r in records:
-            nr = norm_row(r, 'folder_usage')
+            nr = norm_row(r, 'folder_usage', None, self.exact)
             if known.get(nr.get('id')) != digest(nr):
                 bad += 1
         if bad:
@@ -2298,14 +2867,18 @@ class Verifier:
         if self.rejected(pattern, name, d, o, n, npath):
             npath = self._hist_path(d, table, field)
             n = self.new.get(npath, params)
-        if self.status_outcome(pattern, npath, o, n, name, hint='history') != 'both-ok':
-            return
-        od, nd = o.data or {}, n.data or {}
-        a, b = sort_points(norm_points(od.get('data'), ap)), sort_points(norm_points(nd.get('data'), ap))
 
         def norm(x):
             x = x or {}
             return [x.get('field'), x.get('unit'), points_of(x)]
+
+        if self.exact:
+            self.record_old(('tail', name, table, field), pattern, opath, params, norm, o,
+                            {'dir': d, 'data_type': table, 'kind': 'tail'})
+        if self.status_outcome(pattern, npath, o, n, name, hint='history') != 'both-ok':
+            return
+        od, nd = o.data or {}, n.data or {}
+        a, b = sort_points(norm_points(od.get('data'), ap)), sort_points(norm_points(nd.get('data'), ap))
 
         self.remember(('tail', name, table, field), pattern, npath, params, norm, n.status, norm(nd))
         problems = []
@@ -2316,10 +2889,12 @@ class Verifier:
                 self.intended(pattern, 'N18')
             else:
                 problems.append(('unit', od.get('unit'), nd.get('unit')))
-        if nd.get('downsampled'):
-            problems.append(('downsampled', False, True))
+        if nd.get('downsampled') or (self.exact and od.get('downsampled')):
+            problems.append(('downsampled', od.get('downsampled') or False, nd.get('downsampled') or False))
+        if self.exact and bool(od.get('truncated')) != bool(nd.get('truncated')):
+            problems.append(('truncated', od.get('truncated'), nd.get('truncated')))
         if a != b:
-            if len(a) < len(b) and b[len(b) - len(a):] == a:
+            if len(a) < len(b) and b[len(b) - len(a):] == a and not self.exact:
                 self.intended(pattern, 'N8')
             elif cut_equal(a, b, limit, lambda p: p[0]):
                 self.intended(pattern, 'N10')
@@ -2362,31 +2937,37 @@ class Verifier:
         n_old = 0
         rows_failed, field_diffs, examples = False, 0, []
         for (s, e) in info['windows']:
-            o = self.old.get(rows_path, {'start': s, 'end': e})
             nparams = {'start': s, 'end': e, 'limit': NEW_MAX_LIMIT}
+            # the review-fix release caps a window at its default limit like the new one does
+            o = self.old.get(rows_path, nparams if self.exact else {'start': s, 'end': e})
             n = self.new.get(rows_path, nparams)
             self.ep(rows_pat)['requests'] += 1
+
+            def norm_rows(x, table=table):
+                out = [norm_row(r, table, None, self.exact) for r in (x or {}).get('rows') or []]
+                return sorted(((str(r.get('id')), r) for r in out), key=lambda kv: kv[0])
+
+            if self.exact:
+                self.record_old(('rows', d, table, s), rows_pat, rows_path, nparams, norm_rows, o,
+                                {'dir': d, 'data_type': table, 'kind': 'rows'})
             if self.status_outcome(rows_pat, rows_path, o, n, name, hint=hint_rows) != 'both-ok':
                 rows_failed = True
                 continue
-            if (n.data or {}).get('truncated'):
-                self.diff(rows_pat, rows_path, 'window [%s, %s) truncated' % (s, e), False, True,
-                          hint=hint_rows, system=name)
-                rows_failed = True
+            for side, resp in (('NEW', n), ('OLD', o)) if self.exact else (('NEW', n),):
+                if (resp.data or {}).get('truncated'):
+                    self.diff(rows_pat, rows_path, 'window [%s, %s) truncated (%s)' % (s, e, side), False, True,
+                              hint=hint_rows, system=name)
+                    rows_failed = True
             old_raw = (o.data or {}).get('rows') or []
             orows = {}
             for r in old_raw:
-                orows[r.get('id')] = norm_row(r, table, ap)
+                orows[r.get('id')] = norm_row(r, table, ap, self.exact)
             nrows = {}
             for r in (n.data or {}).get('rows') or []:
-                nr = norm_row(r, table, ap)
+                nr = norm_row(r, table, ap, self.exact)
                 nrows[nr.get('id')] = nr
                 if table == 'folder_usage':
                     self.folder_row_digests[d][nr.get('id')] = digest(nr)
-
-            def norm_rows(x, table=table):
-                out = [norm_row(r, table) for r in (x or {}).get('rows') or []]
-                return sorted(((str(r.get('id')), r) for r in out), key=lambda kv: kv[0])
 
             self.remember(('rows', d, table, s), rows_pat, rows_path, nparams, norm_rows, n.status,
                           sorted(((str(k), v) for k, v in nrows.items()), key=lambda kv: kv[0]))
@@ -2450,10 +3031,12 @@ class Verifier:
                           count=sum(st['pend_old'].values()) + sum(st['pend_new'].values()))
             elif not st['failed']:
                 self.ok(hist_pat)
-            self.series_stats[(name, table, field)] = {'total': st['new_total'], 'n': st['n']}
+            self.series_stats[(name, table, field)] = self.series_stats[('dir', d, table, field)] = {
+                'total': st['new_total'], 'n': st['n'], 'min': st['min'], 'max': st['max'],
+                'tmin': st.get('tmin'), 'tmax': st.get('tmax')}
             if not st['failed'] and table in ('system_metrics', 'folder_usage'):
                 full = st['keep'] if st['n'] <= self.args.dashboard_max_points else None
-                self.check_dashboard_range(name, table, field, npath, st, full)
+                self.check_dashboard_range(name, table, field, npath, st, full, d=d)
 
     def _history_window(self, name, d, table, field, s, e, old_rows, st, pattern):
         ap = self.applied
@@ -2461,7 +3044,13 @@ class Verifier:
         npath = self._hist_path(self.new_sys(pattern, name, d), table, field)
         n = self.new.get(npath, params)
         self.ep(pattern)['requests'] += 1
-        if self.args.old_history_windows or (n.status == 400 and (pattern, name) not in self.name_rejected):
+        if self.exact:
+            # the review-fix release answers the window itself, by the same rules as the new one
+            opath = self._hist_path(name, table, field)
+            o = self.old.get(opath, params)
+            self.record_old(('window', name, table, field, s), pattern, opath, params, points_of, o,
+                            {'dir': d, 'data_type': table, 'kind': 'points'})
+        elif self.args.old_history_windows or (n.status == 400 and (pattern, name) not in self.name_rejected):
             o = self.old.get(self._hist_path(name, table, field), {'from': s, 'to': e})
         else:
             o = Resp(200, None, '', 0.0)
@@ -2473,7 +3062,8 @@ class Verifier:
                 st['failed'] = True
                 return
         nd = n.data or {}
-        if nd.get('downsampled') or nd.get('truncated'):
+        od = (o.data or {}) if self.exact else {}
+        if nd.get('downsampled') or nd.get('truncated') or od.get('downsampled') or od.get('truncated'):
             self.diff(pattern, npath, '%s: window [%s, %s) came back downsampled/truncated' % (field, s, e),
                       False, True, hint='history', system=name)
             st['failed'] = True
@@ -2503,16 +3093,34 @@ class Verifier:
             if any(len(set(t for t, _ in x)) != len(x) for x in (a, b)):
                 ap.add('N10')
 
-    def check_dashboard_range(self, name, table, field, npath, stats, full):
-        """The Dashboard's "All Available" query (from/to + max_points) on the NEW Manager."""
+    def check_dashboard_range(self, name, table, field, npath, stats, full, d=None):
+        """
+        The Dashboard's "All Available" query (from/to + max_points) on the NEW
+        Manager.  With the review-fix release as the old side, which answers it
+        too (bucket averages by the same rule), the answers must be identical,
+        unless the NEW one comes from its rollups (N17).
+        """
         pattern = '/api/history/<system>/%s/<field> (dashboard max_points)' % table
         mp = self.args.dashboard_max_points
-        r = self.new.get(npath, {'from': DASHBOARD_ALL_FROM, 'to': HIGH_TS, 'max_points': mp})
+        params = {'from': DASHBOARD_ALL_FROM, 'to': HIGH_TS, 'max_points': mp}
+        r = self.new.get(npath, params)
         self.ep(pattern)['requests'] += 1
         if r.status != 200:
             self.diff(pattern, npath, '%s: HTTP %s' % (field, r.status), 200, r.status, hint='history', system=name)
             return
         pts = sort_points(norm_points((r.data or {}).get('data')))
+        if self.exact and rollup_point_seconds(r.data) is None:
+            o = self.old.get(self._hist_path(name, table, field), params)
+            self.record_old(('dashboard_range', name, table, field), pattern, self._hist_path(name, table, field),
+                            params, points_of, o, {'dir': d, 'data_type': table, 'kind': 'points'})
+            a = sort_points(norm_points((o.data or {}).get('data'))) if o.status == 200 else None
+            if a != pts or bool((o.data or {}).get('downsampled')) != bool((r.data or {}).get('downsampled')):
+                self.diff(pattern, npath, '%s: "All Available" chart differs from the OLD answer' % field,
+                          self._series_summary(a) if a is not None else 'HTTP %s' % o.status,
+                          self._series_summary(pts), hint='history', system=name)
+                return
+            self.ok(pattern)
+            return
         point_seconds = rollup_point_seconds(r.data, stats, mp)
         old_enough = [p for p in (full or []) if p[0] >= canon_ts(DASHBOARD_ALL_FROM)]
         if full is not None and stats['n'] <= mp:
@@ -2544,21 +3152,21 @@ class Verifier:
         ap = self.applied
         self.compare_simple('/api/data/<system> (directory name)', seg('api', 'data', d),
                             lambda x: {'data_types': sorted((x or {}).get('data_types') or [])},
-                            system=name, key=('data_types_dir', d))
+                            system=name, key=('data_types_dir', d), meta={'dir': d, 'kind': 'listing'})
         for rel, dbinv in self._system_db(d):
-            for table, info in dbinv['tables'].items():
+            for table, info in self._types_of(dbinv).items():
                 if 'windows' not in info:
                     continue
                 # recent rows (default limit 100), newest first
                 pattern = '/api/data/<system>/<data_type> (recent)'
 
                 def n_recent(x, table=table):
-                    rows = [norm_row(r, table, ap) for r in ((x or {}).get('rows') or [])]
+                    rows = [norm_row(r, table, ap, self.exact) for r in ((x or {}).get('rows') or [])]
                     return sorted(rows, key=lambda r: (str(r.get('timestamp')), str(r.get('id'))))
 
                 self.compare_simple(pattern, seg('api', 'data', d, table), n_recent, system=name,
                                     hint='rows' if table != 'folder_usage' else 'folder',
-                                    key=('recent', d, table),
+                                    key=('recent', d, table), meta={'dir': d, 'data_type': table, 'kind': 'rows'},
                                     accept=lambda a, b: 'N10' if cut_equal(
                                         a, b, 100, lambda r: str(r.get('timestamp'))) else None)
                 self.compare_table(name, d, table, info)
@@ -2637,7 +3245,16 @@ class Verifier:
                         continue
                     a = sort_points(norm_points((o.data or {}).get('data')))
                     b = sort_points(norm_points((n.data or {}).get('data')))
-                    if (n.data or {}).get('downsampled'):
+                    if self.exact:
+                        # the review-fix release averages buckets by the same rule: identical,
+                        # unless the NEW answer comes from its rollups (N17, against the full OLD series)
+                        st = self.series_stats.get(('dir', s['dir'], table, field))
+                        ok = a == b
+                        if not ok and st and rollup_point_seconds(n.data) is not None and \
+                                not downsampled_problem(b, mp, st, rollup_point_seconds(n.data, st, mp)):
+                            self.intended(pattern, 'N17')
+                            continue
+                    elif (n.data or {}).get('downsampled'):
                         st = series_stats_of(a)
                         ok = not downsampled_problem(b, mp, st, rollup_point_seconds(n.data, st, mp))
                         if ok:
@@ -2667,10 +3284,11 @@ class Verifier:
         db = self.inv['dbs'].get('%s/data.db' % d)
         if not db:
             return out
-        sm = db['tables'].get('system_metrics')
+        types = self._types_of(db)
+        sm = types.get('system_metrics')
         if sm and 'cpu_percent' in sm['columns']:
             out.append(('system_metrics', 'cpu_percent'))
-        fu = db['tables'].get('folder_usage')
+        fu = types.get('folder_usage')
         if fu:
             vols = [k for k in sorted(fu['folder']['keys'])
                     if len([p for p in k.replace('\\', '/').split('/') if p]) <= 1
@@ -2697,6 +3315,8 @@ class Verifier:
         ap = self.applied
 
         def strip(x):
+            if self.exact:          # N13: the review-fix Dashboard already presents them this way
+                return x
             if isinstance(x, dict):
                 out = {}
                 for k, v in x.items():
@@ -2726,7 +3346,7 @@ class Verifier:
                 if isinstance(s, dict) and k in s:
                     s.pop(k)
                     ap.add('N19')
-            disk = s.get('disk')
+            disk = s.get('disk') if not self.exact else None
             if isinstance(disk, dict):
                 # new keys: the scan warnings the NEW Dashboard shows (the old one had none)
                 for k in ('timed_out', 'errors', 'scan_seconds'):
@@ -2745,7 +3365,7 @@ class Verifier:
                 for k in ('total_usage_bytes',):
                     if disk.get(k) in (0, None):
                         disk[k] = None
-            m = s.get('metrics')
+            m = s.get('metrics') if not self.exact else None
             if isinstance(m, dict):
                 for k in ('total_ram_bytes',):
                     if m.get(k) in (0, None):
@@ -2757,13 +3377,14 @@ class Verifier:
 
     # ---------------- ingest ---------------- #
 
-    def check_ingest(self):
-        say('Ingesting one new-format message per device into copy B (and A) ...')
-        problems, done = [], []
-        # newer than anything stored (collector clocks may run ahead of this server),
-        # but never so far ahead that the NEW Manager treats the probe as a message
-        # from a wrong clock: a stored time beyond that slack (an old message from a
-        # collector with a wrong clock) no longer holds back current messages.
+    def _probe_time(self):
+        """
+        The time of a new probe message: newer than anything stored (collector
+        clocks may run ahead of this server), but never so far ahead that the
+        Manager treats the probe as a message from a wrong clock: a stored time
+        beyond that slack (an old message from a collector with a wrong clock)
+        no longer holds back current messages.
+        """
         now = datetime.now(timezone.utc)
         limit = now + timedelta(seconds=FUTURE_SLACK_SECONDS - 120)
         seen = [parse_ts(v) for row in (self.old_totals.get('devices') or {}).values() if isinstance(row, dict)
@@ -2773,8 +3394,15 @@ class Verifier:
         seen = [t for t in seen if t is not None and t <= now + timedelta(seconds=FUTURE_SLACK_SECONDS)]
         if seen and max(seen) + timedelta(minutes=1) > now:
             now = min(max(seen) + timedelta(minutes=1), limit)
+        return now
+
+    def check_ingest(self):
+        say('Ingesting one new-format message per device into copy B (and A) ...')
+        problems, done = [], []
+        now = self._probe_time()
         totals_before = dict(self.old_totals.get('devices') or {})
         devices, frozen = self._ingest_targets()
+        central_before = self._central_rows()
         for i, s in enumerate(devices):
             name = s['name']
             t1 = now + timedelta(seconds=2 * i)
@@ -2874,7 +3502,7 @@ class Verifier:
                                     % (name, n_pts, st['total']))
             if x['probe'] and x['dir']:
                 r = self.new.get(seg('api', 'data', x['dir'], 'folder_usage'), {'limit': 2})
-                rows = [norm_row(row, 'folder_usage') for row in ((r.data or {}).get('rows') or [])]
+                rows = [norm_row(row, 'folder_usage', None, self.exact) for row in ((r.data or {}).get('rows') or [])]
                 if not rows or rows[0].get('timestamp') != x['ts2'] or rows[0].get(x['probe']) != 4096:
                     problems.append('%s: newest folder row is not the probe (%s)' % (name, short(rows[:1], 160)))
                 elif len(rows) > 1 and self.folder_row_digests.get(x['dir']):
@@ -2887,6 +3515,11 @@ class Verifier:
             c = (rr.data or {}).get('counts') or {}
             if rr.status != 200 or c.get('duplicate') != len(x['batch']['messages']):
                 problems.append('%s: re-sent batch not reported as duplicate: %s' % (name, short(c)))
+            r = self.new.get(self._hist_path(hname, 'system_metrics', 'cpu_percent'), {'limit': 3})
+            again = norm_points((r.data or {}).get('data')) if r.status == 200 else []
+            if pts and again[-1:] != pts[-1:]:
+                problems.append('%s: the duplicate re-send changed the stored message (newest cpu_percent '
+                                'point %s, before %s)' % (name, again[-1:] or r.status, pts[-1:]))
         t2 = canon((self.new.get('/api/totals').data or {}).get('devices') or {})
         for x in done:
             if not same_scalar((t2.get(x['name']) or {}).get('total_bytes_in'),
@@ -2902,6 +3535,10 @@ class Verifier:
                                     'is filed under %r' % (name, k, before.get(k), after.get(k),
                                                            normalize_device_name(name), current))
             self.intended('POST /api/data/queue', 'N16')
+        # the registry / snapshot / totals rows of every device that got no message stay as they were
+        problems.extend('central rows of a device that was sent nothing changed: %s' % c
+                        for c in self._central_changes(central_before, self._central_rows(),
+                                                       {x['name'] for x in done}))
         if self.args.with_dashboard and done:
             try:
                 nd, nh = self.start_dashboard('new', self.new_proc.port, self.read_token)
@@ -2966,7 +3603,8 @@ class Verifier:
         again all "duplicate".
         """
         say('Re-sending already-stored messages in the OLD format (no msg_id) to copy B ...')
-        problems, sent, sent_ids, gap_filled = [], 0, 0, []
+        problems, sent, sent_ids, gap_filled, gap_names = [], 0, 0, [], set()
+        central_before = self._central_rows()
         for s in self.inv['systems']:
             name, d = s['name'], s['dir']
             if name is None or not d:
@@ -2999,6 +3637,7 @@ class Verifier:
                 expect.append('duplicate' if in_history else 'stored')
                 if not in_history:
                     gap_filled.append('%s folder_usage %s' % (name, snap['timestamp']))
+                    gap_names.add(name)
             if not msgs:
                 continue
             before = self._b_counts(d)
@@ -3045,6 +3684,9 @@ class Verifier:
                 problems.append('%s: re-sent with a new collector\'s random msg_id, messages the old Manager '
                                 'stored were stored AGAIN (%s); history rows %s -> %s'
                                 % (name, short(results, 160), after, after_ids))
+        # duplicates have no side effects: only a device whose gap scan was stored may move
+        problems.extend('the re-sent duplicates changed central rows: %s' % c
+                        for c in self._central_changes(central_before, self._central_rows(), gap_names))
         if problems:
             self.check('legacy-resend', 'FAIL', '%d problems, e.g. %s' % (len(problems), problems[0]),
                        problems=problems, suspected_cause='manager/data_store.py store_message: duplicates '
@@ -3057,17 +3699,191 @@ class Verifier:
                                             % (len(gap_filled), '; '.join(gap_filled[:3]))) if gap_filled else ''),
                        gap_filled=gap_filled, resent_with_ids=sent_ids)
 
-    def _b_counts(self, d):
+    def _b_counts(self, d, every=False):
+        """
+        Row counts of copy B's history tables of one system: system_metrics,
+        user_metrics, folder_usage_msgs; every=True: every table a message is
+        stored in (not the sqlite_ / _ internals, folder items, the narrow
+        storage_breakdown rows or a *_legacy table).
+        """
         path = self.copy_b / d / 'data.db'
         conn = ro_connect(path)
         try:
             out = {}
             for t in db_tables(conn):
-                if t in ('system_metrics', 'user_metrics', 'folder_usage_msgs'):
+                if every:
+                    keep = not (t.startswith(('sqlite_', '_')) or t in ('folder_usage_items', 'storage_breakdown_rows')
+                                or re.match(r'(folder_usage|storage_breakdown)_legacy', t))
+                else:
+                    keep = t in ('system_metrics', 'user_metrics', 'folder_usage_msgs')
+                if keep:
                     out[t] = conn.execute('SELECT COUNT(*) FROM %s' % qi(t)).fetchone()[0]
             return out
         finally:
             conn.close()
+
+    @staticmethod
+    def _legacy_msg_id(device_name, data_type, timestamp, username):
+        """manager/manager.py _legacy_id: the id a Manager derives for a message without one."""
+        key = '|'.join(str(p) for p in (device_name or '', data_type or '', timestamp or '', username or ''))
+        return 'legacy-' + hashlib.sha1(key.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _timestamp_spellings(ts):
+        """The stored (canonical) timestamp as a collector may have sent it."""
+        out = [ts]
+        dt = parse_ts(ts)
+        if dt is not None:
+            naive = dt.replace(tzinfo=None)
+            for text in (naive.isoformat() + 'Z', naive.isoformat() + '+00:00',
+                         naive.strftime('%Y-%m-%dT%H:%M:%SZ'), naive.isoformat()):
+                if text not in out:
+                    out.append(text)
+        return out
+
+    @staticmethod
+    def _row_message(name, s, data_type, row, msg_id=None, timestamp=None):
+        """A message re-built from a stored row (JSON text decoded, as it was sent)."""
+        data = {}
+        for k, v in row.items():
+            if k.lower() in INTERNAL_COLS or v is None or v == '' or isinstance(v, bytes):
+                continue
+            if isinstance(v, str):
+                decoded = decode_json_text(v)
+                v = decoded if decoded is not None else v
+            plain = k[len('payload_'):] if k.startswith('payload_') else None
+            data[plain if plain and plain.lower() in INTERNAL_COLS else k] = v
+        if data_type != 'not_specified':
+            data['data_type'] = data_type
+        header = {'device_name': name, 'device_id': s.get('system_id') or name,
+                  'device_type': row.get('device_type') or 'unknown',
+                  'timestamp': timestamp or row.get('timestamp')}
+        if msg_id:
+            header['msg_id'] = msg_id
+        return {'header': header, 'data': data}
+
+    def _resend_batches(self, s, types, spellings):
+        """
+        [(label, name, messages, expect)] for check_resend_current; expect is
+        'duplicate', or None where the OLD Manager's own answer is the
+        reference (a scan it kept only in the central snapshot).
+        """
+        name = s['name']
+        own, derived, old_style, random_ids, gaps = [], [], [], [], []
+        for dt, info in types.items():
+            row = info.get('newest_with_id')
+            if row:
+                own.append((name, self._row_message(name, s, dt, row, msg_id=row['msg_id'])))
+            row = info.get('newest_legacy_id')
+            if row:
+                # an OLD collector sent it without an id: re-send it that way when the id is reproduced
+                found = next(((sp, ts) for sp in spellings for ts in self._timestamp_spellings(row['timestamp'])
+                              if self._legacy_msg_id(sp, None if dt == 'not_specified' else dt, ts,
+                                                     row.get('username')) == row['msg_id']), None)
+                if found:
+                    derived.append((found[0], self._row_message(found[0], s, dt, row, timestamp=found[1])))
+                else:
+                    own.append((name, self._row_message(name, s, dt, row, msg_id=row['msg_id'])))
+            row = info.get('newest_legacy_row') or (info.get('newest_pre_upgrade') if dt != 'folder_usage' else None)
+            if row:
+                old_style.append((name, self._row_message(name, s, dt, row)))
+                random_ids.append((name, self._row_message(name, s, dt, row, msg_id=uuid.uuid4().hex)))
+        snap = (getattr(self, 'old_usage_all_raw', {}) or {}).get(name)
+        fu = (types.get('folder_usage') or {}).get('folder') or {}
+        if isinstance(snap, dict) and snap.get('timestamp') and \
+                canon_ts(snap['timestamp']) not in set(fu.get('timestamps') or []):
+            data = {k: v for k, v in snap.items()
+                    if k not in ('name', 'system_id', 'device_type', 'timestamp', 'total_disk_bytes')}
+            data['data_type'] = 'folder_usage'
+            gaps.append((name, {'header': {'device_name': name, 'device_id': s.get('system_id') or name,
+                                           'device_type': snap.get('device_type') or 'unknown',
+                                           'timestamp': snap['timestamp']}, 'data': data}))
+        out = []
+        for label, items, expect in (('own msg_id', own, 'duplicate'),
+                                     ('OLD-style, the id derived from it', derived, 'duplicate'),
+                                     ('OLD-style, no msg_id', old_style, 'duplicate'),
+                                     ('random msg_id', random_ids, 'duplicate'), ('central-only scan', gaps, None)):
+            by_name = OrderedDict()
+            for sender, m in items:
+                by_name.setdefault(sender, []).append(m)
+            for sender, msgs in by_name.items():
+                out.append((label, sender, msgs, expect))
+        return out
+
+    def check_resend_current(self):
+        """
+        legacy-resend with the review-fix release as the old side.  Its rows
+        carry msg_ids, so a collector re-sends them with their own: the newest
+        row of every data type, re-sent with its msg_id (one the old Manager
+        derived for a message that had none, "legacy-<sha1>", is re-sent the
+        way that OLD collector would: without an id, when the derivation is
+        reproduced).  Rows stored before the review-fix upgrade (msg_id NULL,
+        and the newest row of the wide table kept as folder_usage_legacy) are
+        re-sent the OLD way, without an id, and again with a random one.
+        Every batch goes to both Managers: the NEW one must answer exactly
+        what the review-fix one answers, "duplicate" for everything already
+        stored, and store no row beyond what it reports stored.
+        """
+        say('Re-sending already-stored messages to both Managers (own msg_ids; the OLD way for rows from '
+            'before the review-fix upgrade) ...')
+        problems, kinds, gap_filled, done, stored_by = [], Counter(), [], set(), set()
+        central_before = self._central_rows()
+        for s in self.inv['systems']:
+            d = s['dir']
+            if s['name'] is None or not d or d in done:
+                continue
+            done.add(d)
+            types = self._types_of(self.inv['dbs'].get('%s/data.db' % d))
+            spellings = [x['name'] for x in self.inv['systems'] if x['dir'] == d and x['name'] is not None]
+            for label, sender, msgs, expect in self._resend_batches(s, types, spellings):
+                batch = {'queue_id': '%s-%s' % (normalize_device_name(sender), uuid.uuid4().hex[:12]),
+                         'name': sender, 'id': s.get('system_id') or sender, 'messages': msgs}
+                before = self._b_counts(d, every=True)
+                ra = self.old.post('/api/data/queue', batch)
+                rb = self.new_admin.post('/api/data/queue', batch)
+                after = self._b_counts(d, every=True)
+                kinds[label] += len(msgs)
+                if ra.status != 200 or rb.status != 200:
+                    problems.append('%s (%s): HTTP old %s new %s %s' % (sender, label, ra.status, rb.status,
+                                                                       short(rb.data, 120)))
+                    continue
+                got_old = [r.get('status') for r in (ra.data or {}).get('results') or []]
+                got_new = [r.get('status') for r in (rb.data or {}).get('results') or []]
+                what = [m['data'].get('data_type') or 'not_specified' for m in msgs]
+                if got_new != got_old:
+                    problems.append('%s (%s): the NEW Manager answered %s where the OLD one answered %s (%s)'
+                                    % (sender, label, got_new, got_old, ', '.join(what)))
+                if expect and got_new != [expect] * len(msgs):
+                    problems.append('%s (%s): re-sent stored messages were not all duplicates: %s (%s)'
+                                    % (sender, label, short((rb.data or {}).get('results'), 200), ', '.join(what)))
+                grown = Counter()
+                for m, st in zip(msgs, got_new):
+                    if st == 'stored':
+                        stored_by.add(sender)
+                        dt = m['data'].get('data_type') or 'not_specified'
+                        table = {'folder_usage': 'folder_usage_msgs'}.get(dt, normalize_device_name(dt))
+                        if dt == 'storage_breakdown' and 'storage_breakdown_msgs' in after:
+                            table = 'storage_breakdown_msgs'
+                        grown[table] += 1
+                        if label == 'central-only scan':
+                            gap_filled.append('%s folder_usage %s' % (sender, m['header']['timestamp']))
+                if after != {t: n + grown.get(t, 0) for t, n in before.items()}:
+                    problems.append('%s (%s): rows %s -> %s, the NEW Manager reported %d stored'
+                                    % (sender, label, before, after, sum(grown.values())))
+        # duplicates have no side effects: only a device a message was stored for may move
+        problems.extend('the re-sent duplicates changed central rows: %s' % c
+                        for c in self._central_changes(central_before, self._central_rows(), stored_by))
+        if problems:
+            self.check('legacy-resend', 'FAIL', '%d problems, e.g. %s' % (len(problems), problems[0]),
+                       problems=problems, suspected_cause='manager/data_store.py store_message: duplicates '
+                       'of stored rows (msg_id, or the natural key of rows stored without one) are not detected')
+        else:
+            self.check('legacy-resend', 'PASS', '%s: the NEW Manager answered every re-send exactly as the '
+                       'review-fix one did, all duplicates, nothing stored twice%s' % (
+                           ', '.join('%d %s' % (n, k) for k, n in kinds.items()) or 'nothing to re-send',
+                           ('; %d scans the old Manager kept only in the central snapshot now stored (%s)'
+                            % (len(gap_filled), '; '.join(gap_filled[:3]))) if gap_filled else ''),
+                       resent=dict(kinds), gap_filled=gap_filled)
 
     # ---------------- backups / files / source ---------------- #
 
@@ -3087,24 +3903,40 @@ class Verifier:
         results, problems = OrderedDict(), []
         for rel, dbinv in self.inv['dbs'].items():
             orig_tables = {t: info['columns'] for t, info in dbinv['tables'].items()}
-            conn = ro_connect(self.copy_b / rel)
+            path = self.copy_b / rel
+            conn = ro_connect(path, immutable=dbinv['kind'] == 'other' and not os.path.exists(str(path) + '-wal'))
             try:
                 now_tables = db_tables(conn)
+                now_objects = schema_objects(conn)
             finally:
                 conn.close()
+            # a schema change: tables, columns or a table's definition, and indexes,
+            # triggers or views (a trigger alone can break the old code's writes)
+            orig_objects = dbinv.get('schema', now_objects)
+            objects = sorted({o[1] for o in orig_objects if o not in now_objects} |
+                             {o[1] for o in now_objects if o not in orig_objects})
             changed = set(now_tables) != set(orig_tables) or any(
-                now_tables[t]['columns'] != cols for t, cols in orig_tables.items() if t in now_tables)
+                now_tables[t]['columns'] != cols or now_tables[t]['sql'] != dbinv['tables'][t].get('sql')
+                for t, cols in orig_tables.items() if t in now_tables) or bool(objects)
             orig_hash = combine_hash({t: info.get('hash') for t, info in dbinv['tables'].items()}) \
                 if all('hash' in i for i in dbinv['tables'].values()) else None
             mine = [f for f in cands if _backup_belongs(f, rel)]
             matching = [f for f in mine if orig_hash and cand_hash.get(f) == orig_hash]
-            results[rel] = {'schema_changed': changed, 'backups': mine, 'matching_original': matching}
+            results[rel] = {'schema_changed': changed, 'backups': mine, 'matching_original': matching,
+                            'indexes_triggers_views_changed': objects[:20]}
             if changed and not mine:
                 problems.append('%s was altered by the NEW Manager but has no pre-upgrade backup' % rel)
+            elif changed and orig_hash and not matching and self.exact and not set(mine) & new_files:
+                problems.append('%s was altered by the NEW Manager but has no pre-upgrade backup (only the copies '
+                                'of an earlier upgrade: %s)' % (rel, mine))
             elif changed and orig_hash and not matching:
                 problems.append('%s: backup(s) %s do not contain the original content' % (rel, mine))
             taken = [f for f in mine if f in new_files]
-            if len(taken) > 1:
+            results[rel]['new_backups'] = taken
+            if len(taken) > 1 and self.exact and changed:
+                problems.append('%s: %d new pre-upgrade copies %s (expected one per changed database)'
+                                % (rel, len(taken), taken))
+            elif len(taken) > 1:
                 self.warn('%s has %d new backups after a restart (expected one)' % (rel, len(taken)))
         self.report['backups'] = results
         if problems:
@@ -3189,6 +4021,197 @@ class Verifier:
                        'content (%d post-upgrade files kept aside); the OLD Manager on it gave the same %d '
                        'answers as before the upgrade' % (len(moved), replayed))
 
+    def make_rollback_copy(self):
+        """
+        Copy C for the rollback check with the review-fix release as the old
+        side: copy B as the NEW Manager's first start left it (migrated, rollups
+        backfilled), before the new messages of the ingest checks.  Backups
+        are left out: the review-fix Manager reads them only when it would
+        migrate a database, and the rollback check reports any change it makes.
+        """
+        self.copy_c = self.work / 'copyC-back'
+
+        def skip(folder, names):
+            out = [n for n in names if BACKUP_NAME_RE.search(n) and is_sqlite(os.path.join(folder, n))]
+            return out + [n for n in names if n.endswith(('-wal', '-shm', '-journal'))
+                          and n.rsplit('-', 1)[0] in out]
+
+        shutil.copytree(str(self.copy_b), str(self.copy_c), ignore=skip)
+
+    def _content(self, root):
+        """{database: {table: content hash}} of metrics.db and every <system>/data.db under root."""
+        out = {}
+        for rel in sorted(list_files(root)):
+            parts = rel.split('/')
+            if rel == 'metrics.db' or (len(parts) == 2 and parts[1] == 'data.db'):
+                path = Path(root) / rel
+                # a -wal holds what a Manager wrote last: read it (immutable would skip it)
+                conn = ro_connect(path, immutable=not os.path.exists(str(path) + '-wal'))
+                try:
+                    out[rel] = {t: table_hash(conn, t, info['columns'])[0] for t, info in db_tables(conn).items()}
+                    out[rel]['sqlite_master'] = schema_digest(conn)
+                finally:
+                    conn.close()
+        return out
+
+    def _back_ingest(self, h):
+        """
+        New data on the way back (check_back_to_current): docs/UPGRADE.md
+        "Going back" keeps the collectors running, upgraded ones included.
+        Per system, the review-fix Manager on copy C must store a new reading
+        of every data type the system has (rebuilt from its newest stored
+        row, with a new msg_id and timestamp, as that system's collector sends
+        it) and a usage-metrics collector's batch (NEW_COLLECTOR_PAYLOADS),
+        answer "stored" for each, and then serve each from /api/data.
+        Returns (problems, sent, stored).
+        """
+        problems, sent, stored, done = [], 0, 0, set()
+        t = self._probe_time()
+        for s in self.inv['systems']:
+            name, d = s['name'], s['dir']
+            if name is None or not d or d in done:
+                continue
+            done.add(d)
+            header = {'device_name': name, 'device_id': s.get('system_id') or name,
+                      'device_type': s.get('device_type') or 'unknown'}
+            current = []
+            for dt, info in self._types_of(self.inv['dbs'].get('%s/data.db' % d)).items():
+                row = next((info[k] for k in ('newest_with_id', 'newest_legacy_id', 'newest_pre_upgrade',
+                                              'newest_row', 'newest_legacy_row') if info.get(k)), None)
+                if row:
+                    t += timedelta(seconds=1)
+                    current.append(self._row_message(name, s, dt, row, msg_id=uuid.uuid4().hex,
+                                                     timestamp=fmt_ts(t)))
+            usage = []
+            for payload in NEW_COLLECTOR_PAYLOADS:
+                t += timedelta(seconds=1)
+                usage.append({'header': dict(header, msg_id=uuid.uuid4().hex, timestamp=fmt_ts(t)),
+                              'data': json.loads(json.dumps(payload))})
+            for label, msgs in (('its own data types', current), ("a usage-metrics collector's batch", usage)):
+                if not msgs:
+                    continue
+                batch = {'queue_id': '%s-%s' % (normalize_device_name(name), uuid.uuid4().hex[:12]),
+                         'name': name, 'id': header['device_id'], 'messages': msgs}
+                r = h.post('/api/data/queue', batch)
+                sent += len(msgs)
+                results = (r.data or {}).get('results') if r.status == 200 else None
+                if not isinstance(results, list) or len(results) != len(msgs):
+                    problems.append('%s (%s): HTTP %s %s' % (name, label, r.status, short(r.data, 160)))
+                    continue
+                for m, res in zip(msgs, results):
+                    dt = m['data'].get('data_type') or 'not_specified'
+                    if res.get('status') != 'stored':
+                        problems.append('%s (%s): a new %s message was answered %s (%s)'
+                                        % (name, label, dt, res.get('status'), short(res.get('error'), 160)))
+                        continue
+                    stored += 1
+                    ts = m['header']['timestamp']
+                    rr = h.get(seg('api', 'data', d, dt), {'start': ts, 'end': fmt_ts(parse_ts(ts) + timedelta(
+                        seconds=1)), 'limit': 50})
+                    ids = [x.get('msg_id') for x in ((rr.data or {}).get('rows') or [])] if rr.status == 200 else []
+                    if m['header']['msg_id'] not in ids:
+                        problems.append('%s (%s): the new %s message was stored but /api/data does not serve it '
+                                        '(HTTP %s)' % (name, label, dt, rr.status))
+        return problems, sent, stored
+
+    def _not_shown_breakdown(self, rec, resp):
+        """
+        N22: a replayed answer about the storage_breakdown runs of a system whose
+        wide table the NEW Manager moved (N21 b), which the review-fix Manager
+        no longer shows: the same data types without storage_breakdown, or no
+        rows / points.
+        """
+        meta = rec.get('meta') or {}
+        if meta.get('dir') not in self.breakdown_migrated or resp.status != 200 or rec['status'] != 200:
+            return False
+        got = rec['normalize'](resp.data)
+        if meta.get('kind') == 'listing':
+            old = (meta.get('answer') or {}).get('data_types') or []
+            return 'storage_breakdown' in old and got == {'data_types': [t for t in old if t != 'storage_breakdown']}
+        if meta.get('data_type') != 'storage_breakdown':
+            return False
+        if meta.get('kind') == 'tail':
+            return isinstance(got, list) and len(got) == 3 and got[2] == []
+        return got == []
+
+    def check_back_to_current(self):
+        """
+        The rollback check with the review-fix release as the old side: the
+        documented way back from the usage-metrics release (docs/UPGRADE.md)
+        restores nothing, it starts the review-fix code on the data the NEW
+        Manager migrated (copy C).  That Manager must start, take no backup,
+        change no table or schema, and give every answer it gave before the
+        upgrade (N22: storage_breakdown runs the NEW Manager moved are not
+        shown).  Then it must store and serve new data there, from collectors
+        of both releases (_back_ingest).
+        """
+        if self.copy_c is None or not self.copy_c.is_dir():
+            self.check('rollback', 'FAIL', 'no copy of the migrated data_dir to start the review-fix Manager on')
+            return
+        say('Starting the review-fix Manager on the migrated copy C (the documented way back) ...')
+        before_files = list_files(self.copy_c)
+        before = self._content(self.copy_c)
+        try:
+            proc, secs = self.start_manager('old', self.copy_c)
+        except SetupError as e:
+            self.check('rollback', 'FAIL', 'the review-fix Manager did not start on the migrated data: %s'
+                       % str(e).splitlines()[0])
+            return
+        self.timings['back_to_current_start'] = round(secs, 1)
+        h = Http('127.0.0.1', proc.port, self.old_token, self.args.request_timeout)
+        problems, replayed, not_shown, sent, stored = [], 0, 0, 0, 0
+        changed = []
+        self.applied.enabled = False
+        try:
+            for key, rec in self.old_answers.items():
+                resp = h.get(rec['path'], rec['params'])
+                replayed += 1
+                if resp.status != rec['status']:
+                    problems.append('%s: HTTP %s -> %s' % (rec['path'], rec['status'], resp.status))
+                elif resp.status == 200 and digest(rec['normalize'](resp.data)) != rec['digest']:
+                    if self._not_shown_breakdown(rec, resp):
+                        not_shown += 1
+                    else:
+                        problems.append('%s%s: answer differs' % (
+                            rec['path'], '?' + urlencode(rec['params']) if rec['params'] else ''))
+            self.applied.enabled = True
+            # it only read so far: every table and the schema as the NEW Manager left them
+            after = self._content(self.copy_c)
+            changed = sorted('%s %s' % (rel, t) for rel in set(before) | set(after)
+                             for t in set(before.get(rel, {})) | set(after.get(rel, {}))
+                             if t != 'sqlite_sequence' and before.get(rel, {}).get(t) != after.get(rel, {}).get(t))
+            if changed:
+                problems.append('the review-fix Manager changed the migrated data (it must only read it): %s'
+                                % ', '.join(changed[:6]))
+            say('Sending new data to the review-fix Manager on copy C (collectors keep running on the way back) ...')
+            more, sent, stored = self._back_ingest(h)
+            problems.extend(more)
+        finally:
+            self.applied.enabled = True
+            h.close()
+            self.stop(proc)
+        if not_shown:
+            self.applied.add('N22', not_shown)
+            self.ep('rollback: review-fix Manager on the migrated data')['intended']['N22'] += not_shown
+        self.ep('rollback: review-fix Manager on the migrated data')['requests'] += replayed
+        new_backups = sorted(f for f in list_files(self.copy_c) - before_files
+                             if BACKUP_NAME_RE.search(f.split('/')[-1]) and is_sqlite(self.copy_c / f))
+        if new_backups:
+            problems.append('the review-fix Manager took backups of the migrated data: %s' % new_backups[:5])
+        self.report['back_to_current'] = {'replayed': replayed, 'not_shown_N22': not_shown,
+                                          'new_backups': new_backups, 'changed_tables': changed[:50],
+                                          'new_messages_sent': sent, 'new_messages_stored': stored}
+        if problems:
+            self.check('rollback', 'FAIL', '%d problems with the review-fix Manager on the migrated data, e.g. %s'
+                       % (len(problems), problems[0]), problems=problems[:30])
+        else:
+            self.check('rollback', 'PASS', 'the review-fix Manager started on the migrated data (the documented '
+                       'way back, no restore): no backup, no table or schema changed, the same %d answers as '
+                       'before the upgrade%s; then it stored and served all %d new messages (every data type '
+                       'of every system, and a usage-metrics collector\'s batch per system)'
+                       % (replayed, ' (N22: %d storage_breakdown answers not shown)' % not_shown
+                          if not_shown else '', stored))
+
     def check_other_files(self):
         bad = []
         for c in self.copied:
@@ -3214,7 +4237,7 @@ class Verifier:
         if not touched:
             self.check('source', 'PASS', 'data_dir unchanged: %d files, %.2f GB (size, mtime, sha256)' % (n, size / 1e9))
             return
-        db_like = re.compile(r'\.db(-wal|-shm|-journal)?$')
+        db_like = re.compile(r'(\.db(-wal|-shm|-journal)?|^%s)$' % re.escape(INSTANCE_LOCK_NAME))
         only_db = all(db_like.search(f) for f in cmp_['added'] + cmp_['removed'] +
                       [c['file'] for c in cmp_['changed']]) and not cmp_['dirs_added']
         if only_db and self.live_manager:
@@ -3240,6 +4263,10 @@ class Verifier:
 
     def finish(self, setup_error=None):
         r = self.report
+        if self.applied.disallowed and not setup_error:
+            self.check('normalizations', 'FAIL', 'intended differences applied that do not apply with %s as the '
+                       'old side: %s (a real difference: see the endpoints and dashboard differences)'
+                       % (self.old_version, dict(self.applied.disallowed)), disallowed=dict(self.applied.disallowed))
         r['finished'] = utc_now_ts()
         r['checks'] = self.checks
         eps = OrderedDict()
@@ -3251,7 +4278,8 @@ class Verifier:
         r['differences'] = self.differences[:500]
         r['differences_total'] = len(self.differences)
         r['intended_differences'] = OrderedDict(
-            (k, {'title': t, 'reason': why, 'applied': self.applied.counts.get(k, 0)}) for k, (t, why) in INTENDED.items())
+            (k, {'title': t, 'reason': why, 'applied': self.applied.counts.get(k, 0),
+                 'old_sides': list(INTENDED_SIDES.get(k, ()))}) for k, (t, why) in INTENDED.items())
         r['sampling'] = self.sampling
         r['warnings'] = self.warnings
         r['timings_seconds'] = self.timings
@@ -3277,6 +4305,9 @@ class Verifier:
                 code.get('old', {}).get('commit') or code.get('old', {}).get('path'),
                 (code.get('new', {}).get('commit') or '?')[:12],
                 ' (+uncommitted changes)' if code.get('new', {}).get('uncommitted_changes') else ''))
+            version = code.get('old', {}).get('version') or {}
+            if version:
+                say('OLD side: %s (%s)' % (version.get('name'), version.get('description')))
         say('')
         for cid, c in self.checks.items():
             say('  %-5s %-10s %s' % (c['status'], cid, c['summary'][:300]))
@@ -3328,6 +4359,10 @@ def parse_args(argv=None):
     g = ap.add_mutually_exclusive_group()
     g.add_argument('--old-ref', default=DEFAULT_OLD_REF, help='git ref of the OLD code (default %(default)s)')
     g.add_argument('--old-code', help='an extracted OLD checkout instead of git archive')
+    ap.add_argument('--old-version', choices=('auto',) + tuple(OLD_VERSIONS), default='auto',
+                    help='what the OLD code is: "old" (f086e7e or older) or "current" (the review-fix release, '
+                         'fb6498c); default: detected from the old code. Each has its own expectations '
+                         '(tools/README.md)')
     ap.add_argument('--new-code', help='NEW checkout to test (default: the checkout this tool is in)')
     ap.add_argument('--repo', help='git repository for --old-ref (default: the checkout this tool is in)')
     ap.add_argument('--work-dir', help='where copies, code and logs go (a new subdirectory is created; '

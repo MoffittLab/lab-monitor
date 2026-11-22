@@ -39,6 +39,16 @@ partly migrated database) is skipped with a warning, because the old Manager
 would not show the folder history in it.  If no backup has the old layout the
 newest is used, with a warning.  --use-oldest picks the oldest instead.
 
+Not for going back from the usage-metrics release to the review-fix release
+(fb6498c): that needs no restore, the review-fix code is started on the same
+data_dir (docs/UPGRADE.md, "Going back from the usage-metrics release to
+CURRENT").  After f086e7e -> review-fix -> usage-metrics, the backups with the
+old layout are the ones taken before the review-fix upgrade, so restoring them
+sets aside everything stored since then.  When the usage-metrics release has
+run on the data_dir (its _rollup_* tables) and a newer backup in the
+review-fix layout exists, the plan says so and --apply is refused unless
+--past-review-fix is given.
+
 Databases WITHOUT a backup are left as they are and listed: databases the
 new Manager created after the upgrade (systems first seen since), or ones it
 never had to change.  The old Manager can open them; history the new Manager
@@ -58,7 +68,8 @@ After the rollback (see also docs/UPGRADE.md):
 
 Exit status: 0 rolled back (or, without --apply, the plan is ready), 1 a
 problem (bad backup, a file that could not be renamed: see the message),
-2 refused (Manager running, bad arguments, nothing to roll back).
+2 refused (Manager running, bad arguments, nothing to roll back, or it would go
+back past the review-fix release without --past-review-fix).
 """
 import argparse
 import json
@@ -155,6 +166,28 @@ def has_old_layout(path, central):
         return None
 
 
+def usage_metrics_ran(data_dir):
+    """
+    True if the usage-metrics release (or a later one) has opened this
+    data_dir: a <system>/data.db has its _rollup_* tables, or metrics.db its
+    device_session_snapshot table.  Unreadable databases count as no.
+    """
+    for db in find_databases(data_dir):
+        if not os.path.isfile(db):
+            continue
+        try:
+            conn = sqlite3.connect(_ro_uri(db), uri=True)
+            try:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            continue
+        if any(t.startswith('_rollup_') for t in tables) or 'device_session_snapshot' in tables:
+            return True
+    return False
+
+
 def choose_backup(db_path, backups, use_oldest=False):
     """(chosen backup, [newer backups skipped because they have the new layout], old_layout_found)."""
     if not backups:
@@ -221,7 +254,10 @@ def plan(data_dir, use_oldest=False):
     for db in find_databases(data_dir):
         bks = backups_of(db)
         chosen, skipped, old_layout = choose_backup(db, bks, use_oldest)
+        central = os.path.basename(db) == 'metrics.db'
+        newer = bks[bks.index(chosen) + 1:] if chosen else []
         items.append({
+            'newer_new_layout': [b for b in newer if has_old_layout(b, central) is False],
             'db': db,
             'rel': os.path.relpath(db, data_dir),
             'backups': bks,
@@ -265,14 +301,19 @@ def restore_one(item, stamp):
     return moved
 
 
-def rollback(data_dir, apply=False, use_oldest=False, out=say):
-    """Plan (and with apply=True perform) the rollback. Returns (exit code, plan)."""
+def rollback(data_dir, apply=False, use_oldest=False, out=say, past_review_fix=False):
+    """
+    Plan (and with apply=True perform) the rollback. Returns (exit code, plan).
+    Going back past the review-fix release (the usage-metrics release has run
+    and newer backups in the review-fix layout exist) needs past_review_fix.
+    """
     items = plan(data_dir, use_oldest)
     todo = [i for i in items if i['backup']]
     keep = [i for i in items if not i['backup']]
     if not todo:
         out('No pre-upgrade backups (*%s*.bak) found under %s: nothing to roll back.' % (BACKUP_INFIX, data_dir))
         return 2, items
+    twice = usage_metrics_ran(data_dir) and any(i['newer_new_layout'] for i in todo)
     out('Databases to restore (%d):' % len(todo))
     for i in todo:
         others = len(i['backups']) - 1
@@ -280,9 +321,10 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
                                    ' (%d other backup%s ignored)' % (others, 's' if others > 1 else '') if others else '',
                                    '' if i['exists'] else '  [database missing now: recreated]'))
         for b in i['skipped_new_layout']:
-            out('      WARNING: skipped the newer %s: it already has the new layout (a copy of a partly '
-                'migrated database), so the old Manager would not show its folder history'
-                % os.path.basename(b))
+            out('      WARNING: skipped the newer %s: it already has the new layout (%s), so the old Manager '
+                'would not show its folder history'
+                % (os.path.basename(b), 'the review-fix layout, copied by the usage-metrics release'
+                   if twice else 'a copy of a partly migrated database'))
         if i['check'] == 'ok' and not i['old_layout']:
             out('      WARNING: %s already has the new layout (no backup of this database has the old '
                 'one): the old Manager will not show the folder history stored in it' % os.path.basename(i['backup']))
@@ -292,6 +334,17 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
         out('Databases without a pre-upgrade backup, left as they are (%d):' % len(keep))
         for i in keep:
             out('  %s' % i['rel'])
+    if twice:
+        n = sum(1 for i in todo if i['newer_new_layout'])
+        out('')
+        out('WARNING: the usage-metrics release has run on this data_dir, and %d database(s) have a newer backup '
+            'than the one chosen, in the layout the review-fix release writes. After f086e7e -> review-fix -> '
+            'usage-metrics, restoring goes back past the review-fix release to what the f086e7e Manager reads: '
+            'everything stored since the chosen backups were taken is set aside in *%s* files (kept, but no '
+            'longer served).' % (n, MOVED_INFIX))
+        out('To go back to the review-fix release, do NOT run this tool: start the review-fix code on this '
+            'data_dir (docs/UPGRADE.md, "Going back from the usage-metrics release to CURRENT"). To restore '
+            'the chosen backups anyway, add --past-review-fix.')
     bad = [i for i in todo if i['check'] != 'ok']
     if bad:
         out('')
@@ -301,6 +354,10 @@ def rollback(data_dir, apply=False, use_oldest=False, out=say):
         out('')
         out('Dry run: nothing changed. Stop the Manager, then re-run with --apply.')
         return 0, items
+    if twice and not past_review_fix:
+        out('')
+        out('Refused: nothing was changed (see the warning above).')
+        return 2, items
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     done = []
     for i in todo:
@@ -342,6 +399,10 @@ def main(argv=None):
     ap.add_argument('--use-oldest', action='store_true', help='restore the oldest backup of each database')
     ap.add_argument('--force', action='store_true',
                     help='skip the check that no Manager answers on the configured port')
+    ap.add_argument('--past-review-fix', action='store_true',
+                    help='after f086e7e -> review-fix -> usage-metrics: really restore the f086e7e layout, setting '
+                         'aside everything stored since the review-fix upgrade (to go back to the review-fix '
+                         'release no tool is needed: see docs/UPGRADE.md)')
     args = ap.parse_args(argv)
 
     config = {}
@@ -365,7 +426,8 @@ def main(argv=None):
             'Manager"), then run this again.' % config.get('port', 5000))
         return 2
     say('data_dir: %s' % os.path.abspath(data_dir))
-    code, _items = rollback(data_dir, apply=args.apply, use_oldest=args.use_oldest)
+    code, _items = rollback(data_dir, apply=args.apply, use_oldest=args.use_oldest,
+                            past_review_fix=args.past_review_fix)
     return code
 
 

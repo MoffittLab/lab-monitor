@@ -225,3 +225,62 @@ def test_only_new_layout_backups_restore_the_newest_with_a_warning(tmp_path, cap
     code, _items = rb.rollback(str(d), apply=True, out=print)
     assert code == 0 and _rows(db) == ['only-copy']
     assert 'already has the new layout' in capsys.readouterr().out
+
+
+def _review_fix_layout(path, rows, central=False, usage_metrics=False):
+    """A database as the review-fix release leaves it (or, usage_metrics, as the usage-metrics release does)."""
+    if central:
+        _db(path, rows)
+    else:
+        _new_layout(path, rows)
+    con = sqlite3.connect(path)
+    if central:
+        con.execute('CREATE TABLE dead_letter (id INTEGER PRIMARY KEY)')
+    if usage_metrics:
+        con.execute('CREATE TABLE device_session_snapshot (name TEXT)' if central else
+                    'CREATE TABLE _rollup_series (id INTEGER PRIMARY KEY)')
+    con.commit()
+    con.close()
+
+
+@pytest.fixture
+def twice_upgraded(tmp_path):
+    """f086e7e -> review-fix (first backups) -> usage-metrics (second backups, of the review-fix layout)."""
+    d = tmp_path / 'data'
+    central = str(d / 'metrics.db')
+    _db(central + '.pre-upgrade-20261101T100000Z.bak', ['central-f086e7e'])
+    _review_fix_layout(central + '.pre-upgrade-20261201T100000Z.bak', ['central-review-fix'], central=True)
+    _review_fix_layout(central, ['central-usage-metrics'], central=True, usage_metrics=True)
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261101T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-review-fix'])
+    _review_fix_layout(atl, ['atl-usage-metrics'], usage_metrics=True)
+    return d
+
+
+def test_refuses_to_go_back_past_the_review_fix_release(twice_upgraded, capsys):
+    """The way back to the review-fix release is starting its code (docs/UPGRADE.md), not this tool."""
+    d = twice_upgraded
+    before = _tree(d)
+    assert rb.main(['--data-dir', str(d)]) == 0                       # the plan, with the warning
+    out = capsys.readouterr().out
+    assert 'past the review-fix release' in out and '--past-review-fix' in out and 'do NOT run this tool' in out
+    assert 'the review-fix layout, copied by the usage-metrics release' in out
+    for extra in ([], ['--use-oldest']):
+        assert rb.main(['--data-dir', str(d), '--apply', '--force'] + extra) == 2
+        assert 'Refused: nothing was changed' in capsys.readouterr().out
+        assert _tree(d) == before
+    assert rb.main(['--data-dir', str(d), '--apply', '--force', '--past-review-fix']) == 0
+    assert _rows(str(d / 'atlantis' / 'data.db')) == ['atl-f086e7e']
+    assert _rows(str(d / 'metrics.db')) == ['central-f086e7e']
+
+
+def test_going_back_from_usage_metrics_straight_to_f086e7e_needs_no_flag(tmp_path, capsys):
+    """f086e7e -> usage-metrics (no review-fix release in between): its only backups have the old layout."""
+    d = tmp_path / 'data'
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-f086e7e'])
+    _review_fix_layout(atl, ['atl-usage-metrics'], usage_metrics=True)
+    assert rb.main(['--data-dir', str(d), '--apply', '--force']) == 0
+    assert _rows(atl) == ['atl-f086e7e']
+    assert 'past the review-fix release' not in capsys.readouterr().out

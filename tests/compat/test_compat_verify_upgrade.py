@@ -319,6 +319,54 @@ def test_detects_a_broken_new_read_path(old_data_dir, old_code, compat_dir):
     assert rep['checks']['backups']['status'] == 'PASS'
 
 
+def test_detects_a_new_manager_that_rewrites_an_old_row_while_storing_new_data(old_data_dir, old_code, compat_dir):
+    """
+    Found by the round-3 review: the storage check ran only before the ingest
+    and re-send checks.  Here storing a new message rewrites the newest row
+    the OLD Manager stored; the comparison (before), the backups and the
+    rollback (which restores them) can't see it.
+    """
+    new_code = compat_dir / 'broken-ingest-rewrite-code'
+    ignore = shutil.ignore_patterns('__pycache__', '*.pyc', 'config.json', 'logs', 'data')
+    for part in ('manager', 'dashboard'):
+        shutil.copytree(str(REPO / part), str(new_code / part), ignore=ignore)
+    (new_code / 'tools').mkdir()
+    shutil.copy2(str(REPO / 'tools' / 'rollback_upgrade.py'), str(new_code / 'tools' / 'rollback_upgrade.py'))
+    with open(new_code / 'manager' / 'data_store.py', 'a', encoding='utf-8') as f:
+        f.write('''
+
+# --- deliberately broken (tests/compat): storing a new message rewrites the newest older row ---
+_vu_store = TypedDataStore.store_message
+
+
+def _vu_broken_store(self, system_name, msg_id, timestamp, device_type, data_type, data, *a, **kw):
+    status = _vu_store(self, system_name, msg_id, timestamp, device_type, data_type, data, *a, **kw)
+    if status == 'stored' and data_type == 'system_metrics':
+        with self._get_db(system_name).transaction() as conn:
+            conn.execute('UPDATE system_metrics SET ram_percent = 1.5 WHERE id = (SELECT id FROM system_metrics '
+                         'WHERE msg_id IS NOT ? ORDER BY id DESC LIMIT 1)', (msg_id,))
+    return status
+
+
+TypedDataStore.store_message = _vu_broken_store
+''')
+    work = compat_dir / 'work-broken-ingest-rewrite'
+    work.mkdir()
+    report = compat_dir / 'verify-report-broken-ingest-rewrite.json'
+    before = snapshot(old_data_dir)
+    rc, rep, text = run_verify('--data-dir', old_data_dir, '--old-code', old_code, '--new-code', new_code,
+                               '--work-dir', work, '--report', report, *QUICK)
+    assert snapshot(old_data_dir) == before
+    assert rep is not None, text[-4000:]
+    assert rc == 1 and rep['result'] == 'FAIL', _summary(text)
+    checks = rep['checks']
+    assert checks['storage']['status'] == 'FAIL', checks['storage']
+    late = [p for m in checks['storage']['details'].get('more', []) for p in m.get('problems') or []]
+    assert any(p.startswith('atlantis/data.db: system_metrics: rows stored before were changed') for p in late), late
+    for cid in ('endpoints', 'ingest', 'legacy-resend', 'backups', 'rollback'):
+        assert checks[cid]['status'] == 'PASS', (cid, checks[cid])
+
+
 # --------------------------------------------------------------------------- #
 # Orphans: leftovers an old Manager could produce                             #
 # --------------------------------------------------------------------------- #

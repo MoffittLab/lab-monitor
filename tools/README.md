@@ -486,13 +486,23 @@ change it, or `--old-code DIR` with an extracted copy). The NEW code is the chec
 in (`--new-code DIR` to test another one). Both are copied into the work directory, so PID files
 and logs never touch the installed copies.
 
+The OLD code is always **the code the live Manager runs**: `f086e7e` for the review-fix upgrade,
+and the review-fix release (`fb6498c`, or the merge of it that is deployed) for the usage-metrics
+upgrade. The tool tells which from the old code itself (`OLD side:` line, report
+`code.old.version`; `--old-version` overrides it) and applies that side's expectations: see
+[With the review-fix release as the old side](#with-the-review-fix-release-as-the-old-side-the-usage-metrics-upgrade).
+It refuses to run (exit 2) when the `data_dir` is not in the layout that old code writes, e.g.
+`--old-ref f086e7e` on a `data_dir` the review-fix release already migrated.
+
 **Options:**
 
 | Option | Meaning |
 |--------|---------|
 | `--manager-config PATH` | the live Manager's `config.json`: `data_dir` is read from it, and the NEW Manager's `--check-config` is run on a copy of it (`config` FAILs if the new Manager would refuse to start, e.g. a placeholder token: see docs/UPGRADE.md, "Fix a refused token without downtime") |
+| `--old-ref REF` / `--old-code DIR` | the code the live Manager runs (default `f086e7e`); for the usage-metrics upgrade the commit the server runs (`git -C <its checkout> rev-parse HEAD`) |
+| `--old-version auto\|old\|current` | what the old code is (default `auto`: detected from it); `current` = the review-fix release |
 | `--data-dir PATH` | the live `data_dir` (instead of, or overriding, the config) |
-| `--work-dir PATH` | where the two copies, the code and the logs go (a new subdirectory is created; default: the temp dir). Needs about **4x the data_dir size** free (two copies, the new Manager's backups, the rollback check's restored databases); checked before anything is copied. Must not be inside the data_dir. |
+| `--work-dir PATH` | where the two copies, the code and the logs go (a new subdirectory is created; default: the temp dir). Needs about **4x the data_dir size** free (two copies, the new Manager's backups, the rollback check's restored databases, or its copy of the migrated databases with the review-fix release as the old side); checked before anything is copied. Must not be inside the data_dir. |
 | `--report PATH` | JSON report (all checks, every difference with the request, old and new value) |
 | `--keep-work` | keep the copies and Manager logs afterwards (for inspection) |
 | `--with-dashboard` | also start the OLD and NEW Dashboards and compare `/api/data` and charts |
@@ -522,16 +532,16 @@ and logs never touch the installed copies.
 | Check | Meaning |
 |-------|---------|
 | `source` | the live data_dir is unchanged |
-| `copies` | every database copied and passes `PRAGMA quick_check` |
+| `copies` | every database copied and passes `PRAGMA quick_check` (the running Manager's `manager.lock` is not copied or read: it is no data, and on Windows its locked byte can't be read) |
 | `config` | the NEW Manager accepts your config (FAIL if it would refuse it: the upgraded Manager would not start) |
-| `storage` | in copy B after migration: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value; a wide `storage_breakdown` table (a usage-metrics collector reported to the old Manager) is kept as `storage_breakdown_legacy` with identical content |
+| `storage` | in copy B after migration and after the restart: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value; a wide `storage_breakdown` table (a usage-metrics collector reported to the old Manager) is kept as `storage_breakdown_legacy` with identical content. Once more after the `ingest` and `legacy-resend` checks (both Managers stopped): in every table ingest only appends to (every history table, the narrow folder tables, `user_metrics_history`, `dead_letter`), the first rows in insertion order, as many as there were, still hash exactly as the original rows did, and a `*_legacy` table got no rows. So a new message or a re-send that rewrites a stored row FAILs |
 | `endpoints` | every read endpoint the Dashboard and tools use, OLD vs NEW, for every system: `/api/devices`, `/api/systems`, `/api/metrics/all`, `/api/usage/all`, `/api/totals`, `/api/user_metrics/*`, `/api/data/*` (every row of every table over the full time range), `/api/usage/*`, `/api/history/*` for every field and the sampled folders (tail query, full range, and the Dashboard's own "All Available" query) |
 | `devices` | every old device is in the new `/api/devices`, `/api/metrics/all`, `/api/usage/all`, `/api/totals` |
 | `totals` | lifetime network totals (and disk totals) identical per device, via the API and in the database |
 | `restart` | the NEW Manager restarted on the migrated copy: nothing migrated twice, every answer identical |
-| `ingest` | one new-format metrics + folder message per device: totals continue from the old values, the new point appears after the old history, a re-send is a duplicate. Two old spellings of one name (`Atlantis` / `ATLANTIS`): the message is sent under the most recently seen one, and the other rows must stay exactly as they were (data under a registered spelling goes to that row) |
-| `legacy-resend` | already-stored messages re-sent the way an OLD collector would (no `msg_id`), and again the way a collector upgraded before the Manager would (its own random `msg_id`, which the old Manager dropped), are acknowledged as duplicates, not stored twice. A scan the old Manager kept only in the device card (its history insert failed, e.g. a folder whose name differs only in case from another) is stored now |
-| `backups` | every database the NEW Manager altered has a `*.pre-upgrade-*.bak` copy with exactly the original content (a backup from an earlier attempt that the new Manager reused counts only if it holds the original) |
+| `ingest` | one new-format metrics + folder message per device: totals continue from the old values, the new point appears after the old history, a re-send is a duplicate and leaves the stored message as it was. Two old spellings of one name (`Atlantis` / `ATLANTIS`): the message is sent under the most recently seen one, and the other rows must stay exactly as they were (data under a registered spelling goes to that row). The central rows updated in place (`devices`, `device_snapshot`, `device_totals`, `device_user_snapshot`, the new snapshot tables) may change only for the devices that were sent a message |
+| `legacy-resend` | already-stored messages re-sent the way an OLD collector would (no `msg_id`), and again the way a collector upgraded before the Manager would (its own random `msg_id`, which the old Manager dropped), are acknowledged as duplicates, not stored twice, and change no central row. A scan the old Manager kept only in the device card (its history insert failed, e.g. a folder whose name differs only in case from another) is stored now |
+| `backups` | every database the NEW Manager altered (tables, columns, a table's definition, or an index, trigger or view) has a `*.pre-upgrade-*.bak` copy with exactly the original content (a backup from an earlier attempt that the new Manager reused counts only if it holds the original) |
 | `files` | non-database files (`usage.jsonl`, ...) are byte-identical after the run |
 | `rollback` | `rollback_upgrade.py --apply` on the migrated copy B (after the new messages above): every database holds its original content again, and the OLD Manager started on it gives the same answers it gave before the upgrade |
 | `dashboard` | (`--with-dashboard`) the NEW Dashboard shows the same systems, metrics, folders and totals as the OLD one, and charts load; a chart longer than `--dashboard-max-points` must cover the whole old time range within one bucket, with every average inside the old values' range |
@@ -540,12 +550,6 @@ Systems are taken from the device registry **and** from the `data_dir`: a `data/
 without a registry row (the old `DELETE /api/system/<name>` could leave one when Windows kept the
 file open), a registry row without a directory, and per-user rows of a deleted device are all
 compared too (listed under "Warnings").
-
-**Comparing against the review-fix release.** The tool was written for OLD-format originals. Run with
-`--old-ref fb6498c` on a `data_dir` that is already in the review-fix layout, the `backups`, `rollback` and
-`legacy-resend` checks and some record counts report failures that come from that assumption, not from
-lost data; use such a run for the timings and the other checks only
-([docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md#29-first-start-on-the-current-data)).
 
 Only a documented list of **intended** differences is normalized away (timestamps compared as
 instants, fields the new Manager adds such as `msg_id`, NaN as null, `1234.0` = `1234`,
@@ -572,6 +576,53 @@ plus the per-field chart queries); a progress line is printed per system.
 `*.pre-upgrade-*.bak` copies next to each database; keep them until you are sure you won't roll
 back (see `rollback_upgrade.py`), then delete them.
 
+#### With the review-fix release as the old side (the usage-metrics upgrade)
+
+On the server, once the review-fix release runs, the `data_dir` is in its layout (narrow
+`folder_usage_msgs` / `_items` with the old wide table kept as `folder_usage_legacy`, `msg_id` on
+every row, `dead_letter`, its own `*.pre-upgrade-*.bak` copies) and the old side is that release.
+Run from a separate checkout of the usage-metrics release, with the commit the live Manager runs:
+
+```bat
+cd E:\Users\lab-monitor\scripts\lab-monitor
+git fetch
+REM origin/feature/usage-metrics exists only once the release is pushed (the owner's decision):
+REM git ls-remote origin feature/usage-metrics must print a line; if it prints nothing, stop here
+git worktree add ..\lab-monitor-usage origin/feature/usage-metrics
+cd ..\lab-monitor-usage
+git -C ..\lab-monitor rev-parse HEAD
+REM -> the commit the server runs (fb6498c, or the merge of it that is deployed)
+python tools\verify_upgrade.py --manager-config ..\lab-monitor\manager\config.json --old-ref <that commit> ^
+       --work-dir F:\verify-usage --with-dashboard --report F:\verify-usage\report.json
+```
+
+The console then says `OLD side: current (the review-fix release ...)`. Each check is the same as
+above, with these expectations for that old side:
+
+| Check | With the review-fix release as the old side |
+|-------|---------------------------------------------|
+| `storage` | every table the review-fix release wrote, `folder_usage_legacy`, `folder_usage_msgs`, `folder_usage_items`, `dead_letter` and its `.bak` copies included, keeps every row unchanged over its columns; the new Manager only adds tables (`_rollup_*`, ...) and columns (listed in the report under `added_tables`). A wide `storage_breakdown` table (a usage-metrics collector reported to the review-fix Manager, which the rollout order forbids) must be kept as `storage_breakdown_legacy` with every row (N21) |
+| `endpoints` | every endpoint of the review-fix Manager, `/api/dead_letter` (admin) and `/api/usage/history` included, OLD vs NEW for every data type it serves (`folder_usage` reassembled from the narrow tables; the internal tables are not data types); rows are compared with their `msg_id` and nothing is dropped; a window is answered by both Managers (same rules, so identical), and an "All Available" chart must be identical unless the new answer comes from its rollups (N17) |
+| `legacy-resend` | the newest stored message of every data type, re-sent with its own `msg_id` (a `legacy-<sha1>` id the Manager derived for an old collector's message is re-sent the way that collector would: without an id), and the rows from before the review-fix upgrade (`msg_id` NULL, the newest `folder_usage_legacy` row) re-sent the old way, without an id and with a random one: every batch goes to both Managers, the new one must answer exactly what the review-fix one answers, all "duplicate", store nothing and change no central row. Afterwards `storage` checks every row the review-fix release stored once more (above) |
+| `backups` | exactly one new pre-upgrade copy of every database the new Manager changed (`metrics.db`, and every `data.db` that holds rows, before the rollup tables are added; an added index, trigger or view counts as a change), identical to the original; two copies of one database FAIL |
+| `rollback` | the documented way back: **no restore**, the review-fix Manager is started on the data the new Manager migrated (a copy taken after the new Manager's first start). It must start, take no backup, change no table and no schema (indexes, triggers, views included), and give every answer it gave before the upgrade (every recorded endpoint: rows, windows, charts, per-user history, dead letters). Then, because the collectors keep running on the way back, it must store new data there and serve it: per system, a new reading of every data type it has (rebuilt from its newest stored row, with a new `msg_id` and time) and a usage-metrics collector's batch (system and per-user metrics with the new fields, sessions, storage health, storage breakdown); every message must be answered "stored" and be served by `/api/data` (report `back_to_current.new_messages_sent` / `_stored`). The only accepted change is N22: storage-breakdown runs the new Manager moved out of a wide table are not shown ([docs/UPGRADE.md](../docs/UPGRADE.md#going-back-from-the-usage-metrics-release-to-current)) |
+
+Only the intended differences that apply to that old side are normalized (the report's
+`intended_differences.<id>.old_sides`): N1, N3, N4, N6, N9, N10, N12, N14–N21 and N22. The ones that
+describe what the review-fix release itself changed (N2 `msg_id`, N5 null folder keys, N7, N8, N11,
+N13) are not: a difference there FAILs, and so does any of them being applied (check
+`normalizations`). **PASS** therefore means: every row the review-fix release stored is still there
+unchanged, also after new and re-sent messages were stored, the new Manager and Dashboard serve exactly
+what the review-fix ones served (plus only the listed additions), re-sent messages are never stored twice
+and change nothing, every changed database has its one pre-upgrade copy, and the review-fix code started
+again on the migrated data gives back what it showed before and keeps storing what collectors of both
+releases send.
+
+Expect it to take about 1.5 to 2 times as long as with an `f086e7e` old side: the review-fix Manager answers
+every chart window itself, and the `rollback` check asks it every recorded question again (on this Linux box,
+30 days of data of 7 systems, with `--with-dashboard`: 54 s, against 32 s for the same data with the `f086e7e`
+old side).
+
 ---
 
 ### 9. `rollback_upgrade.py` — Put the Pre-upgrade Databases Back (run on the Manager server)
@@ -584,7 +635,9 @@ OLD code serves exactly the data it had. Standard library only; nothing is delet
 no rollback: start the review-fix code on the same `data_dir` ([docs/UPGRADE.md](../docs/UPGRADE.md#going-back-from-the-usage-metrics-release-to-current)).
 This tool restores the layout the OLD (`f086e7e`) code reads; after OLD → review-fix → usage-metrics that
 means the copies taken before the review-fix upgrade, and everything stored since would be moved aside to
-`*.post-upgrade-*` files.
+`*.post-upgrade-*` files. When it finds that case (the usage-metrics release has run on the `data_dir` and a
+database has a newer backup in the review-fix layout than the one it would restore), the plan says so and
+`--apply` is refused (exit 2, nothing changed) unless `--past-review-fix` is given.
 
 ```bat
 REM 1. stop the Manager (and Dashboard): Task Scheduler -> End "Lab Monitor Manager", "Lab Monitor Dashboard"
@@ -612,6 +665,7 @@ run it again once the cause is fixed.
 | `--apply` | perform the rollback (without it: dry run) |
 | `--use-oldest` | restore the oldest backup of each database instead of the newest old-layout one |
 | `--force` | skip the check that no Manager answers `/health` on the configured port |
+| `--past-review-fix` | after OLD → review-fix → usage-metrics: really restore the OLD layout (everything stored since the review-fix upgrade is set aside) |
 
 Then start the OLD code: check out the commit you ran before (`git checkout f086e7e` in the
 installation, or whatever `git rev-parse HEAD` showed before upgrading) and start the two tasks
@@ -625,7 +679,8 @@ any upgraded collector's token) to `auth_tokens`. Messages received after the up
 **Exit codes:** `0` rolled back (or the dry-run plan is ready), `1` a problem (bad backup, a file
 that could not be renamed), `2` refused (a Manager is running, bad arguments, no backups found).
 `verify_upgrade.py` runs this tool on its migrated copy (check `rollback`), so a PASS there means
-the rollback works on your data.
+the rollback works on your data. With the review-fix release as the old side it does not: its
+`rollback` check starts the review-fix Manager on the migrated data instead (the way back to that release).
 
 ---
 

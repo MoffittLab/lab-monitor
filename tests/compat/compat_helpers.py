@@ -34,6 +34,17 @@ def build_fixture(old_code, out, *extra):
     return json.loads(r.stdout.decode('utf-8').strip().splitlines()[-1])
 
 
+def build_current_fixture(current_code, old_data, out, *extra):
+    """Run make_current_fixture.py on a copy of old_data (a make_old_fixture.py data_dir); returns its summary."""
+    r = subprocess.run(
+        [sys.executable, str(HERE / 'make_current_fixture.py'), '--current-code', str(current_code),
+         '--old-data', str(old_data), '--out', str(out), *extra],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    assert r.returncode == 0, r.stderr.decode('utf-8', 'replace')[-4000:]
+    return json.loads(r.stdout.decode('utf-8').strip().splitlines()[-1])
+
+
 def snapshot(root):
     """Every file and directory under root: relative path -> (size, mtime_ns, sha256)."""
     out = {}

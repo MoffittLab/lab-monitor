@@ -140,7 +140,8 @@ SQLite's locking. With **exactly one Manager, on one server,** using the share t
 but a local disk is more robust:
 
 - Never point two Managers (or a Manager and a copy job that writes) at the same files.
-- Network latency makes every write slower; the Manager stores each message in its own transaction.
+- Network latency makes every write slower. The Manager commits up to `ingest_commit_messages` (100)
+  messages of a request together, one COMMIT (and sync) per database, rather than two per message.
 - If the share is briefly unreachable, writes fail as `error` and the collectors keep those messages
   queued; they are stored on a later run.
 - If the share is unreachable at startup, the Manager exits with "Cannot open data_dir …" and the

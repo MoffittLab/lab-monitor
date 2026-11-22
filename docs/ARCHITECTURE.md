@@ -145,8 +145,14 @@ warning when waitress is missing). Configuration: [manager/README.md](../manager
 `POST /api/data/queue` takes the batch above (the legacy `entries` format of v1 collectors is also
 accepted). Checks: a token allowed to write for `name`; every message's `header.device_name` equal
 to `name` after normalization; a header `timestamp`; device names matching `^[A-Za-z0-9_.-]{1,64}$`
-(names an older Manager already registered stay accepted). Each message is stored in its own
-transaction together with its central side effects, so one bad message never fails the batch.
+(names an older Manager already registered stay accepted). Each message is stored or rolled back
+on its own together with its central side effects, so one bad message never fails the batch: its
+own savepoint inside one transaction per database (the system's `data.db` and `metrics.db`) that
+holds up to `ingest_commit_messages` (100) consecutive messages of the request or 0.5 s of work. The
+answer is sent only after those transactions are committed; if a COMMIT fails, every message of
+that group is answered `error` and the collector sends it again
+([manager/README.md](../manager/README.md#ingest)). The two databases are always locked in the
+same order, `data.db` first.
 Limits: `max_request_bytes` (32 MiB) and `max_messages_per_request` (10000, only for requests whose
 messages carry `msg_id`).
 
@@ -235,7 +241,8 @@ rollups are complete (below).
 every numeric field of `system_metrics`, `user_metrics` (one series per user), `sessions` and
 `storage_health` (daily only), in the system's own `data.db`.
 
-1. **Live roll.** Each stored message is rolled up inside its own transaction. A storage error gets
+1. **Live roll.** Each stored message is rolled up in the same transaction (its savepoint) as its
+   row, so the row and its rollup are committed together. A storage error gets
    the message `error` (the collector retries); any other rollup failure queues the row for repair,
    and the raw row is stored anyway.
 2. **Backfill.** The first open of a database queues all its existing rows, and every later open
