@@ -10,7 +10,10 @@
 #   1. Detects and activates the 'lab-monitor' conda environment
 #   2. Creates directory structure at <Drive>:\Users\lab-monitor
 #   3. Clones or updates the lab-monitor repository
-#   4. Installs Python dependencies into the conda environment
+#      3b. Restricts the install directory so only SYSTEM and Administrators
+#          can write to it (the tasks run as SYSTEM), and the config folder
+#          (which holds the Manager token) so only they can read it
+#   4. Installs the collector's Python dependencies (collector\requirements.txt)
 #   5. Gathers configuration interactively
 #   6. Creates wrapper batch scripts with hardcoded Python paths
 #   7. Tests collector
@@ -286,6 +289,54 @@ if (Test-Path "$CollectorDir\collector.py") {
 }
 
 # ==============================================================================
+# Step 3b: Restrict install-directory permissions
+# ==============================================================================
+# By default a folder under a data drive inherits the drive root's ACL, which
+# lets ordinary users create files in subfolders. The scheduled tasks run
+# collector.py from here as SYSTEM, so a file planted next to it (e.g. a
+# module Python would import) would run as SYSTEM. Replace the inherited ACL:
+#   install dir:  SYSTEM + Administrators full control, Users read/execute
+#   local\ dir:   SYSTEM + Administrators only (config.json holds the token;
+#                 files created there later, e.g. by config_tool.py, inherit it)
+# Well-known SIDs are used so this works on non-English Windows.
+Write-Step "Step 3b: Restricting install-directory permissions"
+$SidSystem = "*S-1-5-18"
+$SidAdmins = "*S-1-5-32-544"
+$SidUsers  = "*S-1-5-32-545"
+$LocalDir  = "$CollectorDir\local"
+if (-not (Test-Path $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+
+function Set-RestrictedAcl {
+    param([string]$Path, [string[]]$Grants, [string]$What)
+    # /inheritance:r drops inherited ACEs; (OI)(CI) makes the grants inherit to children
+    $out = & icacls.exe $Path /inheritance:r /grant:r $Grants /C /Q 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Could not restrict permissions on $What ($Path): $($out | Out-String)"
+        return $false
+    }
+    # Make existing children inherit only those ACEs (drops any explicit grants)
+    if (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1) {
+        $out = & icacls.exe "$Path\*" /reset /T /C /Q 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Could not reset permissions under $What ($Path): $($out | Out-String)"
+            return $false
+        }
+    }
+    return $true
+}
+
+$RootAclOk  = Set-RestrictedAcl -Path $RootDir -What "install directory" -Grants @(
+    "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F", "${SidUsers}:(OI)(CI)RX")
+$LocalAclOk = Set-RestrictedAcl -Path $LocalDir -What "config directory" -Grants @(
+    "${SidSystem}:(OI)(CI)F", "${SidAdmins}:(OI)(CI)F")
+if ($RootAclOk -and $LocalAclOk) {
+    Write-Success "Only SYSTEM and Administrators can write to $RootDir"
+    Write-Success "Only SYSTEM and Administrators can read $LocalDir (config + token)"
+} else {
+    Write-Warn "Fix the permissions manually: non-admin users must not be able to write to $RootDir"
+}
+
+# ==============================================================================
 # Step 4: Conda environment info
 # ==============================================================================
 Write-Step "Step 4: Conda environment"
@@ -300,12 +351,11 @@ Write-Step "Step 5: Installing Python dependencies"
 Write-Host "Upgrading pip..." -ForegroundColor Cyan
 & "$PythonExe" -m pip install --upgrade pip 2>&1 | Out-Null
 
-Write-Host "Installing from requirements.txt..." -ForegroundColor Cyan
-# Use the repo-root requirements.txt which covers all components
-Push-Location "$ScriptsDir\lab-monitor"
-$pipOut  = & "$PythonExe" -m pip install -r requirements.txt 2>&1
+Write-Host "Installing from collector\requirements.txt..." -ForegroundColor Cyan
+# The collector only needs requests + psutil; the repo-root requirements.txt
+# is for the Manager, Dashboard and tools.
+$pipOut  = & "$PythonExe" -m pip install -r "$CollectorDir\requirements.txt" 2>&1
 $pipExit = $LASTEXITCODE
-Pop-Location
 
 if ($pipExit -eq 0) {
     Write-Success "Dependencies installed"
@@ -313,6 +363,25 @@ if ($pipExit -eq 0) {
     Write-Err "pip install failed (exit code $pipExit)"
     Write-Host ($pipOut | Out-String) -ForegroundColor Gray
     exit 1
+}
+
+# Optional: NVIDIA GPU stats (nvidia-ml-py), only when an NVIDIA GPU is present
+$HasNvidia = $false
+try {
+    $HasNvidia = [bool](Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop |
+                        Where-Object { $_.Name -like "*NVIDIA*" })
+} catch {
+    $HasNvidia = [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)
+}
+if ($HasNvidia) {
+    Write-Host "NVIDIA GPU detected - installing collector\requirements-gpu.txt..." -ForegroundColor Cyan
+    $gpuOut = & "$PythonExe" -m pip install -r "$CollectorDir\requirements-gpu.txt" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Success "nvidia-ml-py installed (GPU stats enabled)"
+    } else {
+        Write-Warn "Could not install nvidia-ml-py - GPU stats will be unavailable"
+        Write-Host ($gpuOut | Out-String) -ForegroundColor Gray
+    }
 }
 
 # ==============================================================================
@@ -361,8 +430,7 @@ Write-Host "  cmd /c `"$MetricsBat`"" -ForegroundColor Gray
 # Step 7: Gather configuration (interactive)
 # ==============================================================================
 Write-Step "Step 7: Gathering configuration"
-$LocalDir = "$CollectorDir\local"
-if (-not (Test-Path $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+# $LocalDir was created and locked down in Step 3b
 
 if (-not (Test-Path $ConfigFile)) {
 
@@ -372,22 +440,23 @@ if (-not (Test-Path $ConfigFile)) {
     Write-Host ""
 
     # -- Manager URL ----------------------------------------------------------
-    $ManagerUrl = Read-Host "Enter Manager URL (e.g., http://atlantis.med.harvard.edu:5000)"
+    # http:// or https:// - whatever the Manager is served on
+    Write-Host "The Manager itself serves plain http (e.g., http://atlantis.med.harvard.edu:5000);" -ForegroundColor Gray
+    Write-Host "use an https:// URL only if it sits behind a TLS proxy." -ForegroundColor Gray
+    $ManagerUrl = Read-Host "Enter Manager URL"
     if ([string]::IsNullOrWhiteSpace($ManagerUrl)) {
         Write-Err "Manager URL cannot be empty"
         exit 1
     }
-    if ($ManagerUrl -like "https://*") {
-        Write-Warn "URL starts with https:// but Manager runs plain HTTP"
-        $Confirm = Read-Host "Continue with https:// anyway? [y/N]"
-        if ($Confirm -ne "y" -and $Confirm -ne "Y") {
-            Write-Host "Please re-run with the correct URL."
-            exit 1
-        }
+    $ManagerUrl = $ManagerUrl.Trim()
+    if ($ManagerUrl -like "http://*") {
+        Write-Warn "$ManagerUrl is plain http:// - the Manager token will travel unencrypted on the network."
+    } elseif ($ManagerUrl -notlike "https://*") {
+        Write-Warn "The Manager URL should start with http:// or https:// (got: $ManagerUrl)"
     }
 
     # -- Manager Token --------------------------------------------------------
-    $ManagerToken = Read-Host "Enter Manager Token (from Manager config)"
+    $ManagerToken = Read-Host "Enter Manager Token (this server's collector token from the Manager config)"
     if ([string]::IsNullOrWhiteSpace($ManagerToken)) {
         Write-Err "Manager Token cannot be empty"
         exit 1
@@ -482,11 +551,17 @@ if (-not (Test-Path $ConfigFile)) {
         log_file                = "$RootDir\logs\collector.log"
         log_level               = "INFO"
         timeout_seconds         = 3600
+        total_timeout_seconds   = 10800
         request_timeout_seconds = 30
+        max_batch_messages      = 100
+        max_queue_messages      = 50000
     } | ConvertTo-Json -Depth 3
 
+    # $LocalDir is restricted to SYSTEM + Administrators (Step 3b); /reset makes
+    # sure the new file carries only that inherited ACL.
     Set-Content -Path $ConfigFile -Value $ConfigContent
-    Write-Success "Config written to $ConfigFile"
+    & icacls.exe $ConfigFile /reset /Q 2>&1 | Out-Null
+    Write-Success "Config written to $ConfigFile (readable by SYSTEM and Administrators only)"
     Write-Host ""
     Write-Host "  Server name: $ServerName"              -ForegroundColor Gray
     Write-Host "  Device type: $DeviceType"              -ForegroundColor Gray
@@ -647,6 +722,23 @@ function Register-LabTask-Schtasks {
 }
 
 # -- Disk collection (daily at 2:00 AM) --------------------------------------
+# Time limit = the collector's own disk-scan budget (total_timeout_seconds,
+# default 3 x timeout_seconds) + 1 hour for volume capacity and the upload, so
+# Task Scheduler never kills a scan the collector would still finish and send.
+# (Tasks registered by the schtasks.exe fallback keep its 72-hour default.)
+$PerFolderSeconds  = 3600
+$ScanBudgetSeconds = $null
+try {
+    $Cfg = Get-Content -Raw -Path $ConfigFile -ErrorAction Stop | ConvertFrom-Json
+    if ($Cfg.timeout_seconds)       { $PerFolderSeconds  = [double]$Cfg.timeout_seconds }
+    if ($Cfg.total_timeout_seconds) { $ScanBudgetSeconds = [double]$Cfg.total_timeout_seconds }
+} catch {
+    Write-Warn "Could not read scan budgets from $ConfigFile ($_) - assuming defaults"
+}
+if (-not $ScanBudgetSeconds) { $ScanBudgetSeconds = 3 * $PerFolderSeconds }
+$DiskLimitHours = [int][math]::Ceiling($ScanBudgetSeconds / 3600) + 1
+Write-Host "Disk task time limit: $DiskLimitHours h (scan budget $([int]$ScanBudgetSeconds) s + 1 h)" -ForegroundColor Gray
+
 try {
     $DiskAction   = New-ScheduledTaskAction `
                         -Execute       "cmd.exe" `
@@ -656,7 +748,7 @@ try {
     $DiskTrigger  = New-ScheduledTaskTrigger -Daily -At "2:00 AM" -ErrorAction Stop
 
     $DiskSettings = New-ScheduledTaskSettingsSet `
-                        -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+                        -ExecutionTimeLimit (New-TimeSpan -Hours $DiskLimitHours) `
                         -StartWhenAvailable `
                         -ErrorAction       Stop
 
@@ -753,7 +845,10 @@ Write-Host "     Begin the task: On a schedule -> Daily at 02:00:00" -Foreground
 Write-Host "5. Actions tab -> New:" -ForegroundColor White
 Write-Host "     Program/script: cmd.exe" -ForegroundColor Gray
 Write-Host "     Arguments:      /c `"$DiskBat`"" -ForegroundColor Gray
-Write-Host "6. OK to save" -ForegroundColor White
+Write-Host "6. Settings tab:" -ForegroundColor White
+Write-Host "     Stop the task if it runs longer than: $DiskLimitHours hours" -ForegroundColor Gray
+Write-Host "     (must exceed total_timeout_seconds in config.json)" -ForegroundColor Gray
+Write-Host "7. OK to save" -ForegroundColor White
 Write-Host ""
 
 Write-Host "METRICS COLLECTION TASK (Every 5 minutes):" -ForegroundColor Yellow

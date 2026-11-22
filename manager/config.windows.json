@@ -1,14 +1,33 @@
 {
   "host": "0.0.0.0",
   "port": 5000,
-  "data_dir": "E:\\Users\\lab-monitor\\data",
-  "auth_tokens": ["GENERATE-RANDOM-TOKEN-1", "GENERATE-RANDOM-TOKEN-2"],
-  "cors_origins": [
-    "http://localhost:5001",
-    "http://atlantis.med.harvard.edu:5001"
-  ],
+  "data_dir": "E:\\Users\\lab-monitor\\manager-data",
+
+  "admin_tokens": ["GENERATE-RANDOM-ADMIN-TOKEN"],
+  "read_tokens": ["GENERATE-RANDOM-READ-TOKEN-FOR-DASHBOARD"],
+  "collector_tokens": {
+    "Triton": "GENERATE-RANDOM-TOKEN-FOR-TRITON",
+    "Atlas": "GENERATE-RANDOM-TOKEN-FOR-ATLAS"
+  },
+
+  "cors_origins": [],
+  "max_request_bytes": 33554432,
+  "max_messages_per_request": 10000,
+  "history_retention_days": null,
+  "backup_before_migration": true,
+  "threads": 8,
+
+  "snapshot": {
+    "enabled": false,
+    "dest_dir": "\\\\nas.example.org\\lab-monitor\\snapshots",
+    "time": "03:30",
+    "keep_daily": 14,
+    "keep_monthly": 12
+  },
+
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
   "log_level": "INFO",
-  "retention_days": 90,
+  "log_max_bytes": 10485760,
+  "log_backup_count": 5,
   "debug": false
 }

@@ -1,0 +1,65 @@
+# Lab Monitor collector: disk usage (volume capacity + folder sizes of scan_paths).
+# Installed to /etc/systemd/system by install-collector-linux.sh; started daily
+# by lab-monitor-disk.timer. Local overrides belong in a drop-in:
+#   sudo systemctl edit lab-monitor-disk.service
+[Unit]
+Description=Lab Monitor collector - disk usage
+Documentation=file:///opt/lab-monitor/collector/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=labmon
+Group=labmon
+WorkingDirectory=/var/lib/lab-monitor
+# -s / PYTHONNOUSERSITE: no user site-packages. HOME is labmon's writable
+# /var/lib/lab-monitor, and a venv with system site-packages (the installer's
+# offline fallback) would otherwise run any .pth file put under
+# $HOME/.local - in the disk unit, with CAP_DAC_READ_SEARCH.
+ExecStart=/opt/lab-monitor/venv/bin/python -s /opt/lab-monitor/collector/collector.py --config /etc/lab-monitor/collector.json --mode disk
+SyslogIdentifier=lab-monitor-disk
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+# The collector stops scanning after total_timeout_seconds (10800 s = 3 h in
+# the installer's config) and then reports what it has; 1 h more covers volume
+# capacity and the upload. install-collector-linux.sh rewrites this value from
+# the config in lab-monitor-disk.service.d/50-timeout.conf on every run.
+TimeoutStartSec=4h
+UMask=0027
+StateDirectory=lab-monitor
+StateDirectoryMode=0750
+LogsDirectory=lab-monitor
+LogsDirectoryMode=0750
+
+# Background priority: never compete with users for CPU or disk
+Nice=19
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+
+# --- Sandboxing ---------------------------------------------------------------
+# Must READ every file under scan_paths, whoever owns it, without being root:
+# CAP_DAC_READ_SEARCH bypasses read/search permission checks only (it grants
+# no write access), and is the only capability this service can ever hold.
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lab-monitor /var/log/lab-monitor
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

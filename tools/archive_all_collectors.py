@@ -2,60 +2,83 @@
 """
 Lab Monitor - Remote Archive All Collectors
 
-Archive all YYYY-MM.jsonl files on all collectors by moving them to
-timestamped backup folders. Useful for refreshing the collector archives
-and Manager history without deleting data.
+Move every collector's YYYY-MM.jsonl archive files into a timestamped backup
+folder next to them, on all collectors in collectors.csv. Nothing is deleted:
+files are only moved, so they can be inspected later, moved back, or re-sent
+with tools/replay_archives.py to a Manager that lost that data. The Manager
+is not touched — its history stays as it is (to wipe a system on the
+Manager, see reset_system.py).
 
 CSV format (one header row required):
-    ip,username,password,git_path
-    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor
-    atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor
+    ip,username,password,git_path,python_path[,key_filename][,port]
+    192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
+    atlantis.med.harvard.edu,admin,,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
 
 Usage:
-    python3 archive_all_collectors.py --csv collectors.csv
     python3 archive_all_collectors.py --csv collectors.csv --dry-run
-    python3 archive_all_collectors.py --csv collectors.csv --timeout 60 --verbose
-    python3 archive_all_collectors.py --csv collectors.csv --also-delete-queues
+    python3 archive_all_collectors.py --csv collectors.csv                 # asks you to type ARCHIVE
+    python3 archive_all_collectors.py --csv collectors.csv --yes           # no prompt (scripts)
+    python3 archive_all_collectors.py --csv collectors.csv --also-archive-queues
+    python3 archive_all_collectors.py --csv collectors.csv --timeout 60 --verbose --parallel 4
 
 What it does:
-    1. For each collector, SSHes in
-    2. Reads the collector's config to find data_dir and system name
-    3. Creates a timestamped backup folder (backup_YYYYMMDD_HHMMSS)
-    4. Moves all YYYY-MM.jsonl archive files into the backup folder
-    5. Optionally deletes queue.json to force fresh sync
-    6. Shows backup location and file counts
+    1. Asks you to type ARCHIVE to confirm (skipped with --yes or --dry-run)
+    2. For each collector, SSHes in
+    3. Reads the collector's config (config_tool.py) to find data_dir and system name
+    4. Creates a timestamped backup folder <data_dir>/<name>/backup_YYYYMMDD_HHMMSS
+    5. Moves all YYYY-MM.jsonl archive files into the backup folder
+    6. With --also-archive-queues, also MOVES queue.json, and any
+       queue.corrupt-*.json the collector set aside, into the same backup
+       folder, so messages still waiting to be sent are not sent (they remain in
+       the backup and in the archives; send them later with
+       replay_archives.py --source <backup>/queue.json). The move happens while
+       holding the collector's queue lock (queue.json.lock), so it can't
+       interleave with a collector run updating the queue:
+         - Synology/Linux: with the flock command (util-linux or BusyBox); without
+           it the move goes ahead with a warning
+         - Windows: best effort, the same byte-range lock the collector takes
+       A collector too old to have a queue.json.lock doesn't lock at all; the
+       move then goes ahead with a warning (pause those collectors first).
+       queue.json.lock itself is never moved: it holds no data.
+    7. Shows backup locations and file counts. Any failure (unreachable host,
+       failed cd/mkdir/move, unexpected output) is reported as a failure.
+
+--also-delete-queues is a deprecated alias of --also-archive-queues. It used to
+delete queue.json; it now moves it into the backup folder instead.
 
 What it does NOT do:
-    - Does NOT wipe the Manager (unlike reset_system.py)
-    - Does NOT delete config.json or any other files
-    - Does NOT modify collectors.csv
+    - Does NOT delete any file (archives and queue are moved, never removed)
+    - Does NOT wipe or change the Manager (unlike reset_system.py)
+    - Does NOT modify config.json or collectors.csv
 
-Why archive instead of delete:
-    - Backup folders are safe indefinitely
-    - Can recover data if needed via manual import/replay
-    - Seamless refresh of collector history without data loss
+Tips:
+    - Always --dry-run first to preview what will happen
+    - Pause collectors first (toggle_collectors.py --mode off) so no run is
+      writing to the archive while it is moved
+    - Keep collectors.csv out of version control
+
+Exit code: 0 all archived, 1 bad arguments/CSV or confirmation declined,
+2 one or more collectors failed.
 
 Requirements:
     pip install paramiko
-
-Note:
-    - Keep collectors.csv out of version control
-    - Always --dry-run first to preview what will happen
 """
 
 import argparse
-import csv
 import json
+import re
+import shlex
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
+
+import _ssh
+from _ssh import is_windows_path
 
 try:
     import paramiko
 except ImportError:
-    print("ERROR: paramiko is required. Install with: pip install paramiko")
-    sys.exit(1)
+    paramiko = None
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +86,17 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _verbose = False
-_dry_run = False
+
+# Typed confirmation required before anything is moved (unless --yes).
+CONFIRM_WORD = 'ARCHIVE'
+
+# Same pattern the Manager uses for device names; anything else is refused
+# before it gets near a remote shell command.
+_NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
+
+# How long to wait for a running collector to release queue.json.lock (it
+# only holds it for a read + write of queue.json, never during a send)
+QUEUE_LOCK_WAIT_SECONDS = 120
 
 
 def vprint(msg: str):
@@ -73,191 +106,355 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# Platform detection
-# ---------------------------------------------------------------------------
-
-def is_windows_path(path: str) -> bool:
-    """Heuristic: Windows paths contain a drive letter or .exe extension."""
-    p = path.strip()
-    return (
-        p.lower().endswith('.exe') or
-        (len(p) >= 2 and p[1] == ':') or
-        '\\' in p
-    )
-
-
-# ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
 
-def ssh_connect(ip: str, username: str, password: str, timeout: int):
-    """Open an SSH connection. Uses key auth if password is blank."""
-    auth = 'password' if password else 'key/agent'
-    vprint(f"Connecting as '{username}' (auth: {auth}, timeout: {timeout}s)")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=ip, username=username, timeout=timeout)
-    if password:
-        kwargs['password'] = password
-    else:
-        kwargs['look_for_keys'] = True
-        kwargs['allow_agent'] = True
-    client.connect(**kwargs)
-    vprint(f"Connected")
-    return client
-
-
-def run_remote(client, command: str, timeout: int) -> tuple:
+def run_remote(client, command: str, timeout: float) -> tuple:
     """Run a command remotely. Returns (stdout, stderr, exit_code)."""
-    vprint(f"→ {command}")
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    exit_code = stdout.channel.recv_exit_status()
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
-    vprint(f"← exit {exit_code}")
-    if out:
-        vprint(f"  out: {out[:300]}{'...' if len(out) > 300 else ''}")
-    if err:
-        vprint(f"  err: {err[:300]}{'...' if len(err) > 300 else ''}")
-    return out, err, exit_code
+    return _ssh.exec_command(client, command, timeout=timeout, log=vprint)
 
 
 # ---------------------------------------------------------------------------
 # Config management
 # ---------------------------------------------------------------------------
 
-def get_config(client, git_path: str, python_path: str, timeout: int) -> tuple:
+def get_config(client, git_path: str, python_path: str, timeout: float) -> tuple:
     """
     Fetch collector config via config_tool.py.
     Returns (config_dict, None) on success, (None, error_str) on failure.
     """
     # Normalize Windows paths
-    if is_windows_path(git_path):
+    if is_windows_path(git_path) or is_windows_path(python_path):
         git_path = git_path.replace('\\', '/')
-    
+        python_path = python_path.replace('\\', '/')
+
     config_tool_path = f"{git_path}/collector/config_tool.py"
     config_path = f"{git_path}/collector/local/config.json"
     vprint(f"Reading config from {config_path}")
     command = f'"{python_path}" "{config_tool_path}" --config "{config_path}" list --json'
-    
+
     out, err, code = run_remote(client, command, timeout)
-    
+
     if code != 0:
-        return None, f"config_tool.py failed (exit {code}): {err}"
-    
+        return None, f"config_tool.py failed (exit {code}): {err or out}"
+
     try:
         response = json.loads(out)
-        # config_tool.py returns {"status": "ok", "config": {...}}
-        if isinstance(response, dict) and 'config' in response:
-            return response['config'], None
-        # Fallback: if it's a plain config dict (shouldn't happen, but be safe)
-        return response, None
     except json.JSONDecodeError as e:
         return None, f"Invalid JSON from config_tool: {e}"
+    # config_tool.py returns {"status": "ok", "config": {...}}
+    if isinstance(response, dict) and response.get('status') == 'ok' \
+            and isinstance(response.get('config'), dict):
+        return response['config'], None
+    error = response.get('error', 'unexpected response') if isinstance(response, dict) else 'unexpected response'
+    return None, f"config_tool error: {error}"
 
 
 # ---------------------------------------------------------------------------
 # Archive logic
 # ---------------------------------------------------------------------------
 
-def archive_collector(client, git_path: str, config: dict, timeout: int) -> tuple:
+def _is_absolute(path: str, windows: bool) -> bool:
+    if windows:
+        return bool(re.match(r'^[A-Za-z]:[\\/]', path)) or path.startswith('\\\\')
+    return path.startswith('/')
+
+
+def _unix_queue_step(backup: str) -> str:
     """
-    Archive all YYYY-MM.jsonl files and optionally queue.json on a remote collector.
-    
-    Returns:
-        (success: bool, message: str, backup_dir: str, files_moved: int)
+    POSIX sh step: move queue.json and queue.corrupt-*.json into backup
+    (already shell-quoted) while holding the collector's queue lock.
+
+    The collector locks queue.json.lock with flock(2) (Python fcntl.flock);
+    the flock command takes the same lock on fd 9.  `flock -n` in a retry
+    loop works with both util-linux and BusyBox flock (BusyBox has no -w).
+    flock is first tried on /dev/null, so a flock that can't work at all (a
+    BusyBox built without the applet) means "no lock" rather than two
+    minutes of retries.  Prints QUEUE_LOCK:, QUEUE: and QUEUE_CORRUPT: lines.
     """
-    name = config.get('name')
-    data_dir = config.get('data_dir')
-    
-    if not name or not data_dir:
-        return False, "Missing 'name' or 'data_dir' in config", "", 0
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_folder = f'backup_{timestamp}'
-    
-    # Determine OS (Windows paths contain : or \, Unix paths don't)
-    is_windows = ':' in data_dir or '\\' in data_dir
-    
-    if is_windows:
-        # Windows path
-        system_dir = f'{data_dir}\\{name}'
+    move = (f'q=none; c=0; '
+            f'if [ -e queue.json ]; then mv queue.json {backup}/ || exit 1; q=moved; fi; '
+            f'for f in queue.corrupt-*.json; do '
+            f'if [ -e "$f" ]; then mv "$f" {backup}/ || exit 1; c=$((c+1)); fi; done; '
+            f'echo "QUEUE: $q"; echo "QUEUE_CORRUPT: $c"')
+    wait = QUEUE_LOCK_WAIT_SECONDS
+    # One { ...; } group, so it is a single link of the && chain
+    return (
+        '{ fl=; if command -v flock >/dev/null 2>&1; then '
+        'if ( flock -n 8 ) 8</dev/null >/dev/null 2>&1; then fl=1; fi; fi; '
+        'if [ -e queue.json.lock ]; then '
+        'if [ -n "$fl" ]; then '
+        f'( n=0; until flock -n 9; do n=$((n+1)); if [ $n -ge {wait} ]; then '
+        f'echo "ERROR: queue.json.lock is held by a running collector (waited {wait}s); '
+        f'nothing in the queue was moved" >&2; exit 75; fi; sleep 1; done; '
+        f'echo "QUEUE_LOCK: held"; {move} ) 9<queue.json.lock; '
+        'else '
+        f'echo "QUEUE_LOCK: unavailable (no working flock command)"; {move}; '
+        'fi; '
+        'else '
+        f'echo "QUEUE_LOCK: none (collector predates queue locking)"; {move}; '
+        'fi; }'
+    )
+
+
+def build_unix_command(system_dir: str, backup_folder: str, include_queue: bool) -> str:
+    """
+    Shell command (Synology/Linux) that moves the archives (and optionally
+    queue.json and queue.corrupt-*.json, under the collector's queue lock)
+    into backup_folder inside system_dir.
+
+    Steps are chained with && so a failed cd/mkdir/mv aborts the rest and
+    gives a non-zero exit status; paths are shell-quoted.
+    """
+    backup = shlex.quote(backup_folder)
+    steps = [
+        f'cd {shlex.quote(system_dir)}',
+        f'mkdir -p {backup}',
+        'count=0',
+        ('for f in [0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl; do '
+         f'if [ -e "$f" ]; then mv "$f" {backup}/ || exit 1; count=$((count+1)); fi; '
+         'done'),
+        'echo "MOVED: $count"',
+    ]
+    if include_queue:
+        steps.append(_unix_queue_step(backup))
+    return ' && '.join(steps)
+
+
+def build_windows_script(system_dir: str, backup_folder: str, include_queue: bool) -> str:
+    """PowerShell 5.1 script equivalent of build_unix_command (stops on the first error)."""
+    q = _ssh.ps_quote
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "try {",
+        f"    Set-Location -LiteralPath {q(system_dir)}",
+        f"    $backup = Join-Path (Get-Location).Path {q(backup_folder)}",
+        "    if (-not (Test-Path -LiteralPath $backup)) { New-Item -ItemType Directory -Path $backup | Out-Null }",
+        "    $count = 0",
+        "    foreach ($f in @(Get-ChildItem -LiteralPath . -File | Where-Object { $_.Name -match '^\\d{4}-\\d{2}\\.jsonl$' })) {",
+        "        Move-Item -LiteralPath $f.FullName -Destination (Join-Path $backup $f.Name)",
+        "        $count++",
+        "    }",
+        "    Write-Output \"MOVED: $count\"",
+    ]
+    if include_queue:
+        # Best effort: the collector locks byte 0 of queue.json.lock with
+        # msvcrt.locking (LockFile); FileStream.Lock takes the same lock.
+        lines += [
+            "    $lockPath = Join-Path (Get-Location).Path 'queue.json.lock'",
+            "    $lock = $null",
+            "    if (Test-Path -LiteralPath $lockPath) {",
+            f"        $deadline = (Get-Date).AddSeconds({QUEUE_LOCK_WAIT_SECONDS})",
+            "        while ($true) {",
+            "            try {",
+            "                $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)",
+            "                $lock.Lock(0, 1)",
+            "                break",
+            "            } catch {",
+            "                if ($lock) { $lock.Close(); $lock = $null }",
+            f"                if ((Get-Date) -gt $deadline) {{ throw 'queue.json.lock is held by a running collector (waited {QUEUE_LOCK_WAIT_SECONDS}s); nothing in the queue was moved' }}",
+            "                Start-Sleep -Milliseconds 500",
+            "            }",
+            "        }",
+            "        Write-Output 'QUEUE_LOCK: held'",
+            "    } else {",
+            "        Write-Output 'QUEUE_LOCK: none (collector predates queue locking)'",
+            "    }",
+            "    try {",
+            "        $q = 'none'",
+            "        if (Test-Path -LiteralPath 'queue.json') {",
+            "            Move-Item -LiteralPath 'queue.json' -Destination (Join-Path $backup 'queue.json')",
+            "            $q = 'moved'",
+            "        }",
+            "        $c = 0",
+            "        foreach ($f in @(Get-ChildItem -LiteralPath . -File | Where-Object { $_.Name -match '^queue\\.corrupt-.*\\.json$' })) {",
+            "            Move-Item -LiteralPath $f.FullName -Destination (Join-Path $backup $f.Name)",
+            "            $c++",
+            "        }",
+            "        Write-Output \"QUEUE: $q\"",
+            "        Write-Output \"QUEUE_CORRUPT: $c\"",
+            "    } finally {",
+            "        if ($lock) {",
+            "            try { $lock.Unlock(0, 1) } catch { }",
+            "            $lock.Close()",
+            "        }",
+            "    }",
+        ]
+    lines += [
+        "    exit 0",
+        "} catch {",
+        "    [Console]::Error.WriteLine('ERROR: ' + $_.Exception.Message)",
+        "    exit 1",
+        "}",
+    ]
+    return '\n'.join(lines)
+
+
+def build_archive_command(name: str, data_dir: str, backup_folder: str,
+                          include_queue: bool, windows: bool) -> tuple:
+    """Returns (command, backup_dir) for one collector."""
+    if windows:
+        system_dir = data_dir.rstrip('\\/') + '\\' + name
         backup_dir = f'{system_dir}\\{backup_folder}'
-        # PowerShell commands for Windows - must be wrapped in powershell.exe for SSH compatibility
-        ps_commands = [
-            f'cd "{system_dir}"',
-            f'if (!(Test-Path "{backup_folder}")) {{ mkdir "{backup_folder}" | Out-Null }}',
-            f'$count = 0',
-            f'Get-Item "????-??.jsonl" -ErrorAction SilentlyContinue | ForEach-Object {{ Move-Item $_.FullName "{backup_dir}\\$($_.Name)"; $count += 1 }}',
-            f'Write-Output "MOVED: $count"'
-        ]
-        ps_script = ' ; '.join(ps_commands)
-        command = f'powershell -Command "{ps_script}"'
+        command = _ssh.powershell_command(build_windows_script(system_dir, backup_folder, include_queue))
     else:
-        # Unix path (Synology/Linux)
-        system_dir = f'{data_dir}/{name}'
+        system_dir = f"{data_dir.rstrip('/')}/{name}"
         backup_dir = f'{system_dir}/{backup_folder}'
-        # Bash commands for Unix
-        commands = [
-            f'cd "{system_dir}"',
-            f'mkdir -p "{backup_folder}"',
-            f'count=$(ls -1 ????-??.jsonl 2>/dev/null | wc -l)',
-            f'ls -1 ????-??.jsonl 2>/dev/null | while read f; do mv "$f" "{backup_folder}/$f"; done',
-            f'echo "MOVED: $count"'
-        ]
-        command = ' ; '.join(commands)
-    
-    if _dry_run:
-        vprint(f"[DRY-RUN] Would execute: {command}")
-        return True, "[DRY-RUN] Archives would be moved", backup_dir, 0
-    
-    vprint(f"Creating backup folder: {backup_folder}")
-    out, err, code = run_remote(client, command, timeout)
-    
-    if code != 0:
-        return False, f"Archive command failed (exit {code}): {err}", backup_dir, 0
-    
-    # Extract file count from output
-    try:
-        for line in out.split('\n'):
-            if 'MOVED:' in line:
-                count = int(line.split(':')[1].strip())
-                return True, f"Moved {count} archive file(s) to {backup_folder}", backup_dir, count
-    except (ValueError, IndexError):
-        pass
-    
-    return True, f"Archive completed (see backup: {backup_folder})", backup_dir, 0
+        command = build_unix_command(system_dir, backup_folder, include_queue)
+    return command, backup_dir
 
 
-def archive_queue_if_requested(client, git_path: str, config: dict, timeout: int) -> tuple:
+def parse_archive_output(out: str, include_queue: bool) -> tuple:
     """
-    Optionally delete queue.json to force fresh sync.
-    Returns (success: bool, message: str)
+    Parse the MOVED:/QUEUE: lines. Returns (files_moved, queue_state, error);
+    error is set when the expected lines are missing.
     """
-    name = config.get('name')
-    data_dir = config.get('data_dir')
-    
+    moved = None
+    queue_state = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('MOVED:'):
+            try:
+                moved = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith('QUEUE:'):
+            queue_state = line.split(':', 1)[1].strip()
+    if moved is None:
+        return 0, queue_state, f"could not confirm the move (unexpected output: {out[:200]!r})"
+    if include_queue and queue_state not in ('moved', 'none'):
+        return moved, queue_state, f"queue.json state unknown (output: {out[:200]!r})"
+    return moved, queue_state, None
+
+
+def parse_queue_details(out: str) -> tuple:
+    """(corrupt files moved, lock state) from the QUEUE_CORRUPT:/QUEUE_LOCK: lines."""
+    corrupt, lock = 0, None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('QUEUE_CORRUPT:'):
+            try:
+                corrupt = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith('QUEUE_LOCK:'):
+            lock = line.split(':', 1)[1].strip()
+    return corrupt, lock
+
+
+def archive_collector(client, git_path: str, config: dict, timeout: float,
+                      include_queue: bool = False, dry_run: bool = False,
+                      python_path: str = '') -> dict:
+    """
+    Move all YYYY-MM.jsonl files (and optionally queue.json) into a new
+    backup folder on a remote collector.
+
+    Returns {'ok', 'message', 'backup_dir', 'moved', 'queue'}.
+    """
+    name = str(config.get('name') or '').strip()
+    data_dir = str(config.get('data_dir') or '').strip()
+    result = {'ok': False, 'message': '', 'backup_dir': '', 'moved': 0, 'queue': None}
+
     if not name or not data_dir:
-        return False, "Missing 'name' or 'data_dir'"
-    
-    is_windows = ':' in data_dir or '\\' in data_dir
-    
-    if is_windows:
-        queue_path = f'{data_dir}\\{name}\\queue.json'
-        ps_script = f'if (Test-Path "{queue_path}") {{ Remove-Item "{queue_path}"; Write-Output "queue.json deleted" }} else {{ Write-Output "queue.json not found" }}'
-        command = f'powershell -Command "{ps_script}"'
-    else:
-        queue_path = f'{data_dir}/{name}/queue.json'
-        command = f'rm -f "{queue_path}" && echo "queue.json deleted" || echo "queue.json not found"'
-    
-    if _dry_run:
-        vprint(f"[DRY-RUN] Would delete queue: {queue_path}")
-        return True, "[DRY-RUN] queue.json would be deleted"
-    
-    vprint(f"Deleting queue: {queue_path}")
+        result['message'] = "Missing 'name' or 'data_dir' in config"
+        return result
+    if not _NAME_RE.match(name):
+        result['message'] = f"Refusing unusual system name {name!r} (allowed: letters, digits, _ . -)"
+        return result
+
+    windows = is_windows_path(data_dir) or is_windows_path(git_path) or is_windows_path(python_path)
+    if not _is_absolute(data_dir, windows):
+        result['message'] = (f"data_dir {data_dir!r} is not an absolute path; set an absolute "
+                             f"data_dir in the collector config so the archives can be located")
+        return result
+
+    backup_folder = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    command, backup_dir = build_archive_command(name, data_dir, backup_folder, include_queue, windows)
+    result['backup_dir'] = backup_dir
+
+    what = 'Archives' + (' and queue.json' if include_queue else '')
+    if dry_run:
+        vprint(f"[DRY-RUN] Would execute: {command}")
+        result['ok'] = True
+        result['message'] = f"[DRY-RUN] {what} would be moved to {backup_folder}"
+        return result
+
+    vprint(f"Creating backup folder: {backup_dir}")
     out, err, code = run_remote(client, command, timeout)
-    
-    return code == 0, out.strip() if out else err.strip()
+    if code != 0:
+        result['message'] = f"Archive command failed (exit {code}): {err or out}"
+        return result
+
+    moved, queue_state, error = parse_archive_output(out, include_queue)
+    result['moved'] = moved
+    result['queue'] = queue_state
+    if error:
+        result['message'] = error
+        return result
+
+    msg = f"Moved {moved} archive file(s) to {backup_folder}"
+    if include_queue:
+        msg += '; queue.json moved too' if queue_state == 'moved' else '; no queue.json present'
+        corrupt, lock = parse_queue_details(out)
+        if corrupt:
+            msg += f'; {corrupt} queue.corrupt-*.json file(s) moved too'
+        if lock and lock != 'held':
+            msg += f' (WARNING: moved without the queue lock: {lock})'
+    result['ok'] = True
+    result['message'] = msg
+    return result
+
+
+def archive_host(row: dict, timeout: int, command_timeout: float,
+                 include_queue: bool, dry_run: bool) -> dict:
+    """SSH into one collector, read its config and archive. Returns a result dict."""
+    ip = _ssh.row_value(row, 'ip')
+    git_path = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path', 'python3')
+    result = {'ip': ip, 'ok': False, 'name': '?', 'message': '', 'backup_dir': ''}
+
+    if not all([ip, _ssh.row_value(row, 'username'), git_path]):
+        result['message'] = "[SKIP] Missing required fields (ip, username, git_path)"
+        return result
+
+    try:
+        client = _ssh.connect_row(row, timeout=timeout, log=vprint)
+        try:
+            config, err = get_config(client, git_path, python_path, command_timeout)
+            if err:
+                result['message'] = f"Config error: {err}"
+                return result
+            result['name'] = config.get('name', '?')
+            outcome = archive_collector(client, git_path, config, command_timeout,
+                                        include_queue=include_queue, dry_run=dry_run,
+                                        python_path=python_path)
+            result.update(ok=outcome['ok'], message=outcome['message'],
+                          backup_dir=outcome['backup_dir'])
+        finally:
+            client.close()
+    except _ssh.RemoteCommandTimeout as e:
+        result['message'] = f"{e} (see --command-timeout)"
+    except paramiko.AuthenticationException as e:
+        result['message'] = f"Auth failed: {e}"
+    except paramiko.SSHException as e:
+        result['message'] = f"SSH error: {e}"
+    except Exception as e:
+        result['message'] = str(e) or type(e).__name__
+    return result
+
+
+def confirm(count: int, include_queue: bool, input_fn=None) -> bool:
+    """Ask the operator to type CONFIRM_WORD. Returns True only on an exact match."""
+    input_fn = input_fn or input
+    what = 'archive files' + (' and queue.json' if include_queue else '')
+    prompt = (f"Move {what} into backup folders on {count} collector(s)?\n"
+              f"Type {CONFIRM_WORD} to continue, or anything else to cancel: ")
+    try:
+        answer = input_fn(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer == CONFIRM_WORD
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +463,9 @@ def archive_queue_if_requested(client, git_path: str, config: dict, timeout: int
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Archive all collectors — move YYYY-MM.jsonl files to backup folders'
+        description='Archive all collectors — move YYYY-MM.jsonl files to backup folders',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
     )
     parser.add_argument(
         '--csv',
@@ -277,7 +476,14 @@ def main():
         '--timeout',
         type=int,
         default=60,
-        help='SSH timeout in seconds (default: 60)'
+        help='SSH connect timeout in seconds (default: 60)'
+    )
+    parser.add_argument(
+        '--command-timeout',
+        type=int,
+        default=300,
+        metavar='SECONDS',
+        help='Limit for each remote command; 0 = no limit (default: 300)'
     )
     parser.add_argument(
         '--dry-run',
@@ -285,9 +491,26 @@ def main():
         help='Preview commands without executing'
     )
     parser.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        help=f'Do not ask for the typed {CONFIRM_WORD} confirmation'
+    )
+    parser.add_argument(
+        '--also-archive-queues',
+        action='store_true',
+        help='Also move queue.json into the backup folder (pending messages are not sent)'
+    )
+    parser.add_argument(
         '--also-delete-queues',
         action='store_true',
-        help='Also delete queue.json on each collector (forces fresh sync)'
+        help='Deprecated alias of --also-archive-queues (queue.json is moved, not deleted)'
+    )
+    parser.add_argument(
+        '--parallel',
+        type=_ssh.positive_int,
+        default=1,
+        metavar='N',
+        help='Archive up to N collectors at once (default: 1 = one at a time)'
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -296,14 +519,15 @@ def main():
     )
     args = parser.parse_args()
 
-    global _verbose, _dry_run
+    global _verbose
     _verbose = args.verbose
-    _dry_run = args.dry_run
 
-    # Check paramiko
-    if paramiko is None:
-        print("ERROR: paramiko is required. Install with: pip install paramiko")
-        sys.exit(1)
+    _ssh.require_paramiko()
+
+    include_queue = args.also_archive_queues or args.also_delete_queues
+    if args.also_delete_queues:
+        print("NOTE: --also-delete-queues is deprecated; queue.json is now MOVED into the "
+              "backup folder (use --also-archive-queues).")
 
     # Load CSV
     csv_path = Path(args.csv)
@@ -312,9 +536,7 @@ def main():
         sys.exit(1)
 
     try:
-        with open(csv_path, 'r') as f:
-            readers = csv.DictReader(f)
-            collectors = list(readers)
+        collectors, _fieldnames = _ssh.read_inventory(csv_path)
     except Exception as e:
         print(f"ERROR: Failed to read CSV: {e}")
         sys.exit(1)
@@ -328,98 +550,61 @@ def main():
     print("Lab Monitor - Archive All Collectors")
     print("=" * 70)
     print()
-    if _dry_run:
+    if args.dry_run:
         print("[DRY-RUN MODE] - No changes will be made")
         print()
-    
+
     print(f"Collectors: {len(collectors)}")
-    print(f"Timeout: {args.timeout}s")
-    print(f"Also delete queues: {args.also_delete_queues}")
+    print(f"Timeout: {args.timeout}s connect, "
+          f"{f'{args.command_timeout}s' if args.command_timeout else 'no limit'} per command")
+    print(f"Also archive queues: {include_queue}")
+    print(f"Parallel: {args.parallel}")
     print()
 
-    # Process each collector
-    results = []
-    for i, collector in enumerate(collectors, 1):
-        ip = collector.get('ip')
-        username = collector.get('username')
-        password = collector.get('password', '')
-        git_path = collector.get('git_path')
+    if not args.dry_run and not args.yes:
+        if not confirm(len(collectors), include_queue):
+            print("Aborted — nothing was changed.")
+            sys.exit(1)
+        print()
 
-        if not all([ip, username, git_path]):
-            print(f"[{i}/{len(collectors)}] {ip} ... [SKIP] Missing required fields")
-            results.append((ip, False, "Missing fields", ""))
-            continue
+    def worker(row):
+        return archive_host(row, args.timeout, args.command_timeout, include_queue, args.dry_run)
 
-        print(f"[{i}/{len(collectors)}] {ip} ", end='', flush=True)
-        
-        try:
-            # Connect
-            client = ssh_connect(ip, username, password, args.timeout)
-            vprint(f"Connected to {ip}")
+    def on_start(i, row):
+        print(f"[{i}/{len(collectors)}] {_ssh.row_value(row, 'ip')} ", end='', flush=True)
 
-            # Get config
-            python_path = collector.get('python_path', 'python3')
-            config, err = get_config(client, git_path, python_path, args.timeout)
-            if err:
-                print(f"[ERROR] {err}")
-                results.append((ip, False, f"Config error: {err}", ""))
-                client.close()
-                continue
+    def on_done(i, row, r):
+        if r['ok']:
+            print(f"[OK] {r['name']}: {r['message']}")
+        else:
+            print(f"[FAILED] {r['message']}")
 
-            collector_name = config.get('name', '?')
-
-            # Archive
-            success, msg, backup_dir, count = archive_collector(
-                client, git_path, config, args.timeout
-            )
-            if not success:
-                print(f"[ERROR] {msg}")
-                results.append((ip, False, msg, ""))
-                client.close()
-                continue
-
-            # Optionally delete queue
-            if args.also_delete_queues:
-                q_success, q_msg = archive_queue_if_requested(client, git_path, config, args.timeout)
-                if not q_success:
-                    vprint(f"Queue deletion warning: {q_msg}")
-
-            print(f"[OK] {collector_name}: {msg}")
-            results.append((ip, True, msg, backup_dir))
-            client.close()
-
-        except paramiko.AuthenticationException as e:
-            print(f"[AUTH ERROR] {e}")
-            results.append((ip, False, f"Auth failed: {e}", ""))
-        except paramiko.SSHException as e:
-            print(f"[SSH ERROR] {e}")
-            results.append((ip, False, f"SSH error: {e}", ""))
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            results.append((ip, False, str(e), ""))
+    results = _ssh.run_hosts(collectors, worker, parallel=args.parallel,
+                             on_start=on_start, on_done=on_done)
 
     # Summary
     print()
     print("=" * 70)
-    success_count = sum(1 for _, ok, _, _ in results if ok)
-    print(f"Summary: {success_count}/{len(collectors)} collectors archived successfully")
+    success_count = sum(1 for r in results if r['ok'])
+    verb = 'checked (dry-run)' if args.dry_run else 'archived successfully'
+    print(f"Summary: {success_count}/{len(collectors)} collectors {verb}")
     print("=" * 70)
     print()
 
     # Show successful backups
     if success_count > 0:
-        print("Backup locations:")
-        for ip, ok, msg, backup_dir in results:
-            if ok and backup_dir:
-                print(f"  {ip:30} → {backup_dir}")
+        print("Backup locations:" if not args.dry_run else "Backup locations (would be):")
+        for r in results:
+            if r['ok'] and r['backup_dir']:
+                print(f"  {r['ip']:30} → {r['backup_dir']}")
         print()
 
     # Show failures
-    failures = [(ip, msg) for ip, ok, msg, _ in results if not ok]
+    failures = [r for r in results if not r['ok']]
     if failures:
         print("Failures:")
-        for ip, msg in failures:
-            print(f"  {ip:30} {msg}")
+        for r in failures:
+            print(f"  {r['ip']:30} {r['message']}")
         print()
 
     # Exit code

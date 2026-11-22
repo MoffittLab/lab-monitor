@@ -6,15 +6,16 @@ Trigger collection events on remote collectors by SSHing in and running
 the collector script in disk or metrics mode.
 
 CSV format (one header row required):
-    ip,username,password,git_path,python_path
+    ip,username,password,git_path,python_path[,key_filename][,port]
     192.168.1.42,jeff,secret123,/volume1/lab-monitor/scripts/lab-monitor,/volume1/miniconda/envs/lab-monitor/bin/python
     atlantis.med.harvard.edu,admin,secret789,E:/Users/lab-monitor/scripts/lab-monitor,C:/ProgramData/Miniconda3/envs/lab-monitor/python.exe
 
 Usage:
-    python3 run_collectors.py --mode disk              # run disk collection on all
-    python3 run_collectors.py --mode metrics           # run metrics collection on all
-    python3 run_collectors.py --mode disk --dry-run    # preview commands
-    python3 run_collectors.py --mode disk --timeout 60 # custom SSH timeout
+    python3 run_collectors.py --csv collectors.csv --mode disk              # run disk collection on all
+    python3 run_collectors.py --csv collectors.csv --mode metrics           # run metrics collection on all
+    python3 run_collectors.py --csv collectors.csv --mode disk --dry-run    # preview commands
+    python3 run_collectors.py --csv collectors.csv --mode disk --timeout 60 # custom SSH connect timeout
+    python3 run_collectors.py --csv collectors.csv --mode metrics --parallel 4
 
 Requirements:
     pip install paramiko
@@ -23,18 +24,18 @@ Note:
     - Keep collectors.csv out of version control
     - python_path can be absolute or relative to the git_path directory
     - Collection output is captured and displayed per system
+    - SSH host keys are trusted on first use and pinned in tools/.known_hosts
+      (see _ssh.py); a changed host key is refused
+    - Exit code: 0 all OK, 1 bad arguments/CSV, 2 one or more systems failed
 """
 
 import argparse
-import csv
 import sys
 import time
 from pathlib import Path
 
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
+import _ssh
+from _ssh import is_windows_path
 
 
 # ---------------------------------------------------------------------------
@@ -50,71 +51,27 @@ def vprint(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# Platform detection
-# ---------------------------------------------------------------------------
-
-def is_windows_path(path: str) -> bool:
-    """Heuristic: Windows paths contain a drive letter or .exe extension."""
-    p = path.strip()
-    return (
-        p.lower().endswith('.exe') or
-        (len(p) >= 2 and p[1] == ':') or
-        '\\' in p
-    )
-
-
-# ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-
-def ssh_connect(ip: str, username: str, password: str, timeout: int):
-    """Open an SSH connection. Uses key auth if password is blank."""
-    auth = 'password' if password else 'key/agent'
-    vprint(f"Connecting to {ip} as '{username}' (auth: {auth}, timeout: {timeout}s)")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs = dict(hostname=ip, username=username, timeout=timeout)
-    if password:
-        kwargs['password'] = password
-    else:
-        kwargs['look_for_keys'] = True
-        kwargs['allow_agent'] = True
-    client.connect(**kwargs)
-    vprint(f"Connected to {ip}")
-    return client
-
-
-def run_remote(client, command: str, timeout: int) -> tuple:
-    """Run a command remotely. Returns (stdout, stderr, exit_code)."""
-    vprint(f"→ {command}")
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    exit_code = stdout.channel.recv_exit_status()
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
-    vprint(f"← exit {exit_code}")
-    if out: vprint(f"  stdout: {out[:500]}{'...' if len(out) > 500 else ''}")
-    if err: vprint(f"  stderr: {err[:500]}{'...' if len(err) > 500 else ''}")
-    return out, err, exit_code
-
-
-# ---------------------------------------------------------------------------
 # Collection execution
 # ---------------------------------------------------------------------------
 
-def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
+# Default limits for the remote collector run (seconds; 0 = no limit).
+# A disk scan can legitimately take hours (collector timeout_seconds applies
+# per folder), so disk mode waits indefinitely unless --command-timeout is set.
+DEFAULT_COMMAND_TIMEOUT = {'metrics': 600, 'disk': 0}
+
+
+def run_collection(row: dict, mode: str, dry_run: bool, timeout: int,
+                   command_timeout: float = None) -> dict:
     """
     SSH into one collector and run the collector script in the specified mode.
     Returns result dict with status, output, error, and timing.
+
+    timeout bounds the SSH connect; command_timeout (None/0 = no limit)
+    bounds the remote collector run.
     """
-    ip = row['ip'].strip()
-    username = row['username'].strip()
-    password = row.get('password', '').strip()
-    git_path = row['git_path'].strip()
-    python_path = row['python_path'].strip()
+    ip = _ssh.row_value(row, 'ip')
+    git_path = _ssh.row_value(row, 'git_path')
+    python_path = _ssh.row_value(row, 'python_path')
 
     result = {
         'ip': ip,
@@ -146,9 +103,10 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
     try:
         vprint(f"--- {ip} ---")
         vprint(f"Mode: {mode} | python: {python_path}")
-        client = ssh_connect(ip, username, password, timeout)
+        client = _ssh.connect_row(row, timeout=timeout, log=vprint)
         try:
-            stdout, stderr, exit_code = run_remote(client, command, timeout)
+            stdout, stderr, exit_code = _ssh.exec_command(
+                client, command, timeout=command_timeout, log=vprint)
             result['elapsed'] = time.time() - start
 
             if exit_code == 0:
@@ -162,12 +120,39 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
         finally:
             client.close()
 
+    except _ssh.RemoteCommandTimeout as e:
+        result['elapsed'] = time.time() - start
+        result['status'] = 'failed'
+        result['output'] = e.stdout
+        result['error'] = f'{e} (raise --command-timeout if the collector needs longer)'
     except Exception as e:
         result['elapsed'] = time.time() - start
         result['status'] = 'failed'
-        result['error'] = str(e)
+        result['error'] = str(e) or type(e).__name__
 
     return result
+
+
+def print_result(result: dict):
+    """Print one system's outcome (the '[i/n] ip ... ' prefix is already printed)."""
+    if result['status'] == 'ok':
+        print(f"[OK] ({result['elapsed']:.1f}s)")
+        if result['output']:
+            lines = result['output'].splitlines()
+            for line in lines[:10]:  # Show first 10 lines
+                print(f"       {line}")
+            if len(lines) > 10:
+                print(f"       ... ({len(lines) - 10} more lines)")
+    elif result['status'] == 'dry-run':
+        print(f"[DRY-RUN]")
+        print(f"       {result['output']}")
+    else:
+        print(f"[FAILED]")
+        if result['output']:
+            print(f"       stdout: {result['output'][:200]}")
+        if result['error']:
+            print(f"       error:  {result['error'][:200]}")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +160,7 @@ def run_collection(row: dict, mode: str, dry_run: bool, timeout: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    if paramiko is None:
-        print("ERROR: paramiko is required. Install with: pip install paramiko")
-        sys.exit(1)
+    _ssh.require_paramiko()
 
     parser = argparse.ArgumentParser(
         description='Run collection events on remote collectors',
@@ -191,7 +174,12 @@ def main():
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview commands without running')
     parser.add_argument('--timeout', type=int, default=60,
-                        help='SSH timeout in seconds (default: 60)')
+                        help='SSH connect timeout in seconds (default: 60)')
+    parser.add_argument('--command-timeout', type=int, default=None, metavar='SECONDS',
+                        help='Limit for the remote collector run; 0 = no limit '
+                             '(default: 600 for metrics, no limit for disk)')
+    parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
+                        help='Run up to N systems at once (default: 1 = one at a time)')
     parser.add_argument('--verbose', action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -199,56 +187,45 @@ def main():
     global _verbose
     _verbose = args.verbose
 
+    command_timeout = args.command_timeout
+    if command_timeout is None:
+        command_timeout = DEFAULT_COMMAND_TIMEOUT[args.mode]
+
     csv_path = Path(args.csv)
     if not csv_path.exists():
         print(f"ERROR: CSV file not found: {csv_path}")
         sys.exit(1)
 
     # Read CSV
-    with open(csv_path, newline='') as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    rows, fieldnames = _ssh.read_inventory(csv_path)
 
     if not rows:
         print("ERROR: CSV file is empty or has no data rows")
         sys.exit(1)
 
     required = {'ip', 'username', 'git_path', 'python_path'}
-    missing = required - set(reader.fieldnames or [])
+    missing = required - set(fieldnames)
     if missing:
-        print(f"ERROR: CSV missing required columns: {', '.join(missing)}")
+        print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
+    limit = f"{command_timeout}s" if command_timeout else "none"
     print("=" * 70)
     print(f"Lab Monitor - Run Collectors ({args.mode.upper()})")
-    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Dry-run: {args.dry_run}")
+    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Command limit: {limit}  |  "
+          f"Parallel: {args.parallel}  |  Dry-run: {args.dry_run}")
     print("=" * 70)
     print()
 
-    results = []
-    for i, row in enumerate(rows, 1):
-        ip = row['ip'].strip()
-        print(f"[{i}/{len(rows)}] {ip} ... ", end='', flush=True)
-        result = run_collection(row, mode=args.mode, dry_run=args.dry_run, timeout=args.timeout)
-        results.append(result)
+    def worker(row):
+        return run_collection(row, mode=args.mode, dry_run=args.dry_run,
+                              timeout=args.timeout, command_timeout=command_timeout)
 
-        if result['status'] == 'ok':
-            print(f"[OK] ({result['elapsed']:.1f}s)")
-            if result['output']:
-                for line in result['output'].splitlines()[:10]:  # Show first 10 lines
-                    print(f"       {line}")
-                if result['output'].count('\n') > 10:
-                    print(f"       ... ({result['output'].count(chr(10)) - 10} more lines)")
-        elif result['status'] == 'dry-run':
-            print(f"[DRY-RUN]")
-            print(f"       {result['output']}")
-        else:
-            print(f"[FAILED]")
-            if result['output']:
-                print(f"       stdout: {result['output'][:200]}")
-            if result['error']:
-                print(f"       error:  {result['error'][:200]}")
-        print()
+    def on_start(i, row):
+        print(f"[{i}/{len(rows)}] {_ssh.row_value(row, 'ip')} ... ", end='', flush=True)
+
+    results = _ssh.run_hosts(rows, worker, parallel=args.parallel,
+                             on_start=on_start, on_done=lambda i, row, r: print_result(r))
 
     # Summary
     ok = [r for r in results if r['status'] == 'ok']
@@ -269,6 +246,8 @@ def main():
             for r in failed:
                 print(f"    {r['ip']} — {r['error']}")
     print()
+
+    sys.exit(2 if failed else 0)
 
 
 if __name__ == '__main__':

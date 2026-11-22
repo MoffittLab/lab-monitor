@@ -1,1 +1,0 @@
-# Lab Monitor - Shared utilities

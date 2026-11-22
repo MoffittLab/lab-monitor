@@ -1,2 +1,9 @@
-requests==2.31.0
-psutil==5.9.6
+# Lab Monitor collector dependencies — installed by install-collector-synology.sh
+# and install-collector-windows.ps1. (The repo-root requirements.txt is for the
+# Manager, Dashboard and tools.)
+requests==2.32.3
+# psutil is optional at runtime: without it the collector reads /proc on
+# Linux/Synology (the Synology installer installs it best-effort, since armv7l
+# has no wheel and no compiler).
+psutil==5.9.8
+# Optional NVIDIA GPU stats: see requirements-gpu.txt

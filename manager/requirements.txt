@@ -1,2 +1,6 @@
+# Manager-only dependencies (the repo-root requirements.txt is what the
+# installer uses; it includes these plus the Dashboard and tools packages).
 Flask==2.3.3
+Werkzeug==3.1.9
 Flask-CORS==4.0.0
+waitress==3.0.2

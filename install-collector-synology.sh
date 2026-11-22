@@ -19,8 +19,8 @@
 # 2. Clones or updates lab-monitor repository
 # 3. Sets up Python virtual environment
 # 4. Installs dependencies
-# 5. Creates config.json from template
-# 6. Sets up Task Scheduler jobs (via SSH command)
+# 5. Creates config.json (readable only by the installing user — it holds the token)
+# 6. Prints the Task Scheduler jobs to create
 #
 
 set -e  # Exit on error
@@ -163,17 +163,30 @@ cd "$SCRIPTS_DIR/lab-monitor"
 # Upgrade pip (best-effort; don't fail the install if this can't run).
 "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG --upgrade pip > /dev/null 2>&1 || true
 
+# Versions come from collector/requirements.txt (single source of truth).
+# The packages are installed one at a time because psutil is best-effort.
+REQ_FILE="$SCRIPTS_DIR/lab-monitor/collector/requirements.txt"
+req_spec() {
+    # Print the requirement line for package $1 (e.g. "requests==X.Y.Z"),
+    # or the bare name if collector/requirements.txt doesn't list it.
+    local spec
+    spec=$(grep -iE "^[[:space:]]*$1[[:space:]]*([=<>!~]|$)" "$REQ_FILE" 2>/dev/null | head -n 1 | sed -e 's/#.*//' -e 's/[[:space:]]//g')
+    if [ -n "$spec" ]; then echo "$spec"; else echo "$1"; fi
+}
+REQUESTS_SPEC=$(req_spec requests)
+PSUTIL_SPEC=$(req_spec psutil)
+
 # --- requests (REQUIRED) ---
-if ! "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG 'requests==2.31.0' > /tmp/pip-install.log 2>&1; then
+if ! "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG "$REQUESTS_SPEC" > /tmp/pip-install.log 2>&1; then
     echo -e "${RED}ERROR: Could not install 'requests' (required)${NC}"
     echo "See /tmp/pip-install.log"
     [ -z "$PIP_USER_FLAG" ] || echo "If pip is missing, install it: python3 -m ensurepip --user"
     exit 1
 fi
-echo "[OK] requests installed"
+echo "[OK] $REQUESTS_SPEC installed"
 
 # --- psutil (OPTIONAL, best-effort) ---
-if "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG 'psutil==5.9.6' >> /tmp/pip-install.log 2>&1; then
+if "$COLLECTOR_PYTHON" -m pip install $PIP_USER_FLAG "$PSUTIL_SPEC" >> /tmp/pip-install.log 2>&1; then
     echo "[OK] psutil installed (full metrics)"
 else
     echo -e "${YELLOW}Note: psutil could not be installed (no ARM wheel / no compiler).${NC}"
@@ -197,30 +210,33 @@ if [ ! -f "$CONFIG_FILE" ]; then
     echo "  - NAS id: $NAS_ID"
     echo ""
     
-    # Prompt for Manager URL
-    read -p "Enter Manager URL (e.g., http://atlantis.med.harvard.edu:5000): " MANAGER_URL
+    # Prompt for Manager URL (http:// or https:// — whatever the Manager is served on)
+    echo "The Manager itself serves plain http (e.g., http://atlantis.med.harvard.edu:5000);"
+    echo "use an https:// URL only if it sits behind a TLS proxy."
+    read -r -p "Enter Manager URL: " MANAGER_URL
     if [ -z "$MANAGER_URL" ]; then
         echo -e "${RED}ERROR: Manager URL cannot be empty${NC}"
         exit 1
     fi
-    if echo "$MANAGER_URL" | grep -q '^https://'; then
-        echo -e "${YELLOW}Warning: URL starts with https:// but the Manager runs plain HTTP. Did you mean http://?${NC}"
-        read -p "Continue with https:// anyway? [y/N]: " CONFIRM_HTTPS
-        if [ "$CONFIRM_HTTPS" != "y" ] && [ "$CONFIRM_HTTPS" != "Y" ]; then
-            echo "Please re-run and enter the correct URL."
-            exit 1
-        fi
-    fi
+    case "$MANAGER_URL" in
+        https://*) ;;
+        http://*)
+            echo -e "${YELLOW}Warning: $MANAGER_URL is plain http:// — the Manager token will travel unencrypted on the network.${NC}"
+            ;;
+        *)
+            echo -e "${YELLOW}Warning: the Manager URL should start with http:// or https:// (got: $MANAGER_URL)${NC}"
+            ;;
+    esac
 
-    # Prompt for Manager Token
-    read -p "Enter Manager Token (from Manager config): " MANAGER_TOKEN
+    # Prompt for Manager Token (this device's collector token from the Manager config)
+    read -r -p "Enter Manager Token (this device's collector token from the Manager config): " MANAGER_TOKEN
     if [ -z "$MANAGER_TOKEN" ]; then
         echo -e "${RED}ERROR: Manager Token cannot be empty${NC}"
         exit 1
     fi
 
     # Prompt for Device Type
-    read -p "Enter Device Type [NAS/NAS-Instrument/Server/NAS-Backup]: " DEVICE_TYPE
+    read -r -p "Enter Device Type [NAS/NAS-Instrument/Server/NAS-Backup]: " DEVICE_TYPE
     if [ -z "$DEVICE_TYPE" ]; then
         echo -e "${RED}ERROR: Device Type cannot be empty${NC}"
         exit 1
@@ -235,80 +251,102 @@ if [ ! -f "$CONFIG_FILE" ]; then
     echo "    /volume1/*             (monitor each subfolder of /volume1 separately)"
     echo "    /volume1/Data          (monitor /volume1/Data as a single total)"
     echo "    /volume2/*             (monitor each subfolder of /volume2 separately)"
-    read -p "Enter scan paths (comma-separated, or press Enter to use volume roots): " SCAN_PATHS_INPUT
-    
-    if [ -n "$SCAN_PATHS_INPUT" ]; then
-        # User provided custom scan paths
-        SCAN_PATHS_JSON=""
-        IFS=',' read -ra PATHS <<< "$SCAN_PATHS_INPUT"
-        for path in "${PATHS[@]}"; do
-            path=$(echo "$path" | xargs)  # trim whitespace
-            [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
-            SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$path\""
-        done
-        echo "[OK] Scan paths: $SCAN_PATHS_INPUT"
-    else
-        # Default: one level deep in each data volume (match /volumeN only)
-        SCAN_PATHS_JSON=""
-        for vol in /volume[0-9]*; do
-            [ -d "$vol" ] || continue
-            case "$vol" in
-                *\**) continue ;;
-            esac
-            [ -n "$SCAN_PATHS_JSON" ] && SCAN_PATHS_JSON="$SCAN_PATHS_JSON, "
-            SCAN_PATHS_JSON="$SCAN_PATHS_JSON\"$vol/*\""
-        done
-        if [ -z "$SCAN_PATHS_JSON" ]; then
-            SCAN_PATHS_JSON="\"/volume1/*\""
-        fi
-        echo "[OK] Defaulting to one level deep in each volume: $SCAN_PATHS_JSON"
-    fi
-    
+    read -r -p "Enter scan paths (comma-separated, or press Enter to use volume roots): " SCAN_PATHS_INPUT
+
     # Auto-detect data volumes present on this NAS. Match /volume<number>
     # only, skipping /volumeUSB*, /volumeSATA*, and the literal glob when
     # nothing matches (nullglob is not reliable in DSM's ash/bash).
-    VOLUMES_JSON=""
+    VOLUMES_LIST=""
     for vol in /volume[0-9]*; do
         # Guard against the no-match case where the glob stays literal.
         [ -d "$vol" ] || continue
         case "$vol" in
             *\**) continue ;;  # literal '/volume[0-9]*' — no volumes matched
         esac
-        [ -n "$VOLUMES_JSON" ] && VOLUMES_JSON="$VOLUMES_JSON, "
-        VOLUMES_JSON="$VOLUMES_JSON\"$vol\""
+        VOLUMES_LIST="$VOLUMES_LIST$vol
+"
     done
-    if [ -z "$VOLUMES_JSON" ]; then
+    if [ -z "$VOLUMES_LIST" ]; then
         echo -e "${YELLOW}Warning: no /volumeN data volumes auto-detected.${NC}"
         echo "Defaulting to /volume1; edit the config afterward if that is wrong."
-        VOLUMES_JSON="\"/volume1\""
+        VOLUMES_LIST="/volume1
+"
     fi
-    echo "Auto-detected volumes: $VOLUMES_JSON"
     echo ""
 
-    cat > "$CONFIG_FILE" << EOF
-{
-  "name": "${NAS_HOSTNAME}",
-  "id": "${NAS_ID}",
-  "device_type": "${DEVICE_TYPE}",
-  "manager_url": "${MANAGER_URL}",
-  "manager_token": "${MANAGER_TOKEN}",
-  "volumes": [${VOLUMES_JSON}],
-  "scan_paths": [${SCAN_PATHS_JSON}],
-  "data_dir": "/volume1/lab-monitor/data",
-  "log_file": "/volume1/lab-monitor/logs/collector.log",
-  "log_level": "INFO",
-  "timeout_seconds": 3600,
-  "request_timeout_seconds": 30
-}
-EOF
-    echo "[OK] Config file created at $CONFIG_FILE"
-    echo ""
+    # config.json is built by Python's json module: every answer is passed
+    # through the environment (never spliced into code or a heredoc), so
+    # quotes, backslashes or apostrophes in a path or token can't break the
+    # JSON. Scan paths are split on commas and trimmed; one wrapping pair of
+    # quotes is removed. Empty input → "<volume>/*" for each volume.
+    # umask 077 + chmod 600: the file holds the Manager token, so only this
+    # user (who must also be the Task Scheduler user) can read it.
     echo "Configuration saved with:"
     echo "  - Device Type:   $DEVICE_TYPE"
-    echo "  - Volumes:       $VOLUMES_JSON"
-    echo "  - Scan Paths:    $SCAN_PATHS_JSON"
+    if ! (umask 077 && \
+          LM_CONFIG_FILE="$CONFIG_FILE" \
+          LM_NAME="$NAS_HOSTNAME" \
+          LM_ID="$NAS_ID" \
+          LM_DEVICE_TYPE="$DEVICE_TYPE" \
+          LM_MANAGER_URL="$MANAGER_URL" \
+          LM_MANAGER_TOKEN="$MANAGER_TOKEN" \
+          LM_VOLUMES="$VOLUMES_LIST" \
+          LM_SCAN_PATHS_INPUT="$SCAN_PATHS_INPUT" \
+          LM_DATA_DIR="$DATA_DIR" \
+          LM_LOG_FILE="$LOGS_DIR/collector.log" \
+          "$COLLECTOR_PYTHON" - <<'PYCONFIG'
+import json
+import os
+
+env = os.environ
+
+
+def clean(path):
+    path = path.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in '"\'':
+        path = path[1:-1].strip()
+    return path
+
+
+volumes = [v for v in env['LM_VOLUMES'].split('\n') if v.strip()]
+scan_paths = [p for p in (clean(p) for p in env.get('LM_SCAN_PATHS_INPUT', '').split(',')) if p]
+if not scan_paths:
+    scan_paths = [v + '/*' for v in volumes]
+
+config = {
+    'name': env['LM_NAME'],
+    'id': env['LM_ID'],
+    'device_type': env['LM_DEVICE_TYPE'],
+    'manager_url': env['LM_MANAGER_URL'],
+    'manager_token': env['LM_MANAGER_TOKEN'],
+    'volumes': volumes,
+    'scan_paths': scan_paths,
+    'data_dir': env['LM_DATA_DIR'],
+    'log_file': env['LM_LOG_FILE'],
+    'log_level': 'INFO',
+    'timeout_seconds': 3600,
+    # total_timeout_seconds is left unset: the default scales with the number
+    # of scan_paths entries (see collector/README.md, "Time budgets")
+    'request_timeout_seconds': 30,
+    'max_batch_messages': 100,
+    'max_queue_messages': 50000,
+}
+path = env['LM_CONFIG_FILE']
+with open(path, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+os.chmod(path, 0o600)
+print('  - Volumes:       ' + ', '.join(volumes))
+print('  - Scan Paths:    ' + ', '.join(scan_paths))
+PYCONFIG
+    ); then
+        echo -e "${RED}ERROR: Could not write $CONFIG_FILE${NC}"
+        exit 1
+    fi
     echo "  - Manager URL:   $MANAGER_URL"
     echo "  - Manager Token: (set)"
+    echo ""
+    echo "[OK] Config file created at $CONFIG_FILE (permissions 600)"
     echo ""
     echo "To modify later:"
     echo "  nano $CONFIG_FILE"
@@ -316,6 +354,37 @@ EOF
 else
     echo "[OK] Config file already exists at $CONFIG_FILE"
     echo "   (Edit manually if needed: nano $CONFIG_FILE)"
+    # It holds the Manager token, so it should be readable by its owner only.
+    # But tightening it locks out every other account that reads it (the DSM
+    # tasks may run as another user; tools may SSH in as one), so ask first.
+    CONFIG_MODE=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo "")
+    CONFIG_OWNER=$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo "")
+    case "$CONFIG_MODE" in
+        600|400)
+            echo "   Permissions: $CONFIG_MODE (readable only by its owner '$CONFIG_OWNER')"
+            ;;
+        *)
+            echo ""
+            echo -e "${YELLOW}$CONFIG_FILE contains the Manager token and is readable by other users (mode ${CONFIG_MODE:-unknown}, owner ${CONFIG_OWNER:-unknown}).${NC}"
+            echo "   Restricting it to 600 means BOTH 'Lab Monitor' tasks in DSM Task Scheduler, and any"
+            echo "   tool that runs the collector over SSH, must run as '${CONFIG_OWNER:-its owner}' or root."
+            echo "   Tasks under any other user would fail with 'Permission denied' and stop collecting."
+            echo "   Check the 'User' column of those tasks before answering."
+            read -r -p "   Restrict config.json to 600 now? [y/N]: " TIGHTEN_CONFIG || TIGHTEN_CONFIG=""
+            case "$TIGHTEN_CONFIG" in
+                [Yy]|[Yy][Ee][Ss])
+                    if chmod 600 "$CONFIG_FILE" 2>/dev/null; then
+                        echo "   Permissions set to 600: run both tasks as '${CONFIG_OWNER:-its owner}' or root"
+                    else
+                        echo -e "${YELLOW}Warning: could not chmod 600 $CONFIG_FILE (owned by another user?).${NC}"
+                    fi
+                    ;;
+                *)
+                    echo "   Left unchanged. To restrict it later: chmod 600 $CONFIG_FILE"
+                    ;;
+            esac
+            ;;
+    esac
 fi
 echo ""
 
@@ -344,16 +413,19 @@ echo "2. Schedule jobs via Synology Control Panel:"
 echo ""
 echo "   Control Panel → Task Scheduler → Create → Scheduled Task → User-defined Script"
 echo ""
+echo "   Run both tasks as the owner of config.json ('$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo "$CURRENT_USER")') or root:"
+echo "   with mode 600 (the default for new installs) no other user can read it."
+echo ""
 echo "   Task 1: Lab Monitor - Disk Collection"
 echo "   - Task name: 'Lab Monitor - Disk Collection'"
-echo "   - User: your admin user (e.g., 'jeff')"
+echo "   - User: $CURRENT_USER"
 echo "   - Schedule: Daily at 02:00 (2 AM)"
 echo "   - User-defined script:"
 echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $COLLECTOR_PYTHON collector.py --config local/config.json --mode disk"
 echo ""
 echo "   Task 2: Lab Monitor - Metrics Collection"
 echo "   - Task name: 'Lab Monitor - Metrics Collection'"
-echo "   - User: your admin user (e.g., 'jeff')"
+echo "   - User: $CURRENT_USER"
 echo "   - Schedule: Daily at 00:00, repeat every 5 minutes"
 echo "   - User-defined script:"
 echo "     cd $SCRIPTS_DIR/lab-monitor/collector && $COLLECTOR_PYTHON collector.py --config local/config.json --mode metrics"

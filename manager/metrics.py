@@ -6,10 +6,13 @@ Three tables, each with a clear purpose:
   devices          — device registry; one row per system, never deleted.
                      Records identity (name, id, device_type) and first/last seen.
 
-  device_snapshot  — latest known state per device; one row per system,
-                     overwritten on every ingest.  Holds the most recent
-                     metrics (cpu, ram, uptime, bandwidth) and disk state
-                     (total_disk_bytes, raw folders_json).
+  device_snapshot  — latest known state per device; one row per system.
+                     Holds the most recent metrics (cpu, ram, uptime,
+                     bandwidth) and disk state (total_disk_bytes, raw
+                     folders_json).  Only a message at least as new as the
+                     current snapshot overwrites it, so a gap-fill of older
+                     messages (tools/replay_archives.py, retried 'error'
+                     results) adds history without rolling the snapshot back.
 
   device_totals    — running cumulative counters per device.
                      Accumulates network bytes across reboots by tracking
@@ -17,110 +20,587 @@ Three tables, each with a clear purpose:
                      Also mirrors the current total_disk_bytes for
                      quick global-sum queries.
 
+Plus dead_letter (messages the Manager rejected, with the raw message and
+the reason) and the per-user tables managed by UserMetricsStore.
+
+All writes for one ingested message happen in one transaction
+(apply_side_effects).  Device names are matched through
+storage_util.normalize_device_name, so "Lab-A" and "lab-a" resolve to the
+same registered device.  Rows are never renamed: an older Manager keyed
+these tables by the raw name, so a database can hold two spellings that
+normalize alike (a collector renamed from "Triton" to "triton", or two
+machines "lab-a" and "lab_a").  Both rows are kept as they are and stay
+readable under their own names; data sent under a registered spelling goes
+to that row (as the older Manager did), data under a new spelling to the
+alike row with the same system_id, else the spelling seen most recently
+(see resolve_name).
+
+A message timestamped more than FUTURE_SLACK_SECONDS ahead of this server's
+clock (a collector with a bad clock) is stored in the history, but does not
+move the device's last_seen, snapshots or network totals, and a stored
+timestamp that far ahead (an older Manager stored any) never holds back a
+current message.
+
+Opening a metrics.db written by an older Manager adds the new tables and
+columns once, after a consistent copy ("metrics.db.pre-upgrade-<stamp>.bak",
+storage_util.backup_database).  If that copy fails nothing is migrated:
+reads keep working and every write raises MigrationBlockedError (ingest
+answers 'error', collectors keep their messages) until a retry succeeds.
+
 Full historical data lives in TypedDataStore (data_store.py).
 """
 
 import json
 import logging
-import os
-import sqlite3
-from datetime import datetime
+import math
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+from storage_util import (
+    UPGRADE_RETRY_SECONDS, LockedConnection, MigrationBlockedError, backup_database,
+    normalize_device_name, parse_timestamp, timestamp_le, utc_now,
+)
 
 logger = logging.getLogger(__name__)
 
 
+_INT64_MAX = 2 ** 63 - 1
+
+# Network counters that went DOWN are a reboot / counter reset only if the
+# reported uptime started after the previous reading (allowing this much
+# clock and collection-time slack); a machine that has been up all along
+# had its counters drop for another reason (an interface removed, a
+# collector that stopped counting loopback), and that must not add all the
+# traffic since boot to the lifetime totals again.
+REBOOT_UPTIME_SLACK_SECONDS = 300
+
+# Tables and columns of the current central schema (an existing database
+# missing any of them is upgraded, after a pre-upgrade backup)
+_CURRENT_SCHEMA = {
+    'devices':              (),
+    'device_snapshot':      ('metrics_json',),
+    'device_totals':        ('network_last_updated',),
+    'dead_letter':          (),
+    'device_user_snapshot': (),
+    'user_metrics_history': ('msg_id',),
+}
+
+# A message whose timestamp is further ahead of this server's clock than
+# this (a collector with a wrong clock: dead RTC battery, before NTP sync)
+# is stored in the history but does not move the device's "latest" state;
+# a stored state timestamp that far ahead does not block current messages.
+FUTURE_SLACK_SECONDS = 3600
+FUTURE_WARN_INTERVAL_SECONDS = 3600
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _has_original_central_layout(conn) -> bool:
+    """
+    True while a metrics.db still has the layout an older Manager wrote:
+    none of the tables / columns only this Manager adds (dead_letter,
+    device_totals.network_last_updated, user_metrics_history.msg_id).
+    """
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'dead_letter' in tables:
+        return False
+    for table, column in (('device_totals', 'network_last_updated'), ('user_metrics_history', 'msg_id')):
+        if table in tables and column in {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}:
+            return False
+    return True
+
+
+def _number_or_none(value):
+    """Finite numbers pass through; anything else (None, str, bool, NaN, ±inf) → None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _seconds_ahead(timestamp) -> Optional[float]:
+    """How many seconds `timestamp` lies ahead of this server's clock (negative: past); None if unparseable."""
+    try:
+        return (parse_timestamp(timestamp) - datetime.now(timezone.utc)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _in_future(timestamp) -> bool:
+    """True if a timestamp is more than FUTURE_SLACK_SECONDS ahead of this server's clock."""
+    ahead = _seconds_ahead(timestamp)
+    return ahead is not None and ahead > FUTURE_SLACK_SECONDS
+
+
+def _not_older(timestamp: str, current: Optional[str]) -> bool:
+    """
+    True if a message at `timestamp` may replace state recorded at `current`.
+    A recorded timestamp far in the future (a message from a collector with
+    a wrong clock, stored by an older Manager) never blocks a current one.
+    """
+    return not current or timestamp_le(current, timestamp) or _in_future(current)
+
+
+def _later(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """The later of two stored timestamps (either may be missing; one far in the future is ignored)."""
+    if not a or _in_future(a):
+        return b
+    if not b:
+        return a
+    return b if timestamp_le(a, b) else a
+
+
+def _ts_key(value) -> datetime:
+    """Sort key for a stored timestamp (unparseable / missing sorts first)."""
+    try:
+        return parse_timestamp(value)
+    except ValueError:
+        return _EPOCH
+
+
+def _seconds_between(earlier: Optional[str], later: str) -> Optional[float]:
+    try:
+        return (parse_timestamp(later) - parse_timestamp(earlier)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
 class MetricsDB:
 
-    def __init__(self, db_path: str, data_dir: str = None):
+    def __init__(self, db_path: str, data_dir: str = None, backup_before_migration: bool = True):
         self.db_path  = db_path
         self.data_dir = data_dir   # kept for signature compat; unused here
+        self.backup_before_migration = backup_before_migration
+        self.upgrade_blocked: Optional[str] = None
+        self._upgrade_attempted = 0.0
+        self._names: Dict[str, str] = {}
+        self._registered: set = set()
+        self._system_ids: Dict[str, Optional[str]] = {}
+        self._spellings: Dict[str, set] = {}
+        self._future_warned: Dict[str, float] = {}
         self._connect()
-        self._init_schema()
+        self.users = UserMetricsStore(self, init=False)
+        self._upgrade()
+        self._load_name_index()
 
     # ------------------------------------------------------------------ #
     # Connection                                                           #
     # ------------------------------------------------------------------ #
 
     def _connect(self):
-        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.execute('PRAGMA foreign_keys=ON')
+        self._conn = LockedConnection(self.db_path)
+        self._conn.conn.execute('PRAGMA foreign_keys=ON')
+        # Raw connection kept for compatibility (autocommit mode)
+        self.db = self._conn.conn
+
+    def transaction(self):
+        """Context manager: one BEGIN IMMEDIATE ... COMMIT on the central DB."""
+        return self._write()
+
+    def _write(self):
+        """A write transaction; MigrationBlockedError while a migration is held back."""
+        self._check_writable()
+        return self._conn.transaction()
+
+    # ------------------------------------------------------------------ #
+    # One-time upgrade of a metrics.db written by an older Manager         #
+    # ------------------------------------------------------------------ #
+
+    def _upgrade_reasons(self) -> List[str]:
+        """What an existing database still needs migrated ([] = current or new)."""
+        tables = {r[0] for r in self._conn.query("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not tables & set(_CURRENT_SCHEMA):
+            return []   # a new (empty) database: nothing to back up
+        reasons = []
+        for table, columns in _CURRENT_SCHEMA.items():
+            if table not in tables:
+                reasons.append(f'no {table} table')
+                continue
+            have = self._columns(table)
+            missing = [c for c in columns if c not in have]
+            if missing:
+                reasons.append(f"{table} has no {', '.join(missing)}")
+        return reasons
+
+    def _upgrade(self) -> bool:
+        """
+        Create / migrate the schema.  An existing database that needs changes
+        is first copied with backup_database() (unless backup_before_migration
+        is off); if that fails, nothing is changed and upgrade_blocked is set.
+        Returns True if the schema is current.
+        """
+        with self._conn.lock:
+            self._upgrade_attempted = time.monotonic()
+            reasons = self._upgrade_reasons()
+            if reasons:
+                reason = '; '.join(reasons)
+                if self.backup_before_migration:
+                    try:
+                        backup_database(self._conn.conn, self.db_path, reason,
+                                        original_layout=_has_original_central_layout)
+                    except Exception as e:
+                        self.upgrade_blocked = reason
+                        logger.error(
+                            f"NOT migrating {self.db_path}: the pre-upgrade backup failed "
+                            f"({type(e).__name__}: {e}). Reads keep working on the old schema; "
+                            f"every new message gets 'error' and stays queued on its collector. "
+                            f"Free disk space / fix permissions (retried every "
+                            f"{UPGRADE_RETRY_SECONDS}s on the next write), or set "
+                            f"\"backup_before_migration\": false to migrate without a backup."
+                        )
+                        return False
+                else:
+                    logger.warning(f"Migrating {self.db_path} WITHOUT a backup "
+                                   f"(backup_before_migration is false): {reason}")
+            self._init_schema()
+            self.users._init_tables()
+            self.upgrade_blocked = None
+            return True
+
+    def _check_writable(self):
+        if not self.upgrade_blocked:
+            return
+        with self._conn.lock:
+            if self.upgrade_blocked and \
+                    time.monotonic() - self._upgrade_attempted >= UPGRADE_RETRY_SECONDS:
+                if self._upgrade():
+                    self._load_name_index()
+            if self.upgrade_blocked:
+                raise MigrationBlockedError(
+                    f"{self.db_path} needs a migration that is held back until its "
+                    f"pre-upgrade backup succeeds")
 
     # ------------------------------------------------------------------ #
     # Schema                                                               #
     # ------------------------------------------------------------------ #
 
+    def _columns(self, table: str) -> set:
+        return {row[1] for row in self._conn.query(f'PRAGMA table_info("{table}")')}
+
     def _init_schema(self):
-        # ---- device registry ----------------------------------------- #
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS devices (
-                name        TEXT PRIMARY KEY,
-                system_id   TEXT,
-                device_type TEXT DEFAULT 'unknown',
-                first_seen  DATETIME NOT NULL,
-                last_seen   DATETIME NOT NULL
-            )
-        ''')
+        with self._conn.transaction() as db:
+            # ---- device registry ----------------------------------------- #
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS devices (
+                    name        TEXT PRIMARY KEY,
+                    system_id   TEXT,
+                    device_type TEXT DEFAULT 'unknown',
+                    first_seen  DATETIME NOT NULL,
+                    last_seen   DATETIME NOT NULL
+                )
+            ''')
 
-        # ---- latest snapshot per device ------------------------------- #
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS device_snapshot (
-                name                        TEXT PRIMARY KEY,
-                metrics_timestamp           DATETIME,
-                cpu_percent                 REAL,
-                ram_percent                 REAL,
-                uptime_seconds              INTEGER DEFAULT 0,
-                uptime_formatted            TEXT    DEFAULT '0s',
-                network_bandwidth_in_mbps   REAL    DEFAULT 0,
-                network_bandwidth_out_mbps  REAL    DEFAULT 0,
-                disk_timestamp              DATETIME,
-                total_disk_bytes            INTEGER DEFAULT 0,
-                folders_json                TEXT    DEFAULT '{}',
-                metrics_json                TEXT    DEFAULT '{}'
-            )
-        ''')
+            # ---- latest snapshot per device ------------------------------- #
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_snapshot (
+                    name                        TEXT PRIMARY KEY,
+                    metrics_timestamp           DATETIME,
+                    cpu_percent                 REAL,
+                    ram_percent                 REAL,
+                    uptime_seconds              INTEGER DEFAULT 0,
+                    uptime_formatted            TEXT    DEFAULT '0s',
+                    network_bandwidth_in_mbps   REAL    DEFAULT 0,
+                    network_bandwidth_out_mbps  REAL    DEFAULT 0,
+                    disk_timestamp              DATETIME,
+                    total_disk_bytes            INTEGER DEFAULT 0,
+                    folders_json                TEXT    DEFAULT '{}',
+                    metrics_json                TEXT    DEFAULT '{}'
+                )
+            ''')
+
+            # ---- running cumulative counters ------------------------------ #
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_totals (
+                    name                 TEXT PRIMARY KEY,
+                    total_bytes_in       INTEGER DEFAULT 0,
+                    total_bytes_out      INTEGER DEFAULT 0,
+                    last_bytes_in        INTEGER DEFAULT 0,
+                    last_bytes_out       INTEGER DEFAULT 0,
+                    total_disk_bytes     INTEGER DEFAULT 0,
+                    last_updated         DATETIME,
+                    network_last_updated DATETIME
+                )
+            ''')
+
+            # ---- rejected messages ---------------------------------------- #
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS dead_letter (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    received_at TEXT NOT NULL,
+                    device_name TEXT,
+                    msg_id      TEXT,
+                    data_type   TEXT,
+                    reason      TEXT NOT NULL,
+                    raw_json    TEXT NOT NULL
+                )
+            ''')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_dead_letter_msg_id ON dead_letter (msg_id)')
+
         # Migration: add metrics_json to existing databases that pre-date it
-        try:
-            self.db.execute("ALTER TABLE device_snapshot ADD COLUMN metrics_json TEXT DEFAULT '{}'")
-            self.db.commit()
+        if 'metrics_json' not in self._columns('device_snapshot'):
+            self._conn.execute("ALTER TABLE device_snapshot ADD COLUMN metrics_json TEXT DEFAULT '{}'")
             logger.info("Migrated device_snapshot: added metrics_json column")
-        except Exception:
-            pass  # column already exists
 
-        # ---- running cumulative counters ------------------------------ #
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS device_totals (
-                name             TEXT PRIMARY KEY,
-                total_bytes_in   INTEGER DEFAULT 0,
-                total_bytes_out  INTEGER DEFAULT 0,
-                last_bytes_in    INTEGER DEFAULT 0,
-                last_bytes_out   INTEGER DEFAULT 0,
-                total_disk_bytes INTEGER DEFAULT 0,
-                last_updated     DATETIME
-            )
-        ''')
+        # Migration: network replay guard gets its own timestamp, so a
+        # folder_usage update (which also sets last_updated) can't make a
+        # later-arriving metrics message look like a replay.  The old Manager
+        # set last_bytes_* and device_snapshot.metrics_timestamp from the same
+        # (last processed) system_metrics message, so that is when the stored
+        # counters were read; last_updated, which folder_usage messages also
+        # moved, is the fallback.  Only the new column is written.
+        if 'network_last_updated' not in self._columns('device_totals'):
+            with self._conn.transaction() as db:
+                db.execute('ALTER TABLE device_totals ADD COLUMN network_last_updated DATETIME')
+                db.execute('''
+                    UPDATE device_totals SET network_last_updated = COALESCE(
+                        (SELECT s.metrics_timestamp FROM device_snapshot s
+                          WHERE s.name = device_totals.name),
+                        last_updated)
+                ''')
+            logger.info("Migrated device_totals: added network_last_updated column")
 
-        self.db.commit()
+    # ------------------------------------------------------------------ #
+    # Device names                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _load_name_index(self):
+        """
+        Map normalized name → the registered spelling data under a NEW
+        (unregistered) spelling is filed under.
+
+        An older Manager keyed the central tables by the raw device name, so
+        two registered spellings can share a normalized name: a collector
+        renamed from 'Triton' to 'triton', or two machines 'lab-a' and
+        'lab_a'.  Neither row is changed or merged: each keeps its own
+        snapshot and lifetime totals and stays readable under its own name,
+        and data sent under a registered spelling goes to that row, exactly
+        as the older Manager filed it (resolve_name).  A spelling not
+        registered yet goes to the spelling seen MOST RECENTLY, whose last
+        network counters are current; adding a new reading to a stale row
+        would count the traffic since that row's last reading again.
+        """
+        try:
+            rows = self._conn.query('SELECT name, system_id, first_seen, last_seen FROM devices')
+        except Exception as e:   # only possible while a migration is held back
+            logger.error(f"Could not read the device registry: {e}")
+            rows = []
+        groups: Dict[str, list] = {}
+        for row in rows:
+            groups.setdefault(normalize_device_name(row['name']), []).append(row)
+        names: Dict[str, str] = {}
+        for key, group in groups.items():
+            group.sort(key=lambda r: (_ts_key(r['last_seen']), _ts_key(r['first_seen']), r['name']),
+                       reverse=True)
+            names[key] = group[0]['name']
+            if len(group) > 1:
+                logger.warning(
+                    f"Central DB has devices {', '.join(repr(r['name']) for r in group)} that "
+                    f"normalize to the same name (registered by an older Manager: a renamed "
+                    f"collector, or different machines). All rows are kept unchanged and each "
+                    f"stays readable under its own name; data sent under one of these names goes "
+                    f"to that row, data under another spelling to the most recently seen, "
+                    f"{names[key]!r}. They share one history directory."
+                )
+        self._names = names
+        self._registered = {row['name'] for row in rows}
+        self._system_ids = {row['name']: row['system_id'] for row in rows}
+        self._spellings = {key: {row['name'] for row in group} for key, group in groups.items()}
+
+    def resolve_name(self, name: str, system_id=None) -> str:
+        """
+        The registered row new data for this device is filed under: the row
+        of exactly this spelling if one is registered (the older Manager
+        keyed rows by the raw name, so 'lab-a' and 'lab_a' keep their own
+        rows), else a registered spelling that normalizes alike (a renamed
+        collector continues its row): the one with the same system_id, else
+        the most recently seen.  A new spelling whose system_id differs from
+        that of every alike registered row is another machine: it gets its
+        own row (the name itself), as the older Manager gave it.
+        """
+        with self._conn.lock:
+            if name in self._registered:
+                return name
+            key = normalize_device_name(name)
+            default = self._names.get(key)
+            if default is None:
+                return name
+            if system_id is not None and str(system_id):
+                ids = {n: self._system_ids.get(n) for n in self._spellings.get(key, {default})}
+                same = sorted(n for n, i in ids.items() if i is not None and str(i) == str(system_id))
+                if same:
+                    return default if default in same else same[0]
+                if all(i is not None and str(i) for i in ids.values()):
+                    return name
+            return default
+
+    def resolve_read_name(self, name: str) -> str:
+        """
+        The registered row a read for `name` should return: the row of that
+        exact spelling if one is registered (so every row an older Manager
+        stored stays reachable), else the spelling resolve_name() picks.
+        """
+        with self._conn.lock:
+            if name in self._registered:
+                return name
+            return self._names.get(normalize_device_name(name), name)
+
+    def is_registered(self, name: str) -> bool:
+        """True if exactly this spelling is in the device registry."""
+        with self._conn.lock:
+            return name in self._registered
+
+    def is_known(self, name: str) -> bool:
+        with self._conn.lock:
+            return normalize_device_name(name) in self._names
+
+    def spellings(self, name: str) -> List[str]:
+        """Every registered spelling that normalizes like `name` (sorted)."""
+        key = normalize_device_name(name)
+        with self._conn.lock:
+            return sorted(n for n in self._registered if normalize_device_name(n) == key)
+
+    # ------------------------------------------------------------------ #
+    # Write — one message                                                  #
+    # ------------------------------------------------------------------ #
+
+    def apply_side_effects(self, name: str, system_id: str, device_type: str,
+                           timestamp: str, data_type: str, payload: Dict[str, Any],
+                           msg_id: Optional[str] = None, raw_timestamp: Optional[str] = None):
+        """
+        Apply every central-DB update for one newly stored message in a
+        single transaction: device registry, then the data-type specific
+        snapshot / running totals / per-user rows.  Raises on failure (the
+        transaction is rolled back).  raw_timestamp (the header string) lets
+        a message be matched against per-user history rows an older Manager
+        stored (see UserMetricsStore._ingest).
+        """
+        if _in_future(timestamp):
+            self._warn_future(name, timestamp)
+            with self._write() as db:
+                # History only: a device seen for the first time is
+                # registered at this server's time, nothing else moves.
+                if db.execute('SELECT 1 FROM devices WHERE name = ?', (name,)).fetchone() is None:
+                    self._upsert_device(db, name, system_id, device_type, utc_now())
+                self._remember_name(name, system_id)
+                if data_type == 'user_metrics':
+                    self.users._ingest(
+                        db, name, timestamp,
+                        payload.get('username'),
+                        _number_or_none(payload.get('cpu_percent')),
+                        _number_or_none(payload.get('ram_bytes')),
+                        payload.get('ram_formatted'),
+                        msg_id,
+                        raw_timestamp=raw_timestamp,
+                        update_snapshot=False,
+                    )
+            return
+
+        with self._write() as db:
+            self._upsert_device(db, name, system_id, device_type, timestamp)
+            self._remember_name(name, system_id)
+            if data_type == 'system_metrics':
+                self._update_snapshot_metrics(db, name, timestamp, payload)
+                self._accumulate_network(
+                    db, name,
+                    payload.get('network_bytes_in'),
+                    payload.get('network_bytes_out'),
+                    timestamp,
+                    uptime_seconds=payload.get('uptime_seconds'),
+                )
+            elif data_type == 'folder_usage':
+                if self._update_snapshot_disk(db, name, timestamp, payload):
+                    self._update_disk_total(db, name, payload.get('total_usage'), timestamp)
+            elif data_type == 'user_metrics':
+                self.users._ingest(
+                    db, name, timestamp,
+                    payload.get('username'),
+                    _number_or_none(payload.get('cpu_percent')),
+                    _number_or_none(payload.get('ram_bytes')),
+                    payload.get('ram_formatted'),
+                    msg_id,
+                    raw_timestamp=raw_timestamp,
+                )
+            # Unknown / not_specified: nothing else to do in central DB
+
+    def _warn_future(self, name: str, timestamp: str):
+        """Log a message from the future (at most once per device per FUTURE_WARN_INTERVAL_SECONDS)."""
+        now = time.monotonic()
+        last = self._future_warned.get(name)
+        if last is not None and now - last < FUTURE_WARN_INTERVAL_SECONDS:
+            return
+        self._future_warned[name] = now
+        ahead = _seconds_ahead(timestamp) or 0.0
+        logger.warning(
+            f"{name}: message timestamp {timestamp} is {ahead / 3600:.1f} h ahead of this server's "
+            f"clock ({utc_now()}). It is stored in the history, but it does not move the device's "
+            f"last-seen time, snapshot, per-user snapshot or network totals. Check the clock of "
+            f"{name} (or of this server). Logged at most once an hour per device."
+        )
+
+    def add_dead_letter(self, device_name: Optional[str], msg_id: Optional[str],
+                        data_type: Optional[str], reason: str, raw: Any):
+        """Record a rejected message (first rejection of a msg_id wins)."""
+        try:
+            raw_json = json.dumps(raw, default=str)
+        except (TypeError, ValueError):
+            raw_json = json.dumps(str(raw))
+        with self._write() as db:
+            db.execute('''
+                INSERT OR IGNORE INTO dead_letter
+                    (received_at, device_name, msg_id, data_type, reason, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (utc_now(), device_name, msg_id,
+                  data_type if isinstance(data_type, str) else None, reason, raw_json))
+
+    def get_dead_letters(self, limit: int = 100) -> List[Dict]:
+        rows = self._conn.query(
+            'SELECT * FROM dead_letter ORDER BY id DESC LIMIT ?', (limit,))
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
     # Write — device registry                                              #
     # ------------------------------------------------------------------ #
 
+    def _upsert_device(self, db, name, system_id, device_type, timestamp):
+        """
+        Register on first contact.  Later messages move last_seen (and the
+        identity fields) forward only when they are newer, and first_seen
+        back when they are older, so stored order doesn't matter.
+        """
+        row = db.execute('SELECT first_seen, last_seen FROM devices WHERE name = ?', (name,)).fetchone()
+        if row is None:
+            db.execute('''
+                INSERT INTO devices (name, system_id, device_type, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (name, system_id, device_type, timestamp, timestamp))
+            return
+        if _not_older(timestamp, row['last_seen']):
+            db.execute('''
+                UPDATE devices SET system_id = ?, device_type = ?, last_seen = ?
+                WHERE name = ?
+            ''', (system_id, device_type, timestamp, name))
+        if row['first_seen'] and not timestamp_le(row['first_seen'], timestamp):
+            db.execute('UPDATE devices SET first_seen = ? WHERE name = ?', (timestamp, name))
+
+    def _remember_name(self, name: str, system_id=None):
+        # Called inside the write transaction (lock held); a rolled-back
+        # registration only leaves a harmless alias for the same name.
+        key = normalize_device_name(name)
+        self._names.setdefault(key, name)
+        self._spellings.setdefault(key, set()).add(name)
+        self._registered.add(name)
+        if system_id is not None or name not in self._system_ids:
+            self._system_ids[name] = system_id if system_id is None else str(system_id)
+
     def upsert_device(self, name: str, system_id: str,
                       device_type: str, timestamp: str) -> bool:
         """Register a device on first contact; update last_seen on every ingest."""
         try:
-            self.db.execute('''
-                INSERT INTO devices (name, system_id, device_type, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    system_id   = excluded.system_id,
-                    device_type = excluded.device_type,
-                    last_seen   = excluded.last_seen
-            ''', (name, system_id, device_type, timestamp, timestamp))
-            self.db.commit()
+            with self._write() as db:
+                self._upsert_device(db, name, system_id, device_type, timestamp)
+                self._remember_name(name, system_id)
             return True
         except Exception as e:
             logger.error(f"upsert_device failed for {name}: {e}")
@@ -140,73 +620,92 @@ class MetricsDB:
         return {k: v for k, v in data.items()
                 if k == '_unit' or k.endswith('_unit')}
 
+    @staticmethod
+    def _update_snapshot_metrics(db, name, timestamp, data) -> bool:
+        """
+        Overwrite the metrics columns unless the snapshot already holds a
+        newer system_metrics message.  Returns True if it was updated.
+        """
+        # Full raw payload kept as metrics_json so unit fields and any future
+        # collector additions are preserved alongside the fast-access columns.
+        # Unmeasured values are stored as NULL, never 0.
+        db.execute('INSERT OR IGNORE INTO device_snapshot (name) VALUES (?)', (name,))
+        current = db.execute(
+            'SELECT metrics_timestamp FROM device_snapshot WHERE name = ?', (name,)).fetchone()[0]
+        if not _not_older(timestamp, current):
+            return False
+        metrics_json = json.dumps(
+            {k: v for k, v in data.items() if k != 'data_type'}, default=str
+        )
+        db.execute('''
+            UPDATE device_snapshot SET
+                metrics_timestamp          = ?,
+                cpu_percent                = ?,
+                ram_percent                = ?,
+                uptime_seconds             = ?,
+                uptime_formatted           = ?,
+                network_bandwidth_in_mbps  = ?,
+                network_bandwidth_out_mbps = ?,
+                metrics_json               = ?
+            WHERE name = ?
+        ''', (
+            timestamp,
+            _number_or_none(data.get('cpu_percent')),
+            _number_or_none(data.get('ram_percent')),
+            _number_or_none(data.get('uptime_seconds')),
+            data.get('uptime_formatted') if isinstance(data.get('uptime_formatted'), str) else None,
+            _number_or_none(data.get('network_bandwidth_in_mbps')),
+            _number_or_none(data.get('network_bandwidth_out_mbps')),
+            metrics_json,
+            name,
+        ))
+        return True
+
     def update_snapshot_metrics(self, name: str, timestamp: str,
                                  data: Dict[str, Any]) -> bool:
         """
         Update the metrics columns of device_snapshot from a system_metrics payload.
-        Also stores the full raw payload as metrics_json so unit fields and any
-        future collector additions are preserved alongside the fast-access columns.
         Creates the row if it doesn't exist yet (disk columns default to empty).
         """
         try:
-            metrics_json = json.dumps(
-                {k: v for k, v in data.items() if k != 'data_type'}
-            )
-            self.db.execute(
-                'INSERT OR IGNORE INTO device_snapshot (name) VALUES (?)', (name,)
-            )
-            self.db.execute('''
-                UPDATE device_snapshot SET
-                    metrics_timestamp          = ?,
-                    cpu_percent                = ?,
-                    ram_percent                = ?,
-                    uptime_seconds             = ?,
-                    uptime_formatted           = ?,
-                    network_bandwidth_in_mbps  = ?,
-                    network_bandwidth_out_mbps = ?,
-                    metrics_json               = ?
-                WHERE name = ?
-            ''', (
-                timestamp,
-                data.get('cpu_percent'),
-                data.get('ram_percent'),
-                data.get('uptime_seconds', 0),
-                data.get('uptime_formatted', '0s'),
-                data.get('network_bandwidth_in_mbps', 0.0),
-                data.get('network_bandwidth_out_mbps', 0.0),
-                metrics_json,
-                name,
-            ))
-            self.db.commit()
+            with self._write() as db:
+                self._update_snapshot_metrics(db, name, timestamp, data)
             return True
         except Exception as e:
             logger.error(f"update_snapshot_metrics failed for {name}: {e}")
             return False
 
+    @staticmethod
+    def _update_snapshot_disk(db, name, timestamp, data) -> bool:
+        """
+        Overwrite the disk columns unless the snapshot already holds a newer
+        folder_usage message.  Returns True if it was updated.
+        """
+        # Full payload (minus data_type) kept as folders_json so the dashboard
+        # can reconstruct the folder breakdown without hitting the history DB.
+        db.execute('INSERT OR IGNORE INTO device_snapshot (name) VALUES (?)', (name,))
+        current = db.execute(
+            'SELECT disk_timestamp FROM device_snapshot WHERE name = ?', (name,)).fetchone()[0]
+        if not _not_older(timestamp, current):
+            return False
+        folders_json = json.dumps(
+            {k: v for k, v in data.items() if k != 'data_type'}, default=str
+        )
+        db.execute('''
+            UPDATE device_snapshot SET
+                disk_timestamp   = ?,
+                total_disk_bytes = ?,
+                folders_json     = ?
+            WHERE name = ?
+        ''', (timestamp, _number_or_none(data.get('total_usage')), folders_json, name))
+        return True
+
     def update_snapshot_disk(self, name: str, timestamp: str,
                               data: Dict[str, Any]) -> bool:
-        """
-        Update the disk columns of device_snapshot from a folder_usage payload.
-        Stores total_disk_bytes and the full raw payload as folders_json so the
-        dashboard can reconstruct folder breakdown without hitting the history DB.
-        """
+        """Update the disk columns of device_snapshot from a folder_usage payload."""
         try:
-            total_bytes = data.get('total_usage', 0) or 0
-            # Store full payload (minus data_type) as JSON for dashboard parsing
-            folders_json = json.dumps(
-                {k: v for k, v in data.items() if k != 'data_type'}
-            )
-            self.db.execute(
-                'INSERT OR IGNORE INTO device_snapshot (name) VALUES (?)', (name,)
-            )
-            self.db.execute('''
-                UPDATE device_snapshot SET
-                    disk_timestamp   = ?,
-                    total_disk_bytes = ?,
-                    folders_json     = ?
-                WHERE name = ?
-            ''', (timestamp, total_bytes, folders_json, name))
-            self.db.commit()
+            with self._write() as db:
+                self._update_snapshot_disk(db, name, timestamp, data)
             return True
         except Exception as e:
             logger.error(f"update_snapshot_disk failed for {name}: {e}")
@@ -216,64 +715,131 @@ class MetricsDB:
     # Write — running totals                                               #
     # ------------------------------------------------------------------ #
 
-    def accumulate_network(self, name: str, current_bytes_in: int,
-                           current_bytes_out: int, timestamp: str) -> bool:
+    @staticmethod
+    def _accumulate_network(db, name, current_bytes_in, current_bytes_out, timestamp,
+                            uptime_seconds=None) -> bool:
         """
-        Add the delta since the last reading to the lifetime network totals.
+        Add the traffic since the last reading to the lifetime totals.
 
-        Delta is computed as  max(0, current - last_seen).
-        Using max(0, …) means a counter reset (reboot) contributes 0 to the
-        lifetime total for that interval — conservative but accurate.
+          - either counter null/missing  → skip (unmeasured, never treated as 0)
+          - timestamp <= last network update → skip (replay / out-of-order)
+          - current < last:
+              * uptime_seconds unknown (null/missing), or shorter than the time
+                since the last reading (+ REBOOT_UPTIME_SLACK_SECONDS): a reboot
+                or counter reset → delta = current (traffic since boot)
+              * uptime shows the machine has been up since the last reading:
+                not a reboot (interface removed, loopback no longer counted,
+                ...) → delta = 0 and the counter is re-baselined, so the
+                traffic since boot is not counted a second time
+          - otherwise delta = current - last
 
         On first contact the current counter value seeds the totals.
+        Returns True if the totals were updated.
         """
+        cur_in, cur_out = _number_or_none(current_bytes_in), _number_or_none(current_bytes_out)
+        if cur_in is None or cur_out is None:
+            return False
+        cur_in, cur_out = int(cur_in), int(cur_out)
+        if cur_in < 0 or cur_out < 0 or cur_in > _INT64_MAX or cur_out > _INT64_MAX:
+            logger.warning(f"Ignoring out-of-range network counters from {name}")
+            return False
+
+        row = db.execute('SELECT * FROM device_totals WHERE name = ?', (name,)).fetchone()
+        if row:
+            last_ts = row['network_last_updated']
+            # A last reading stamped far in the future (stored from a collector
+            # with a wrong clock, e.g. by an older Manager) blocks nothing.
+            future_last = _in_future(last_ts or row['last_updated'])
+            if last_ts and timestamp_le(timestamp, last_ts) and not future_last:
+                logger.info(
+                    f"Skipping network accumulation for {name}: message {timestamp} "
+                    f"is not newer than last update {last_ts}"
+                )
+                return False
+            last_in, last_out = row['last_bytes_in'] or 0, row['last_bytes_out'] or 0
+            reset_delta = MetricsDB._reset_delta_factor(
+                name, uptime_seconds, None if future_last else (last_ts or row['last_updated']),
+                timestamp, cur_in < last_in or cur_out < last_out)
+            delta_in  = cur_in * reset_delta  if cur_in  < last_in  else cur_in  - last_in
+            delta_out = cur_out * reset_delta if cur_out < last_out else cur_out - last_out
+            new_total_in  = (row['total_bytes_in']  or 0) + delta_in
+            new_total_out = (row['total_bytes_out'] or 0) + delta_out
+            last_updated  = _later(row['last_updated'], timestamp)
+        else:
+            # First time we see this device — seed with current OS counter
+            new_total_in, new_total_out = cur_in, cur_out
+            last_updated = timestamp
+
+        db.execute('''
+            INSERT INTO device_totals
+                (name, total_bytes_in, total_bytes_out,
+                 last_bytes_in, last_bytes_out, last_updated, network_last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                total_bytes_in       = excluded.total_bytes_in,
+                total_bytes_out      = excluded.total_bytes_out,
+                last_bytes_in        = excluded.last_bytes_in,
+                last_bytes_out       = excluded.last_bytes_out,
+                last_updated         = excluded.last_updated,
+                network_last_updated = excluded.network_last_updated
+        ''', (name, new_total_in, new_total_out,
+              cur_in, cur_out, last_updated, timestamp))
+        return True
+
+    @staticmethod
+    def _reset_delta_factor(name, uptime_seconds, last_reading: Optional[str], timestamp: str,
+                            decreased: bool) -> int:
+        """
+        1 if a counter decrease is a reboot / reset (count the current value as
+        traffic since boot), 0 if the reported uptime shows the machine has
+        been up since the previous reading (count nothing, re-baseline).
+        """
+        if not decreased:
+            return 1
+        uptime = _number_or_none(uptime_seconds)
+        elapsed = _seconds_between(last_reading, timestamp)
+        if uptime is None or uptime < 0 or elapsed is None:
+            return 1      # contract 6: no uptime to go by → reboot
+        if uptime < elapsed + REBOOT_UPTIME_SLACK_SECONDS:
+            return 1      # booted after (or about when) the previous reading
+        logger.warning(
+            f"Network counters of {name} went down at {timestamp} although it reports "
+            f"{uptime:.0f}s uptime ({elapsed:.0f}s since the previous reading at "
+            f"{last_reading}): not a reboot, so nothing is added for the lower counter "
+            f"and it is re-baselined"
+        )
+        return 0
+
+    def accumulate_network(self, name: str, current_bytes_in: Optional[int],
+                           current_bytes_out: Optional[int], timestamp: str,
+                           uptime_seconds=None) -> bool:
+        """Atomic (read + write in one transaction) wrapper; see _accumulate_network."""
         try:
-            cursor = self.db.execute(
-                'SELECT * FROM device_totals WHERE name = ?', (name,)
-            )
-            row = cursor.fetchone()
-
-            if row:
-                delta_in  = max(0, current_bytes_in  - row['last_bytes_in'])
-                delta_out = max(0, current_bytes_out - row['last_bytes_out'])
-                new_total_in  = row['total_bytes_in']  + delta_in
-                new_total_out = row['total_bytes_out'] + delta_out
-            else:
-                # First time we see this device — seed with current OS counter
-                new_total_in  = current_bytes_in
-                new_total_out = current_bytes_out
-
-            self.db.execute('''
-                INSERT INTO device_totals
-                    (name, total_bytes_in, total_bytes_out,
-                     last_bytes_in, last_bytes_out, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    total_bytes_in  = excluded.total_bytes_in,
-                    total_bytes_out = excluded.total_bytes_out,
-                    last_bytes_in   = excluded.last_bytes_in,
-                    last_bytes_out  = excluded.last_bytes_out,
-                    last_updated    = excluded.last_updated
-            ''', (name, new_total_in, new_total_out,
-                  current_bytes_in, current_bytes_out, timestamp))
-            self.db.commit()
-            return True
+            with self._write() as db:
+                return self._accumulate_network(db, name, current_bytes_in, current_bytes_out,
+                                                timestamp, uptime_seconds=uptime_seconds)
         except Exception as e:
             logger.error(f"accumulate_network failed for {name}: {e}")
             return False
 
-    def update_disk_total(self, name: str, total_disk_bytes: int,
+    @staticmethod
+    def _update_disk_total(db, name, total_disk_bytes, timestamp):
+        row = db.execute('SELECT last_updated FROM device_totals WHERE name = ?', (name,)).fetchone()
+        last_updated = _later(row['last_updated'], timestamp) if row else timestamp
+        db.execute('''
+            INSERT INTO device_totals (name, total_disk_bytes, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                total_disk_bytes = excluded.total_disk_bytes,
+                last_updated     = excluded.last_updated
+        ''', (name, _number_or_none(total_disk_bytes), last_updated))
+
+    def update_disk_total(self, name: str, total_disk_bytes: Optional[int],
                           timestamp: str) -> bool:
         """Mirror the latest total_disk_bytes into device_totals for global sums."""
         try:
-            self.db.execute('''
-                INSERT INTO device_totals (name, total_disk_bytes, last_updated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    total_disk_bytes = excluded.total_disk_bytes,
-                    last_updated     = excluded.last_updated
-            ''', (name, total_disk_bytes, timestamp))
-            self.db.commit()
+            with self._write() as db:
+                self._update_disk_total(db, name, total_disk_bytes, timestamp)
             return True
         except Exception as e:
             logger.error(f"update_disk_total failed for {name}: {e}")
@@ -284,32 +850,28 @@ class MetricsDB:
     # ------------------------------------------------------------------ #
 
     def get_all_devices(self) -> List[Dict]:
-        cursor = self.db.execute('SELECT * FROM devices ORDER BY name')
-        return [dict(row) for row in cursor.fetchall()]
+        return [dict(row) for row in self._conn.query('SELECT * FROM devices ORDER BY name')]
 
     def get_device(self, name: str) -> Optional[Dict]:
-        cursor = self.db.execute('SELECT * FROM devices WHERE name = ?', (name,))
-        row = cursor.fetchone()
+        row = self._conn.query_one('SELECT * FROM devices WHERE name = ?', (self.resolve_read_name(name),))
         return dict(row) if row else None
 
     def get_all_systems(self) -> List[str]:
-        cursor = self.db.execute('SELECT name FROM devices ORDER BY name')
-        return [row[0] for row in cursor.fetchall()]
+        return [row[0] for row in self._conn.query('SELECT name FROM devices ORDER BY name')]
 
     # ------------------------------------------------------------------ #
     # Read — snapshots                                                     #
     # ------------------------------------------------------------------ #
 
     def get_snapshot(self, name: str) -> Optional[Dict]:
-        cursor = self.db.execute(
-            'SELECT * FROM device_snapshot WHERE name = ?', (name,)
+        row = self._conn.query_one(
+            'SELECT * FROM device_snapshot WHERE name = ?', (self.resolve_read_name(name),)
         )
-        row = cursor.fetchone()
         return self._unpack_snapshot(row) if row else None
 
     def get_all_snapshots(self) -> Dict[str, Dict]:
-        cursor = self.db.execute('SELECT * FROM device_snapshot ORDER BY name')
-        return {row['name']: self._unpack_snapshot(row) for row in cursor.fetchall()}
+        rows = self._conn.query('SELECT * FROM device_snapshot ORDER BY name')
+        return {row['name']: self._unpack_snapshot(row) for row in rows}
 
     def _unpack_snapshot(self, row) -> Dict:
         d = dict(row)
@@ -324,26 +886,24 @@ class MetricsDB:
     # ------------------------------------------------------------------ #
 
     def get_totals(self, name: str) -> Optional[Dict]:
-        cursor = self.db.execute(
-            'SELECT * FROM device_totals WHERE name = ?', (name,)
+        row = self._conn.query_one(
+            'SELECT * FROM device_totals WHERE name = ?', (self.resolve_read_name(name),)
         )
-        row = cursor.fetchone()
         return dict(row) if row else None
 
     def get_all_totals(self) -> Dict[str, Dict]:
-        cursor = self.db.execute('SELECT * FROM device_totals ORDER BY name')
-        return {row['name']: dict(row) for row in cursor.fetchall()}
+        rows = self._conn.query('SELECT * FROM device_totals ORDER BY name')
+        return {row['name']: dict(row) for row in rows}
 
     def get_global_totals(self) -> Dict:
         """Sum network and disk totals across all devices."""
-        cursor = self.db.execute('''
+        row = self._conn.query_one('''
             SELECT
                 SUM(total_bytes_in)   AS total_bytes_in,
                 SUM(total_bytes_out)  AS total_bytes_out,
                 SUM(total_disk_bytes) AS total_disk_bytes
             FROM device_totals
         ''')
-        row = cursor.fetchone()
         if row:
             return {
                 'total_bytes_in':   row['total_bytes_in']   or 0,
@@ -363,7 +923,7 @@ class MetricsDB:
         Includes a 'units' dict extracted from metrics_json.
         """
         result = {}
-        cursor = self.db.execute('''
+        rows = self._conn.query('''
             SELECT d.name, d.system_id, d.device_type,
                    s.metrics_timestamp AS timestamp,
                    s.cpu_percent, s.ram_percent,
@@ -379,22 +939,27 @@ class MetricsDB:
             WHERE s.metrics_timestamp IS NOT NULL
             ORDER BY d.name
         ''')
-        for row in cursor.fetchall():
+        for row in rows:
             d = dict(row)
             try:
                 raw = json.loads(d.pop('metrics_json') or '{}')
             except Exception:
                 raw = {}
+            # Current counters come from the latest message itself, so a
+            # message that couldn't measure them shows null rather than the
+            # previous reading.
+            for key in ('network_bytes_in', 'network_bytes_out'):
+                if key in raw:
+                    d[key] = _number_or_none(raw[key])
             d['units']           = self._extract_units(raw)
             d['gpus']            = raw.get('gpus', [])
-            d['total_ram_bytes'] = raw.get('total_ram_bytes', 0)
+            d['total_ram_bytes'] = _number_or_none(raw.get('total_ram_bytes'))
             result[d['name']] = d
         return result
 
     def get_latest(self, name: str) -> Optional[Dict]:
         """Latest system_metrics snapshot for one system."""
-        all_latest = self.get_latest_for_all()
-        return all_latest.get(name)
+        return self.get_latest_for_all().get(self.resolve_read_name(name))
 
     def get_latest_disk_usage_for_all(self) -> Dict[str, Dict]:
         """
@@ -402,7 +967,7 @@ class MetricsDB:
         Shape compatible with /api/usage/all dashboard calls.
         """
         result = {}
-        cursor = self.db.execute('''
+        rows = self._conn.query('''
             SELECT d.name, d.system_id, d.device_type,
                    s.disk_timestamp   AS timestamp,
                    s.total_disk_bytes,
@@ -412,7 +977,7 @@ class MetricsDB:
             WHERE s.disk_timestamp IS NOT NULL
             ORDER BY d.name
         ''')
-        for row in cursor.fetchall():
+        for row in rows:
             d = dict(row)
             try:
                 folders_raw = json.loads(d.pop('folders_json') or '{}')
@@ -423,8 +988,7 @@ class MetricsDB:
         return result
 
     def get_latest_disk_usage(self, name: str) -> Optional[Dict]:
-        all_disk = self.get_latest_disk_usage_for_all()
-        return all_disk.get(name)
+        return self.get_latest_disk_usage_for_all().get(self.resolve_read_name(name))
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -432,28 +996,35 @@ class MetricsDB:
 
     def delete_system(self, name: str) -> bool:
         """
-        Remove all records for a system from the central summary DB.
-        Clears rows from devices, device_snapshot, and device_totals.
+        Remove ONE device's records from the central summary DB: devices,
+        device_snapshot, device_totals and the per-user tables of the row
+        reads for `name` return (that exact spelling if registered, else the
+        spelling it resolves to), plus any per-user rows stored under exactly
+        `name`.  Other registered spellings that normalize alike (two
+        machines 'lab-a' / 'lab_a', or a stale row from before a rename)
+        keep their rows; delete each by its own name.
         Returns True if any rows were deleted.
         """
         try:
-            cur = self.db.cursor()
-            cur.execute('DELETE FROM devices WHERE name = ?', (name,))
-            cur.execute('DELETE FROM device_snapshot WHERE name = ?', (name,))
-            cur.execute('DELETE FROM device_totals WHERE name = ?', (name,))
-            self.db.commit()
-            deleted = cur.rowcount > 0
-            logger.info(f"Deleted system '{name}' from central metrics DB")
-            return deleted
+            with self._conn.transaction() as db:
+                names = {name, self.resolve_read_name(name)}
+                deleted = 0
+                for n in names:
+                    for table, col in (('devices', 'name'), ('device_snapshot', 'name'),
+                                       ('device_totals', 'name'), ('device_user_snapshot', 'name'),
+                                       ('user_metrics_history', 'device_name')):
+                        deleted += db.execute(f'DELETE FROM {table} WHERE {col} = ?', (n,)).rowcount
+                self._registered.difference_update(names)   # a deleted name is no longer grandfathered
+            logger.info(f"Deleted system '{name}' ({', '.join(sorted(names))}) from central metrics DB "
+                        f"({deleted} rows)")
+            self._load_name_index()     # other spellings of the name keep being resolved
+            return deleted > 0
         except Exception as e:
             logger.error(f"Failed to delete system '{name}' from metrics DB: {e}")
             return False
 
     def close(self):
-        try:
-            self.db.close()
-        except Exception:
-            pass
+        self._conn.close()
 
 
 class UserMetricsStore:
@@ -461,51 +1032,94 @@ class UserMetricsStore:
     Manages per-user CPU/RAM snapshot and normalized history.
 
     Snapshot table  (device_user_snapshot): latest row per (device, username).
-    History table   (user_metrics_history):  one row per (device, timestamp, username).
+    History table   (user_metrics_history):  one row per (device, timestamp, username),
+                                             msg_id UNIQUE for dedup.
     """
 
-    def __init__(self, db):
-        self.db = db
-        self._init_tables()
+    def __init__(self, metrics_db: MetricsDB, init: bool = True):
+        self._metrics_db = metrics_db
+        self._conn = metrics_db._conn
+        self.db = metrics_db.db   # raw connection, kept for compatibility
+        if init:
+            self._init_tables()
 
     def _init_tables(self):
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS device_user_snapshot (
-                name          TEXT NOT NULL,
-                username      TEXT NOT NULL,
-                cpu_percent   REAL,
-                ram_bytes     INTEGER,
-                ram_formatted TEXT,
-                timestamp     TEXT,
-                PRIMARY KEY (name, username)
-            )
-        ''')
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS user_metrics_history (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_name TEXT NOT NULL,
-                timestamp   TEXT NOT NULL,
-                username    TEXT NOT NULL,
-                cpu_percent REAL,
-                ram_bytes   INTEGER,
-                ram_formatted TEXT
-            )
-        ''')
-        self.db.execute('''
-            CREATE INDEX IF NOT EXISTS idx_umh_device_ts
-                ON user_metrics_history (device_name, timestamp)
-        ''')
-        self.db.execute('''
-            CREATE INDEX IF NOT EXISTS idx_umh_device_user_ts
-                ON user_metrics_history (device_name, username, timestamp)
-        ''')
-        self.db.commit()
+        with self._conn.transaction() as db:
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS device_user_snapshot (
+                    name          TEXT NOT NULL,
+                    username      TEXT NOT NULL,
+                    cpu_percent   REAL,
+                    ram_bytes     INTEGER,
+                    ram_formatted TEXT,
+                    timestamp     TEXT,
+                    PRIMARY KEY (name, username)
+                )
+            ''')
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS user_metrics_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_name TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    username    TEXT NOT NULL,
+                    cpu_percent REAL,
+                    ram_bytes   INTEGER,
+                    ram_formatted TEXT,
+                    msg_id      TEXT
+                )
+            ''')
+            cols = {row[1] for row in db.execute('PRAGMA table_info(user_metrics_history)').fetchall()}
+            if 'msg_id' not in cols:
+                # Migration: existing rows get NULL (UNIQUE allows many NULLs)
+                db.execute('ALTER TABLE user_metrics_history ADD COLUMN msg_id TEXT')
+                logger.info("Migrated user_metrics_history: added msg_id column")
+            db.execute('''
+                CREATE INDEX IF NOT EXISTS idx_umh_device_ts
+                    ON user_metrics_history (device_name, timestamp)
+            ''')
+            db.execute('''
+                CREATE INDEX IF NOT EXISTS idx_umh_device_user_ts
+                    ON user_metrics_history (device_name, username, timestamp)
+            ''')
+            db.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_umh_msg_id
+                    ON user_metrics_history (msg_id)
+            ''')
 
-    def ingest(self, device_name: str, timestamp: str, username: str,
-               cpu_percent: float, ram_bytes: int, ram_formatted: str):
-        """Store one user-metric observation: updates snapshot + appends history."""
-        # Upsert snapshot
-        self.db.execute('''
+    @staticmethod
+    def _ingest(db, device_name, timestamp, username, cpu_percent, ram_bytes,
+                ram_formatted, msg_id=None, raw_timestamp=None, update_snapshot=True):
+        """
+        History row, unless it is there already: by msg_id (UNIQUE index),
+        or because an older Manager stored this reading (a msg_id NULL row
+        with the same device, user and timestamp, raw or canonical - whatever
+        the message's id: none, "legacy-...", or a collector's random id the
+        older Manager dropped); the snapshot row only if this message is not
+        older (and update_snapshot: False for a message from the future).
+        """
+        row = db.execute(
+            'SELECT timestamp FROM device_user_snapshot WHERE name = ? AND username = ?',
+            (device_name, username)).fetchone()
+        if update_snapshot and (row is None or _not_older(timestamp, row['timestamp'])):
+            UserMetricsStore._upsert_snapshot(
+                db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted)
+        stamps = list(dict.fromkeys(t for t in (raw_timestamp, timestamp) if isinstance(t, str)))
+        ph = ', '.join(['?'] * len(stamps))
+        if stamps and db.execute(
+                f'SELECT 1 FROM user_metrics_history INDEXED BY idx_umh_device_user_ts '
+                f'WHERE device_name = ? AND username = ? AND timestamp IN ({ph}) '
+                f'AND msg_id IS NULL LIMIT 1',
+                [device_name, username] + stamps).fetchone():
+            return
+        db.execute('''
+            INSERT OR IGNORE INTO user_metrics_history
+                (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted, msg_id))
+
+    @staticmethod
+    def _upsert_snapshot(db, device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted):
+        db.execute('''
             INSERT INTO device_user_snapshot
                 (name, username, cpu_percent, ram_bytes, ram_formatted, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -516,45 +1130,77 @@ class UserMetricsStore:
                 timestamp     = excluded.timestamp
         ''', (device_name, username, cpu_percent, ram_bytes, ram_formatted, timestamp))
 
-        # Append history
-        self.db.execute('''
-            INSERT INTO user_metrics_history
-                (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (device_name, timestamp, username, cpu_percent, ram_bytes, ram_formatted))
-
-        self.db.commit()
+    def ingest(self, device_name: str, timestamp: str, username: str,
+               cpu_percent: Optional[float], ram_bytes: Optional[int],
+               ram_formatted: Optional[str], msg_id: Optional[str] = None):
+        """Store one user-metric observation: updates snapshot + appends history."""
+        with self._metrics_db._write() as db:
+            self._ingest(db, device_name, timestamp, username, cpu_percent,
+                         ram_bytes, ram_formatted, msg_id)
 
     def get_snapshot(self, device_name: str) -> list:
         """Current users for one device, sorted by cpu_percent desc."""
-        cur = self.db.execute('''
+        rows = self._conn.query('''
             SELECT username, cpu_percent, ram_bytes, ram_formatted, timestamp
             FROM device_user_snapshot
             WHERE name = ?
             ORDER BY cpu_percent DESC
         ''', (device_name,))
-        return [dict(r) for r in cur.fetchall()]
+        return [dict(r) for r in rows]
 
     def get_all_snapshots(self) -> dict:
         """Current users for all devices. Returns {device_name: [user_rows]}."""
-        cur = self.db.execute('''
+        rows = self._conn.query('''
             SELECT name, username, cpu_percent, ram_bytes, ram_formatted, timestamp
             FROM device_user_snapshot
             ORDER BY name, cpu_percent DESC
         ''')
         result = {}
-        for row in cur.fetchall():
+        for row in rows:
             d = dict(row)
             result.setdefault(d.pop('name'), []).append(d)
         return result
 
+    def has_device(self, device_name: str) -> bool:
+        """
+        True if per-user rows exist under exactly this device name.  The old
+        DELETE /api/system/<name> left them behind, so they can outlive the
+        device registry row; they stay readable.
+        """
+        return self._conn.query_one('''
+            SELECT 1 WHERE EXISTS (SELECT 1 FROM device_user_snapshot WHERE name = ?)
+                        OR EXISTS (SELECT 1 FROM user_metrics_history WHERE device_name = ?)
+        ''', (device_name, device_name)) is not None
+
     def get_history(self, device_name: str, username: str, limit: int = 200) -> list:
         """Time-series rows for one user on one device."""
-        cur = self.db.execute('''
+        rows = self._conn.query('''
             SELECT timestamp, cpu_percent, ram_bytes, ram_formatted
             FROM user_metrics_history
             WHERE device_name = ? AND username = ?
             ORDER BY timestamp DESC
             LIMIT ?
         ''', (device_name, username, limit))
-        return [dict(r) for r in cur.fetchall()]
+        return [dict(r) for r in rows]
+
+    # ---- retention support (archive_metrics.py) ---- #
+
+    def history_older_than(self, cutoff: str, limit: int = 5000) -> list:
+        """Oldest-first user_metrics_history rows with timestamp < cutoff."""
+        rows = self._conn.query('''
+            SELECT * FROM user_metrics_history
+            WHERE timestamp < ?
+            ORDER BY timestamp, id
+            LIMIT ?
+        ''', (cutoff, limit))
+        return [dict(r) for r in rows]
+
+    def delete_history_ids(self, ids: list) -> int:
+        deleted = 0
+        with self._metrics_db._write() as db:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                ph = ', '.join(['?'] * len(chunk))
+                deleted += db.execute(
+                    f'DELETE FROM user_metrics_history WHERE id IN ({ph})', chunk).rowcount
+        return deleted

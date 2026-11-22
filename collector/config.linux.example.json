@@ -1,0 +1,27 @@
+{
+  "comment": "Linux (Ubuntu/Debian) collector config. install-collector-linux.sh writes it to /etc/lab-monitor/collector.json (mode 0640 root:labmon). 'volumes' is left out on purpose: real filesystems are discovered from the mount table.",
+  "name": "compute-01",
+  "id": "linux-compute-01",
+  "device_type": "Server",
+  "platform": "linux",
+  "manager_url": "http://atlantis.med.harvard.edu:5000",
+  "manager_token": "YOUR-COLLECTOR-TOKEN-FOR-THIS-DEVICE",
+
+  "scan_paths": [
+    "/home/*",
+    "/data/*"
+  ],
+  "include_network_mounts": false,
+  "cross_filesystems": false,
+
+  "data_dir": "/var/lib/lab-monitor",
+  "log_file": "/var/log/lab-monitor/collector.log",
+  "log_level": "INFO",
+  "timeout_seconds": 3600,
+  "total_timeout_seconds": 10800,
+  "request_timeout_seconds": 30,
+  "max_batch_messages": 100,
+  "max_queue_messages": 50000,
+  "exclude_system_accounts": true,
+  "exclude_users": []
+}

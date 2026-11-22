@@ -1,347 +1,276 @@
 # Remote NAS Storage Configuration
 
+> **Superseded.** Don't put the Manager's `data_dir` on a NAS share. SQLite (in WAL mode above all)
+> is not reliable over SMB; in practice it produced thousands of failed transactions a day
+> (`cannot commit - no transaction is active`, `disk I/O error`) and, through collector retries,
+> duplicate rows. Keep `data_dir` on a local disk (`E:\Users\lab-monitor\manager-data`) and let the
+> Manager copy it to the NAS every night: [manager/README.md, "Snapshots to a
+> NAS"](../manager/README.md#snapshots-to-a-nas). To move an existing NAS `data_dir`:
+> ["Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas). The rest of
+> this page is kept for installs that still run this way.
+
 ## Overview
 
-You can configure lab-monitor to store its data on a remote NAS (e.g., `\\triton1.hms.harvard.edu\lab-monitor-data`) instead of the local Atlantis drive. This enables centralized backup and snapshot management.
+You can store the Manager's databases on a NAS share (for example
+`\\triton1.hms.harvard.edu\lab-monitor-data`) instead of the local atlantis drive, so they are
+covered by the NAS's snapshots and backups. This page explains what that requires.
+
+**The default: a local `data_dir` of its own** (`E:\Users\lab-monitor\manager-data`, not the local
+collector's `E:\Users\lab-monitor\data`), copied to the NAS every night by the Manager's
+[snapshots](../manager/README.md#snapshots-to-a-nas). The NAS then holds consistent copies, and
+its own snapshots and replication cover them. Don't use a share for the live databases (see the
+banner above).
 
 ---
 
 ## Key Insight: Independent Data Directories
 
-**Manager and Collector have independent `data_dir` paths.**
+**Manager and Collector have independent `data_dir` settings.**
 
-- **Collector's `data_dir`**: Used only for local archiving (`YYYY-MM.jsonl`) and staging (`queue.json`)
-- **Manager's `data_dir`**: Used for central databases (`metrics.db`, per-system `data.db`)
+- **Collector's `data_dir`**: local archive (`YYYY-MM.jsonl`), queue (`queue.json` +
+  `queue.json.lock`) and `network_snapshot.json`
+- **Manager's `data_dir`**: central database (`metrics.db`) and per-system history
+  (`<system>\data.db`), plus the `*.pre-upgrade-*.bak` copies after an upgrade
 
-Data flow:
 ```
-Collector → Writes archive + queue to its data_dir
+Collector → writes archive + queue to its own data_dir
          ↓
-         → POSTs queue to Manager (HTTP)
+         → POSTs the queue to the Manager (HTTP)
          ↓
-Manager → Receives POST → Stores to its own data_dir
+Manager  → stores to its own data_dir
 ```
 
-They're **independent**. The Collector doesn't read from the Manager's storage, and the Manager doesn't read from the Collector's local queue.
+The Collector never reads the Manager's storage and the Manager never reads the Collector's queue.
 
 ---
 
 ## Configuration Options
 
-### Option A: Both Point to Remote NAS (Everything Backed Up)
+### Option B: Collector Local, Manager on the Share (RECOMMENDED if you use a share)
 
 **Pros:**
-- ✅ All data (archives + databases) on NAS, snapshotted daily
-- ✅ Complete centralized backup
-- ✅ Simplest mental model (one remote path)
+- The Manager history (the data that matters) lives on the NAS and is snapshotted with it
+- The collector's queue and archive stay local and fast, and keep working if the NAS is down
 
 **Cons:**
-- ⚠️ Network I/O for everything (queue writes, database operations)
-- ⚠️ SQLite databases over SMB can be slower (though WAL mode mitigates this)
-- ⚠️ Any network hiccup affects both collector and manager
+- The collector archives on atlantis are not on the NAS (they are a local safety net)
+- Every Manager write goes over the network (see [SMB considerations](#smbnetwork-considerations))
 
-**Configuration:**
-
-Manager (`E:\Users\lab-monitor\scripts\lab-monitor\manager\local\config.json`):
+**Manager** (`E:\Users\lab-monitor\scripts\lab-monitor\manager\config.json`):
 ```json
 {
   "host": "0.0.0.0",
   "port": 5000,
   "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data",
-  "auth_tokens": ["YOUR-SECURE-TOKEN"],
-  ...
+  "admin_tokens": ["<random admin token>"],
+  "read_tokens": ["<random read token>"],
+  "collector_tokens": {"atlantis": "<random token>"},
+  "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log"
 }
 ```
 
-Collector on atlantis (`E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`):
+**Collector on atlantis** (`E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`):
 ```json
 {
   "name": "atlantis",
   "id": "windows-atlantis",
   "manager_url": "http://localhost:5000",
-  "manager_token": "YOUR-SECURE-TOKEN",
-  "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data",
-  ...
+  "manager_token": "<atlantis's collector token>",
+  "data_dir": "E:\\Users\\lab-monitor\\data"
 }
 ```
 
-Remote path structure:
-```
-\\triton1.hms.harvard.edu\lab-monitor-data\
-├── metrics.db                   ← Manager: central summary
-├── atlantis\
-│   ├── data.db                  ← Manager: full history
-│   ├── 2026-08.jsonl            ← Collector: archive
-│   └── queue.json               ← Collector: staging
-├── triton\
-│   ├── data.db
-│   ├── 2026-08.jsonl
-│   └── queue.json
-└── other-system\
-    └── ...
-```
-
----
-
-### Option B: Collector Local, Manager Remote (RECOMMENDED)
-
-**Pros:**
-- ✅ Manager history (the most important data) backed up on NAS
-- ✅ Collector queue stays local and fast (resilient to network hiccups)
-- ✅ Best performance — only critical path is remote
-- ✅ Collector archives stay local (they're small, append-only)
-- ✅ If NAS goes down, Collector can still queue locally
-
-**Cons:**
-- ⚠️ Collector archives not automatically backed up (but they're just append-only logs; rarely needed)
-
-**Configuration:**
-
-Manager (`E:\Users\lab-monitor\scripts\lab-monitor\manager\local\config.json`):
-```json
-{
-  "host": "0.0.0.0",
-  "port": 5000,
-  "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data",
-  "auth_tokens": ["YOUR-SECURE-TOKEN"],
-  ...
-}
-```
-
-Collector on atlantis (`E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`):
-```json
-{
-  "name": "atlantis",
-  "id": "windows-atlantis",
-  "manager_url": "http://localhost:5000",
-  "manager_token": "YOUR-SECURE-TOKEN",
-  "data_dir": "E:\\Users\\lab-monitor\\data",
-  ...
-}
-```
-
-Local and remote structure:
-
-**Local (E:\Users\lab-monitor\data):**
+**Local (`E:\Users\lab-monitor\data`):**
 ```
 E:\Users\lab-monitor\data\
 └── atlantis\
     ├── 2026-08.jsonl            ← Collector: archive (local)
-    └── queue.json               ← Collector: staging (local)
+    ├── queue.json               ← Collector: queue (local)
+    └── queue.json.lock
 ```
 
-**Remote (\\triton1.hms.harvard.edu\lab-monitor-data):**
+**Remote (`\\triton1.hms.harvard.edu\lab-monitor-data`):**
 ```
 \\triton1.hms.harvard.edu\lab-monitor-data\
-├── metrics.db                   ← Manager: central summary (backed up)
+├── metrics.db                   ← Manager: central summary
 ├── atlantis\
-│   └── data.db                  ← Manager: full history (backed up)
+│   └── data.db                  ← Manager: full history
 ├── triton\
-│   └── data.db                  ← Manager: full history (backed up)
+│   └── data.db
 └── other-system\
     └── data.db
 ```
 
----
+### Option A: Collector data_dir on the Share too (not recommended)
 
-## Which Option?
+Putting a collector's `data_dir` on a share is not recommended:
+- The queue relies on file locking, which some network file systems don't support; the collector
+  then logs an error on every run and uses the queue unlocked (see
+  [collector/README.md](../collector/README.md#local-storage)).
+- The Windows collector tasks usually run as SYSTEM, which reaches a share as the computer account
+  (`DOMAIN\ATLANTIS$`), not as you.
+- If the NAS is unreachable, the collector can neither archive nor queue.
 
-| Scenario | Recommendation |
-|----------|---|
-| **You want everything backed up + don't mind network I/O** | Option A |
-| **You want performance + Manager data backed up + collector archives are "nice to have"** | Option B (Recommended) |
-| **You have very fast network (iSCSI, Fiber, etc.)** | Option A is acceptable |
-| **Network can be flaky** | Option B (local queue survives brief outages) |
-
-**My recommendation: Option B** — The Manager databases are what matter (they're the authoritative history). The Collector archives are just a local safety net; in practice, you'll rely on the Manager's databases for any data recovery.
+Keep collector `data_dir`s local; their archives can be copied to the NAS separately if wanted.
 
 ---
 
 ## Network Path Format
 
-Windows supports two formats for network paths:
-
-### UNC Path (Recommended)
+### UNC Path (the only supported form)
 ```json
 "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data"
 ```
-- `\\\\` at the start (escaped backslashes in JSON)
-- Hostname or IP after the double backslash
-- Share name
-- Optional subfolder
+- `\\\\` at the start (each backslash doubled in JSON), then the host name, the share and an optional
+  subfolder.
 
-### Mapped Drive Letter
+**A UNC `data_dir` needs a task with a stored password.** The installer registers the Manager and
+Dashboard tasks with S4U (no stored password) by default, and an S4U task has **no network access**.
+When `data_dir`, a log file or an enabled `snapshot.dest_dir` is a UNC path, `install-manager-dashboard-taskscheduler.ps1` asks for the
+account's password (or takes `-TaskCredential (Get-Credential)`) and registers the tasks with it. The
+account needs read/write access to the share. Re-run the installer whenever that password changes,
+or the tasks stop starting.
+
+### Mapped Drive Letter (not supported)
 ```json
 "data_dir": "Z:\\lab-monitor-data"
 ```
-Requires the network share to be pre-mapped:
-```powershell
-net use Z: \\triton1.hms.harvard.edu\lab-monitor-data /persistent:yes
-```
-
-**I recommend UNC paths** — they don't depend on a mapped drive and work immediately without setup.
+Scheduled tasks don't see drive mappings, so the Manager would not find `Z:`. The installer stops
+with an error (before changing anything) when `data_dir`, a log file or an enabled `snapshot.dest_dir`
+uses a mapped or missing drive letter. Use the UNC path instead.
 
 ---
 
 ## SMB/Network Considerations
 
-### SQLite WAL Mode (Already Enabled)
+The Manager opens its SQLite databases in WAL mode. SQLite's documentation warns that WAL needs all
+processes using a database to be on the same machine and that network file systems can break
+SQLite's locking. That is what happened on this lab's server, even with exactly one Manager: failed
+transactions and `disk I/O error` (see the banner). Move such an install to a local disk
+([Migration from Remote back to Local](#migration-from-remote-back-to-local)). Until then:
 
-Both components use SQLite WAL mode for concurrent access:
-```python
-db.execute('PRAGMA journal_mode=WAL')
-```
-
-This works reliably over Windows SMB shares, even with concurrent readers/writers. However:
-
-- **First access**: Slightly slower than local (network latency)
-- **Sustained load**: Similar performance to local with WAL mode enabled
-- **Network hiccups**: May briefly stall operations (depends on timeout settings)
-
-### Performance Expectations
-
-**Option A (Both Remote):**
-- Collector queue writes: ~10-50 ms (vs 1 ms local)
-- Manager database inserts: ~5-20 ms (vs 1-2 ms local)
-- Overall impact: Negligible for 5-minute collection intervals
-
-**Option B (Collector Local, Manager Remote):**
-- Collector: No change (local)
-- Manager: Same as Option A's Manager timing
-- Overall impact: Minimal (Manager isn't time-critical)
+- Never point two Managers (or a Manager and a copy job that writes) at the same files.
+- Network latency makes every write slower; the Manager stores each message in its own transaction.
+- If the share is briefly unreachable, writes fail as `error` and the collectors keep those messages
+  queued; they are stored on a later run.
+- If the share is unreachable at startup, the Manager exits with "Cannot open data_dir …" and the
+  launcher retries every 10 seconds.
 
 ---
 
 ## Backup & Snapshot Strategy
 
-If you're using Triton's snapshot feature (e.g., hourly snapshots):
+**Local `data_dir` (the default):** the Manager's nightly [snapshots](../manager/README.md#snapshots-to-a-nas)
+copy every database consistently to `snapshot.dest_dir` on the NAS while it keeps running, verify each
+copy and prune old ones. By hand instead, a consistent copy needs the Manager stopped for the copy
+(collectors queue meanwhile):
 
-**With Option A (Both Remote):**
-- Snapshots capture everything — archives, queues, databases
-- Full point-in-time recovery available
-- **Disadvantage:** Queues are temporary; snapshots include incomplete data
+```powershell
+Stop-ScheduledTask -TaskName "Lab Monitor Manager"
+# make sure the python process is gone (see INSTALLATION.md, "Restart a service")
+robocopy E:\Users\lab-monitor\manager-data \\triton1.hms.harvard.edu\lab-monitor-backup\data /MIR /COPY:DAT /R:2 /W:5
+Start-ScheduledTask -TaskName "Lab Monitor Manager"
+```
 
-**With Option B (Manager Remote):**
-- Snapshots capture just `metrics.db` and per-system `data.db`
-- This is the data that matters
-- Collectors have local backups anyway (archives)
-- **Advantage:** Smaller snapshots, cleaner recovery
+**Option B (Manager on the share, not recommended):** NAS snapshots capture `metrics.db` and every
+`data.db`. A snapshot that captures a database and its `-wal` file at the same instant is
+crash-consistent: SQLite recovers it on open, as after a power cut.
+
+(`/MIR` deletes files in the destination that no longer exist in the source; use a dated folder and
+`/E` instead if you want to keep every copy.)
+
+The collector archives (`YYYY-MM.jsonl` on each collector) are a second, independent record: a lost
+Manager history can be rebuilt from them with `tools/replay_archives.py`.
 
 ---
 
-## Setup Steps
+## Setup Steps (switching to a share)
 
-### 1. Create NAS Share (if not already done)
+Not recommended (see the banner); kept for reference. For a NAS copy of the databases, turn on
+[snapshots](../manager/README.md#snapshots-to-a-nas) instead.
 
-On Triton NAS:
-```
-Create share: lab-monitor-data
-Permissions: Read/Write for atlantis user
-```
-
-### 2. Update Manager Config
-
-Edit `E:\Users\lab-monitor\scripts\lab-monitor\manager\local\config.json`:
-```json
-{
-  "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data",
-  ...
-}
-```
-
-### 3. Update Collector Config (if Option A)
-
-Edit `E:\Users\lab-monitor\scripts\lab-monitor\collector\local\config.json`:
-```json
-{
-  "data_dir": "\\\\triton1.hms.harvard.edu\\lab-monitor-data",
-  ...
-}
-```
-
-(Or skip this step if using Option B — keep Collector local.)
-
-### 4. Restart Services
-
-```powershell
-Get-ScheduledTask -TaskName "Lab Monitor*" | Stop-ScheduledTask
-Start-Sleep -Seconds 2
-Get-ScheduledTask -TaskName "Lab Monitor*" | Start-ScheduledTask
-```
-
-### 5. Verify
-
-Check Manager logs:
-```powershell
-Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 20
-# Should show: "Central metrics DB: \\triton1.hms.harvard.edu\lab-monitor-data\metrics.db"
-```
-
-Run a collection manually:
-```powershell
-cd E:\Users\lab-monitor\scripts\lab-monitor\collector
-python collector.py --config local\config.json --mode metrics --verbose
-# Should complete without errors
-```
+1. **Create the share** on the NAS (e.g. `lab-monitor-data`) with read/write for the account the
+   Manager tasks will run as.
+2. **Stop the Manager and Dashboard** and make sure the processes are gone.
+3. **Copy the existing data** (keeps all history):
+   ```powershell
+   robocopy <the current data_dir> \\triton1.hms.harvard.edu\lab-monitor-data /E /COPY:DAT /R:2 /W:5
+   ```
+   This also copies atlantis's own collector files (`YYYY-MM.jsonl`, `queue.json`); the copies on
+   the share are simply not used, and the collector keeps writing locally (Option B). Keep the local
+   copy until the Manager runs from the share.
+4. **Update `data_dir`** in `manager\config.json` to the UNC path.
+5. **Re-run the installer** so the tasks get a stored password:
+   ```powershell
+   cd E:\Users\lab-monitor\scripts\lab-monitor
+   .\install-manager-dashboard-taskscheduler.ps1 -SkipGitPull
+   ```
+   It keeps both configs, asks for the password, registers and starts the tasks.
+6. **Verify:**
+   ```powershell
+   Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 20
+   # "Central metrics DB: \\triton1.hms.harvard.edu\lab-monitor-data\metrics.db"
+   Invoke-RestMethod http://localhost:5000/health
+   ```
+   and check that the Dashboard shows the full history.
 
 ---
 
 ## Troubleshooting
 
+### Manager restarts every 10 s; `manager-console.log` says "Cannot open data_dir"
+The task account can't reach the share. An S4U task has no network access: re-run the installer so
+it registers the tasks with a stored password. Also check the account's permissions on the share and
+that the password hasn't changed.
+
 ### "Permission denied" or "Access is denied"
+The task account lacks write permission on the share. Grant it.
 
-**Cause:** Atlantis user doesn't have write permission on the share  
-**Fix:** Add write permission for the user running the services on Triton
-
-### "Cannot create file" or "Network path not found"
-
-**Cause:** UNC path typo or share doesn't exist  
-**Fix:** Test from PowerShell:
+### "Network path not found"
+UNC path typo, or the share doesn't exist:
 ```powershell
 Test-Path "\\triton1.hms.harvard.edu\lab-monitor-data"
-# Should return True
 ```
 
-### Slow collection or "timeout" errors
+### Installer stops: "mapped (or missing) drive letter"
+Replace the drive letter with the UNC path (`net use` lists the mappings) and re-run.
 
-**Cause:** Network latency or SMB congestion  
-**Fix:** 
-- Increase `request_timeout_seconds` in Collector config (default: 30)
-- Check network connectivity: `ping triton1.hms.harvard.edu`
-- Monitor SMB share performance: `Performance Monitor` → Network Interface
+### Collector POSTs time out
+The Manager waits for the share on every write. Raise `request_timeout_seconds` in the collector
+config (default 30); the messages stay queued until they are acknowledged.
 
-### "Database is locked"
-
-**Cause:** Multiple Manager instances trying to access same database  
-**Fix:** Ensure only one Manager process is running:
+### "database is locked"
+More than one process is using the databases. Make sure only one Manager runs:
 ```powershell
-tasklist | findstr python
-# Should show only one manager.py process
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object CommandLine -match 'manager\.py' | Select-Object ProcessId, CommandLine
 ```
 
 ---
 
-## Migration from Local to Remote
+## Migration from Remote back to Local
 
-If you've been running with local storage and want to switch to remote:
+Follow [manager/README.md, "Moving `data_dir` off the NAS"](../manager/README.md#moving-data_dir-off-the-nas)
+(during the review-fix upgrade: [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard),
+before the installer):
 
-### Option 1: Clean Start
-1. Stop Manager and Collector
-2. Update configs to point to remote NAS
-3. Start services
-4. Data will accumulate fresh on remote (old local archives remain local)
-
-### Option 2: Migrate History
-1. Stop services
-2. Copy `E:\Users\lab-monitor\data\*` to `\\triton1.hms.harvard.edu\lab-monitor-data\*`
-3. Update configs to point to remote NAS
-4. Start services
-5. Verify in Manager logs and Dashboard
+- Copy the Manager's files only (`metrics.db*`, `<system>\data.db*` with their `.bak` copies,
+  `<system>\archive\`, `<name>\usage.jsonl`), with the Manager stopped, to
+  `E:\Users\lab-monitor\manager-data`. **Not** to `E:\Users\lab-monitor\data`: that is the local
+  collector's folder, and the Manager warns at every start when its databases share it. The share's
+  copies of collector files (`YYYY-MM.jsonl`, `queue.json*`) are not needed.
+- Set `data_dir` to that folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a
+  `snapshots` folder next to the old data).
+- Re-run the installer. With an enabled UNC `snapshot.dest_dir` it keeps a stored password for the
+  tasks (an S4U task could not reach the share); only with snapshots off does it go back to S4U.
+- Keep the share's `data_dir` untouched until a few days of the local one, and a snapshot, have been
+  checked (`GET /api/snapshot`, `snapshot.py verify`); then remove it by hand.
 
 ---
 
 ## See Also
 
-- [ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md) — Dual Manager + Collector setup
+- [ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md) — Manager and collector on one server
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System design
-- [CONFIG.md](../CONFIG.md) — Configuration security
+- [UPGRADE.md](UPGRADE.md) — Upgrading an existing installation
+- [CONFIG.md](../CONFIG.md) — Configuration and security
+- [manager/README.md](../manager/README.md#running-from-task-scheduler) — Task Scheduler details
