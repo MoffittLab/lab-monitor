@@ -324,9 +324,10 @@ def _fmt(value, suffix: str = '') -> str:
 
 
 def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
-                     logger: logging.Logger) -> bool:
+                     logger: logging.Logger, sync: bool = True) -> bool:
     """
-    Write new messages to the permanent archive and the queue, then sync.
+    Write new messages to the permanent archive and the queue, then sync
+    (unless sync=False: the next run that syncs sends them).
     
     Both appends happen under the queue lock so concurrent collector runs
     can't interleave archive lines or lose each other's queue entries. The
@@ -364,6 +365,9 @@ def _record_and_sync(config: dict, name: str, system_id: str, entries: list,
 
     logger.info(f"Archived {len(entries)} message(s) to {archive_path}; queue now holds {queued}")
 
+    if not sync:
+        logger.info("Not sending now (--no-sync): the next metrics run sends the queue to the Manager")
+        return True
     # Try to sync queue to manager
     return sync_queue_to_manager(config, name, system_id, queue_path, logger)
         
@@ -576,9 +580,10 @@ def _scan_policy(config: dict, nas_type: str):
                                  include_network=include_network)
 
 
-def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
+def collect_disk_usage(config: dict, logger: logging.Logger, sync: bool = True) -> bool:
     """
-    Collect disk usage (daily mode).
+    Collect disk usage (daily mode). sync=False only archives and queues the
+    result (the Linux disk unit, which has no network, runs it that way).
 
     Legacy scan_depth parameter in config is silently ignored; use scan_paths instead.
     """
@@ -666,7 +671,7 @@ def collect_disk_usage(config: dict, logger: logging.Logger) -> bool:
         logger.error(f"Disk collection failed: {e}", exc_info=True)
         return False
 
-    return _record_and_sync(config, name, system_id, [entry], logger)
+    return _record_and_sync(config, name, system_id, [entry], logger, sync=sync)
 
 
 def collect_metrics(config: dict, logger: logging.Logger) -> bool:
@@ -1816,6 +1821,9 @@ def main():
     parser = argparse.ArgumentParser(description='Lab Monitor Collector')
     parser.add_argument('--config', required=True, help='Config file')
     parser.add_argument('--mode', choices=['disk', 'metrics'], default='disk', help='Collection mode')
+    parser.add_argument('--no-sync', action='store_true',
+                        help='disk mode: archive and queue the result without sending it; the next '
+                             'metrics run sends it (the Linux disk unit runs without network access)')
     
     args = parser.parse_args()
     
@@ -1837,7 +1845,7 @@ def main():
     logger.info(f"Starting collector ({args.mode} mode)")
     
     if args.mode == 'disk':
-        success = collect_disk_usage(config, logger)
+        success = collect_disk_usage(config, logger, sync=not args.no_sync)
     else:
         success = collect_metrics(config, logger)
     

@@ -46,7 +46,7 @@ def _write(path, size):
 def _capture_disk_message(collector, monkeypatch):
     captured = []
     monkeypatch.setattr(collector, '_record_and_sync',
-                        lambda cfg, n, i, entries, log: captured.extend(entries) or True)
+                        lambda cfg, n, i, entries, log, sync=True: captured.extend(entries) or True)
     return captured
 
 
@@ -603,7 +603,7 @@ def test_metrics_from_proc_without_psutil(collector, config, monkeypatch):
     monkeypatch.setattr(collector, 'get_gpu_stats', lambda: [])
     captured = []
     monkeypatch.setattr(collector, '_record_and_sync',
-                        lambda cfg, n, i, entries, log: captured.extend(entries) or True)
+                        lambda cfg, n, i, entries, log, sync=True: captured.extend(entries) or True)
     config['platform'] = 'linux'
     assert collector.collect_metrics(config, logging.getLogger('test')) is True
     data = captured[0]['data']
@@ -848,12 +848,15 @@ def _seconds(value):
 HARDENING = {
     'NoNewPrivileges': 'yes', 'ProtectSystem': 'strict', 'PrivateTmp': 'yes',
     'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes', 'LockPersonality': 'yes',
-    'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX', 'SystemCallFilter': '@system-service',
+    'SystemCallFilter': '@system-service',
     'ReadWritePaths': '/var/lib/lab-monitor /var/log/lab-monitor', 'User': 'labmon', 'Type': 'oneshot',
 }
 # The metrics unit loads the NVIDIA driver's libnvidia-ml, which isn't known to
 # be W^X-safe (see the comment in the unit); the disk unit loads nothing native.
 MEMORY_DENY_WRITE_EXECUTE = {'metrics': 'no', 'disk': 'yes'}
+# The disk unit has no network at all; the metrics unit only IP to the Manager
+ADDRESS_FAMILIES = {'metrics': 'AF_INET AF_INET6 AF_UNIX', 'disk': 'AF_UNIX'}
+EXTRA_ARGS = {'metrics': '', 'disk': ' --no-sync'}
 
 
 @pytest.mark.parametrize('mode', ['metrics', 'disk'])
@@ -862,10 +865,12 @@ def test_service_units_are_hardened(mode):
     for key, value in HARDENING.items():
         assert svc.get(key) == [value], key
     assert svc.get('MemoryDenyWriteExecute') == [MEMORY_DENY_WRITE_EXECUTE[mode]]
+    assert svc.get('RestrictAddressFamilies') == [ADDRESS_FAMILIES[mode]]
+    assert svc.get('IPAddressDeny') == ['any']
     # -s: no user site-packages from labmon's writable HOME (see test_user_site_is_off_in_units)
     assert svc['ExecStart'] == [
         '/opt/lab-monitor/venv/bin/python -s /opt/lab-monitor/collector/collector.py '
-        f'--config /etc/lab-monitor/collector.json --mode {mode}']
+        f'--config /etc/lab-monitor/collector.json --mode {mode}{EXTRA_ARGS[mode]}']
     assert 'PYTHONNOUSERSITE=1' in svc['Environment'][0].split()
     # Per-user metrics read every user's /proc entries; PrivateUsers would turn them into 'nobody'
     assert 'ProtectProc' not in svc and 'ProcSubset' not in svc and 'PrivateUsers' not in svc
@@ -875,6 +880,8 @@ def test_service_units_are_hardened(mode):
 def test_metrics_unit_has_no_capabilities_and_a_short_timeout():
     svc = _unit('lab-monitor-metrics.service')['Service']
     assert svc['CapabilityBoundingSet'] == [''] and svc.get('AmbientCapabilities', ['']) == ['']
+    # Loopback only in the unit itself; the installer's drop-in adds the Manager
+    assert svc['IPAddressAllow'] == ['localhost'] and 'PrivateNetwork' not in svc
     assert svc['ProtectHome'] == ['yes']
     assert _seconds(svc['TimeoutStartSec'][0]) < 5 * 60
 
@@ -937,10 +944,19 @@ def test_nvml_blockers_are_recognised(extra, blocked):
     assert bool(nvml_blockers(svc)) is blocked, nvml_blockers(svc)
 
 
-def test_disk_unit_reads_everything_without_root():
-    svc = _unit('lab-monitor-disk.service')['Service']
+def test_disk_unit_reads_everything_without_root_but_has_no_network():
+    unit = _unit('lab-monitor-disk.service')
+    svc = unit['Service']
     assert svc['AmbientCapabilities'] == ['CAP_DAC_READ_SEARCH']
     assert svc['CapabilityBoundingSet'] == ['CAP_DAC_READ_SEARCH']
+    # The capability holder can't send anything anywhere: the next metrics run sends its result
+    assert svc['PrivateNetwork'] == ['yes'] and svc['RestrictAddressFamilies'] == ['AF_UNIX']
+    assert svc['IPAddressDeny'] == ['any'] and 'IPAddressAllow' not in svc
+    assert svc['ExecStart'][0].endswith('--mode disk --no-sync')
+    assert 'network-online.target' not in ' '.join(sum(unit['Unit'].values(), []))
+    hidden = svc['InaccessiblePaths'][0].split()
+    for path in ('/root', '/etc/shadow', '/etc/gshadow', '/etc/ssh', '/etc/sudoers', '/etc/sudoers.d'):
+        assert '-' + path in hidden
     assert svc['ProtectHome'] == ['read-only']
     assert svc['Nice'] == ['19'] and svc['IOSchedulingClass'] == ['idle']
     # Default budget written by the installer (total_timeout_seconds 10800) + 1 h
@@ -1527,3 +1543,98 @@ def test_test_run_checks_that_the_service_saw_the_gpus(tmp_path, journal, expect
     proc = run_sourced(script)
     assert proc.returncode == 0, proc.stderr
     assert expected in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Network limits: disk results are only queued; metrics may reach the Manager only
+# ---------------------------------------------------------------------------
+
+def test_disk_no_sync_queues_without_sending(tmp_path, collector, config, monkeypatch):
+    def must_not_send(*a, **k):
+        raise AssertionError('--no-sync must not contact the Manager')
+    monkeypatch.setattr(collector, 'sync_queue_to_manager', must_not_send)
+    _write(str(tmp_path / 'tree' / 'alice' / 'a'), 1000)
+    config.update({'platform': 'linux', 'volumes': [str(tmp_path)],
+                   'scan_paths': [str(tmp_path / 'tree') + '/*']})
+    assert collector.collect_disk_usage(config, logging.getLogger('test'), sync=False) is True
+    queue = tmp_path / 'data' / 'testbox' / 'queue.json'
+    entries = json.loads(queue.read_text())
+    assert len(entries) == 1 and entries[0]['data']['data_type'] == 'folder_usage'
+
+
+def test_disk_sync_is_the_default(tmp_path, collector, config, monkeypatch):
+    sent = []
+    monkeypatch.setattr(collector, 'sync_queue_to_manager', lambda *a: sent.append(a) or True)
+    config.update({'platform': 'linux', 'volumes': [str(tmp_path)], 'scan_paths': []})
+    assert collector.collect_disk_usage(config, logging.getLogger('test')) is True
+    assert len(sent) == 1
+
+
+def test_no_sync_flag_reaches_disk_mode(collector, monkeypatch, tmp_path, config):
+    cfg = tmp_path / 'c.json'
+    cfg.write_text(json.dumps(config))
+    seen = {}
+    monkeypatch.setattr(collector, 'collect_disk_usage',
+                        lambda c, log, sync=True: seen.setdefault('sync', sync))
+    monkeypatch.setattr(sys, 'argv', ['collector.py', '--config', str(cfg), '--mode', 'disk', '--no-sync'])
+    with pytest.raises(SystemExit):
+        collector.main()
+    assert seen == {'sync': False}
+
+
+@needs_bash
+def test_name_servers_from_resolv_conf(tmp_path):
+    conf = tmp_path / 'resolv.conf'
+    conf.write_text('# comment\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\noptions edns0\n'
+                    'search example.org\nnameserver 10.0.0.2\n')
+    proc = run_sourced(f'name_servers "{conf.as_posix()}"')
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ['10.0.0.2', '127.0.0.53', 'fe80::1']
+
+
+@needs_bash
+@pytest.mark.parametrize('url,expected', [
+    ('http://127.0.0.1:5000', ['127.0.0.1']),
+    ('https://10.1.2.3/', ['10.1.2.3']),
+    ('http://name.invalid:5000', []),
+    ('', []),
+])
+def test_manager_addresses(url, expected):
+    if shutil.which('getent') is None and expected:
+        pytest.skip('needs getent')
+    proc = run_sourced(f'manager_addresses {shlex.quote(url)}')
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == expected
+
+
+@needs_bash
+def test_metrics_network_dropin_allows_the_manager_and_name_servers():
+    if shutil.which('getent') is None:
+        pytest.skip('needs getent')
+    proc = run_sourced('name_servers() { echo 10.0.0.2; }\nmetrics_network_dropin http://127.0.0.1:5000')
+    assert proc.returncode == 0, proc.stderr
+    lines = [l for l in proc.stdout.splitlines() if l and not l.startswith('#')]
+    assert lines == ['[Service]', 'IPAddressAllow=127.0.0.1', 'IPAddressAllow=10.0.0.2']
+
+
+@needs_bash
+def test_metrics_network_dropin_fails_when_the_manager_does_not_resolve():
+    proc = run_sourced('metrics_network_dropin http://name.invalid:5000; echo "rc=$?"')
+    assert 'rc=1' in proc.stdout and 'IPAddressAllow' not in proc.stdout
+
+
+@needs_bash
+def test_no_network_limit_resets_the_deny_list():
+    proc = run_sourced('OPT_NO_NETWORK_LIMIT=1\nmetrics_network_dropin http://name.invalid:5000')
+    assert proc.returncode == 0, proc.stderr
+    lines = [l for l in proc.stdout.splitlines() if l and not l.startswith('#')]
+    assert lines == ['[Service]', 'IPAddressDeny=']
+
+
+@needs_bash
+def test_installer_has_no_network_limit_flag_and_uninstall_removes_the_dropin():
+    assert '--no-network-limit' in run_installer('--help', check=True).stdout
+    with open(INSTALLER) as f:
+        text = f.read()
+    assert 'METRICS_NET_DROPIN="$METRICS_DROPIN_DIR/50-network.conf"' in text
+    assert 'rm -f -- "$DISK_DROPIN" "$METRICS_NET_DROPIN"' in text
