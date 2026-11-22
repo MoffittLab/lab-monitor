@@ -5,6 +5,23 @@ the Windows server that runs the Manager, the Dashboard and a local collector, a
 databases. If you are on a different machine, find out which machine holds the Manager's `data_dir`
 before doing anything else.
 
+## Status 2026-11-22 (Windows server session)
+
+- **Running commit on the server is `1a2171b`**, not `f086e7e` (six commits older). Step 1 was run with
+  `--old-ref 1a2171b`.
+- **Test suite on Windows** (Windows Server 2019, Python 3.11): 544 passed, 125 skipped (Linux-only), after
+  the fixes in `fix/windows-tests` (merged here). One real bug (hard links counted once per link by the
+  Python scanner on Windows) and several tests that assumed POSIX or hung (see that branch's commits).
+- **Smoke test (step 5 below)** passed on scratch data: metrics, GPU, PowerShell folder scan, Dashboard,
+  one snapshot (`ok`, `snapshot.py verify` OK). The snapshot went to a local folder, not yet to a NAS share.
+- **Step 1 against copies of the real databases**: every check PASS except `dashboard` (2 differences, one
+  system's current network counters). Cause: the old Manager's save of that system's latest sample failed
+  half-way (row and `device_totals` written, `device_snapshot` not), so the old card mixed two samples and
+  the new one shows the consistent, one-sample-older message. Clears with the first new sample. First start
+  95.5 s for 2.8 GB. The owner decided to go ahead.
+- Not done from that session (the lab's rules there allow no admin work, NAS writes or SSH): Step 0, Step 3,
+  Step 4, Step 5. The owner runs them.
+
 ## What this branch is
 
 `fix/review-findings` starts from `f086e7e`, the commit deployed today (`origin/main`). It adds a
