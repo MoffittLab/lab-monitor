@@ -225,6 +225,11 @@ async function loadData() {
             return;
         }
 
+        if (signInRequired(resp, body)) {
+            goToSignIn();
+            return;
+        }
+
         if (!resp.ok || !body || body.success !== true) {
             const what = describeHttpFailure(resp.status, body);
             const errors = (body && Array.isArray(body.errors)) ? body.errors : [];
@@ -240,6 +245,20 @@ async function loadData() {
         clearTimeout(timer);
         loadInFlight = false;
     }
+}
+
+// The dashboard server answers 401 with {"login": "/login"} when this browser
+// is not signed in (any more): the remembered sign-in expired, or the password
+// was changed.  Other 401s (a proxy's, say) are ordinary failures.
+function signInRequired(resp, body) {
+    return resp.status === 401 && !!body && body.login === '/login';
+}
+
+// Stop polling and open the sign-in page; it comes back to this page afterwards.
+function goToSignIn() {
+    stopPolling();
+    const here = window.location.pathname + window.location.search;
+    window.location.assign('/login?next=' + encodeURIComponent(here));
 }
 
 // Only the dashboard server's own JSON says the Manager is the problem.  A
@@ -994,6 +1013,10 @@ function requestChart(fromISO, toISO) {
         .then(async r => {
             let body = null;
             try { body = await r.json(); } catch (e) { body = null; }
+            if (signInRequired(r, body)) {
+                goToSignIn();
+                throw new Error('Sign-in required');
+            }
             if (!r.ok || !body || body.error) {
                 throw new Error((body && body.error) || `HTTP ${r.status}`);
             }

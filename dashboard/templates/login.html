@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex">
+    <title>Sign in - Moffitt Laboratory Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-body">
+    <main class="login-card">
+        <h1>🔬 Moffitt Laboratory Dashboard</h1>
+        <p class="login-intro">Enter the lab password to continue.</p>
+
+        {% if error %}
+        <div class="login-error" role="alert">{{ error }}</div>
+        {% endif %}
+
+        <form method="post" action="{{ url_for('login') }}" class="login-form">
+            <input type="hidden" name="next" value="{{ next_url }}">
+            <!-- No user name: one shared password. This field only gives password managers a name to file it under. -->
+            <input type="text" name="username" value="lab-monitor" autocomplete="username" hidden>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password"
+                   maxlength="1024" required autofocus>
+            <button type="submit">Sign in</button>
+        </form>
+
+        <p class="login-note">This browser stays signed in for {{ remember_days }} days after its last visit.</p>
+    </main>
+</body>
+</html>

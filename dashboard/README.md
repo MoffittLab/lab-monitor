@@ -8,7 +8,7 @@ The Dashboard owns no data. Its Flask server polls the Manager's read API on beh
 
 **See [INSTALLATION.md](../INSTALLATION.md) for complete setup instructions.**
 
-Run `install-manager-dashboard-taskscheduler.ps1` on the Windows server (atlantis). It installs the Manager and the Dashboard from the same checkout, registers the "Lab Monitor Dashboard" task, and gives the Dashboard its own Manager **read** token, never the admin token. At the end it says whether the Dashboard login is enabled, and how to enable it (see [Security](#security)).
+Run `install-manager-dashboard-taskscheduler.ps1` on the Windows server (atlantis). It installs the Manager and the Dashboard from the same checkout, registers the "Lab Monitor Dashboard" task, and gives the Dashboard its own Manager **read** token, never the admin token. At the end it says whether the Dashboard sign-in is enabled, and how to enable it (see [Security](#security)).
 
 Requirements: `pip install -r requirements.txt` (Flask, requests, waitress). The dashboard runs under **waitress** when it is installed. Without waitress, or with `"debug": true`, it falls back to the Flask development server and logs a loud warning.
 
@@ -25,8 +25,8 @@ Dashboard reads `config.json` in its directory (see `config.example.json`):
   "manager_url": "http://localhost:5000",
   "manager_token": "PASTE-A-MANAGER-READ-TOKEN-HERE",
   "auth": {
-    "username": "labadmin",
-    "password_hash": "PASTE-OUTPUT-OF: python app.py --hash-password"
+    "password_hash": "PASTE-OUTPUT-OF: python app.py --hash-password",
+    "remember_days": 180
   },
   "refresh_interval_seconds": 30,
   "manager_timeout_seconds": 5,
@@ -46,7 +46,10 @@ Dashboard reads `config.json` in its directory (see `config.example.json`):
 | `host` / `port` | `0.0.0.0` / `5001` | Bind address. See **Security** before using `0.0.0.0`. |
 | `manager_url` | `http://localhost:5000` | Manager base URL |
 | `manager_token` | — | Bearer token for the Manager. Use a **read token** (one of the Manager's `read_tokens`). |
-| `auth` | none | Optional HTTP basic auth for the whole dashboard: `{"username", "password_hash"}` |
+| `auth` | none | Optional sign-in for the whole dashboard: `{"password_hash"}` (see [Security](#security)) |
+| `auth.remember_days` | 180 | How long a browser stays signed in after its last visit (1 to 3650) |
+| `auth.session_key_file` | `dashboard/.session_key` | Where the key that signs the sign-in cookies is kept |
+| `auth.cookie_secure` | `false` | Set `true` behind an HTTPS proxy that doesn't tell the dashboard the request was HTTPS |
 | `refresh_interval_seconds` | 30 | Browser poll interval (minimum 5). Also the server-side cache TTL. |
 | `cache_ttl_seconds` | = refresh interval | Override for how long one Manager poll is reused |
 | `manager_timeout_seconds` | 5 | Timeout for each Manager request |
@@ -64,13 +67,26 @@ The dashboard refuses to start if `auth` is present but incomplete or its `passw
 ## Security
 
 - **Manager token:** the dashboard only reads from the Manager. Give it a token from the Manager's `read_tokens` list, not an admin or collector token. A read token cannot ingest data or delete systems if the dashboard host or its config file is compromised. Legacy Manager `auth_tokens` still work but carry full admin rights.
-- **Who can see the dashboard:** the page shows host names, user names, and folder paths. When it is bound to `0.0.0.0` (reachable from the network), turn on basic auth:
+- **Who can see the dashboard:** the page shows host names, user names, and folder paths. When it is bound to `0.0.0.0` (reachable from the network), turn on the sign-in:
 
   ```
   python app.py --hash-password
   ```
 
-  Paste the printed `auth` block into `config.json` and restart. Every page, API route and static file then requires the username/password, except `GET /health`, which returns only `{"status": "ok"}`. Basic auth sends the password with every request, so on an untrusted network either put the dashboard behind an HTTPS reverse proxy or bind it to `127.0.0.1` and reach it through the proxy.
+  Paste the printed `auth` block into `config.json` and restart. Every page and API route then needs a signed-in browser. The exceptions hold no system data: `GET /health` (returns only `{"status": "ok"}`), the sign-in page, and the static files (stylesheet, script, images).
+
+  **How the sign-in works**
+  - There is one shared password and no user names. The config holds only its hash.
+  - A correct password gives that browser a cookie that keeps it signed in for `remember_days` (180 by default). The time counts from the browser's last visit, so a computer in regular use is never asked again. A private window, another browser, or clearing the cookies means signing in again.
+  - **Sign out** in the page header signs out that browser only.
+  - **To change the password**, run `--hash-password` again, replace the hash and restart: every browser is signed out. To sign everyone out without changing it, delete the key file (`dashboard/.session_key`) and restart. A restart alone signs nobody out.
+  - After 5 wrong passwords within 15 minutes from one address, sign-in from that address is refused for 15 minutes. Browsers that are already signed in are not affected. Wrong passwords and sign-ins are logged with the client address.
+  - The cookie holds no secret: an issue time, a random value and a signature (HMAC-SHA256). The signing key is derived from the key file and the password hash. The key file is created on first start; protect it like `config.json`, since whoever can read both can make a valid cookie.
+
+  **Limits**
+  - The dashboard itself speaks plain HTTP: the password crosses the network unencrypted once per sign-in, and the cookie with every request. On a network you don't trust, put the dashboard behind an HTTPS reverse proxy (or bind it to `127.0.0.1` and reach it through the proxy); the cookie is then marked `Secure`.
+  - Behind a proxy every client has the proxy's address, so the wrong-password lockout applies to all of them together.
+  - The earlier `auth.username` setting and HTTP basic auth are gone; a `username` left in the config is ignored with a startup warning.
 - The browser never sees the Manager token or the Manager URL. All Manager calls go through the dashboard server, which validates system names and URL-encodes every path segment it forwards. A name must match `^[A-Za-z0-9_.-]{1,64}$`, or be exactly a name the Manager's device registry listed in a recent poll (devices an older Manager registered under other names, such as `Lab PC`). Error responses carry short generic messages; details go to the log.
 - Plotly is loaded from the CDN at a pinned version (1.58.5) with a Subresource Integrity hash.
 
@@ -107,12 +123,14 @@ Card and summary-strip colours use the same thresholds: CPU/RAM amber at 50% and
 
 ## Dashboard HTTP API
 
-These routes are used by the page. With `auth` configured, they require basic auth too.
+These routes are used by the page. With `auth` configured, a browser that is not signed in is redirected from `/` to `/login`, and the `/api/` routes answer 401 `{"success": false, "error": "Sign-in required", "login": "/login"}`, on which the page opens the sign-in page.
 
 | Route | Description |
 |-------|-------------|
 | `GET /` | The dashboard page |
-| `GET /health` | Liveness probe: `{"status": "ok"}`. No Manager call, no system data, no basic auth. Used by `tools/restart_manager_dashboard.py`. |
+| `GET /login`, `POST /login` | The sign-in page and its form (`password`, `next`). Only with `auth`. |
+| `POST /logout` | Signs this browser out |
+| `GET /health` | Liveness probe: `{"status": "ok"}`. No Manager call, no system data, no sign-in. Used by `tools/restart_manager_dashboard.py`. |
 | `GET /api/data` | Aggregated state of all systems (cached for one refresh interval) |
 | `GET /api/history/<system>/<data_type>/<field>` | Time series for one field. Query: `from`, `to` (ISO 8601), `max_points`, `limit` |
 
@@ -136,8 +154,14 @@ A healthy result is cached for one refresh interval. Failed and degraded results
 - Verify network connectivity: `ping atlantis.med.harvard.edu`
 - The banner lists the failing calls. `HTTP 401` means the Manager rejected `manager_token`. `HTTP 403` means the token isn't allowed to read (for example, a collector token).
 
-**Browser keeps asking for a password:**
-- Regenerate the hash with `python app.py --hash-password` and check the `auth.username` spelling
+**The password is not accepted:**
+- Regenerate the hash with `python app.py --hash-password`, replace `auth.password_hash` and restart
+- "Too many wrong passwords": wait 15 minutes, or restart the Dashboard (the count is kept in memory)
+
+**A browser is asked for the password again:**
+- It was not used for longer than `remember_days`, its cookies were cleared, or it is a private window
+- The password hash or the key file changed (both sign every browser out)
+- The log says "Cannot save the sign-in key": the key file's folder is not writable, so a new key is made at every start. Make it writable, or set `auth.session_key_file`
 
 **Dashboard doesn't update:**
 - Check `refresh_interval_seconds` (should be 30 or less)

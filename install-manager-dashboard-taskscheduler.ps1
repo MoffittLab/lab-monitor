@@ -1125,10 +1125,10 @@ if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "po
     $DashPort = [string]$FinalDashboard.port
 }
 if ($FinalDashboard -and ($FinalDashboard.PSObject.Properties.Name -contains "auth") -and $FinalDashboard.auth) {
-    Write-Host "   Login: enabled (basic auth, user '$($FinalDashboard.auth.username)')"
+    Write-Host "   Sign-in: enabled (one password; each browser stays signed in after its first sign-in)"
 } else {
-    Write-Host "   Login: NOT enabled. The Dashboard listens on ${DashHost}:$DashPort, so anyone who can" -ForegroundColor Yellow
-    Write-Host "   reach that port sees host names, user names and folder paths. To require a login:" -ForegroundColor Yellow
+    Write-Host "   Sign-in: NOT enabled. The Dashboard listens on ${DashHost}:$DashPort, so anyone who can" -ForegroundColor Yellow
+    Write-Host "   reach that port sees host names, user names and folder paths. To require a password:" -ForegroundColor Yellow
     Write-Host "     conda activate $CondaEnv"
     Write-Host "     cd $RepoDir\dashboard"
     Write-Host "     python app.py --hash-password"

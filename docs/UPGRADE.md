@@ -668,8 +668,9 @@ back: the old Manager knows only that key.
 won't roll back. `DELETE /api/system/<name>` does not remove them. `folder_usage_legacy` can also be
 dropped by hand then, but costs only disk space.
 
-**Optional:** turn on the Dashboard login (`python app.py --hash-password` in `dashboard\`, paste
-the printed `auth` block into `dashboard\config.json`, restart the Dashboard); set
+**Optional:** turn on the Dashboard sign-in (`python app.py --hash-password` in `dashboard\`, paste
+the printed `auth` block into `dashboard\config.json`, restart the Dashboard; each browser then asks
+for the password once and stays signed in for 180 days); set
 `"cors_origins": []` (the Dashboard calls the Manager server-side and needs no CORS; old configs
 list two origins, which is harmless).
 
