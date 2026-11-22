@@ -1,7 +1,8 @@
 """
-Run the CURRENT Manager (commit fb6498c: the release before rollups, with
-contract items 1-9 and the reserved "_" / "storage_breakdown_" table
-prefixes) on a data_dir, to build CURRENT-format databases and to check a
+Run the CURRENT Manager (commit 160da09: the review-fix release as deployed,
+the release before rollups, with contract items 1-9, the reserved "_" /
+"storage_breakdown_" table prefixes and nightly snapshots; its database code
+is fb6498c's) on a data_dir, to build CURRENT-format databases and to check a
 NEW -> CURRENT downgrade.
 
 Like old_manager.py: manager/ of that commit is extracted once per session
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-CURRENT_COMMIT = 'fb6498c'
+CURRENT_COMMIT = '160da09'
 REPO = Path(__file__).resolve().parents[2]
 _SCRATCH_BASE = '/tmp/claude-1000' if os.path.isdir('/tmp/claude-1000') else None
 _cache = {}

@@ -420,8 +420,8 @@ with a history database is listed, with `users: []` if it has no per-user data. 
 | Endpoint | Meaning |
 |----------|---------|
 | `GET /api/dead_letter?limit=100` | Most recent rejected messages with the reason and raw message |
-| `GET /api/snapshot` | Snapshot settings and outcome: `enabled`, `dest_dir`, `time`, `running`, `next_run`, `last_success`, `last_snapshot`, `last_failure`, `last_error`, `hours_since_success` (read token) |
-| `POST /api/snapshot` | Start a snapshot now, in the background: `202`, or `409` if one is running or snapshots are disabled (admin token) |
+| `GET /api/snapshot` | Snapshot settings and outcome: `enabled`, `dest_dir`, `time`, `running`, `next_run`, `last_result` (`ok`, `partial` or `error`), `last_success`, `last_partial`, `last_snapshot`, `last_failed` (databases a partial run could not copy), `last_failure`, `last_error`, `hours_since_success` (read token) |
+| `POST /api/snapshot` | Start a snapshot now, in the background: `202`, or `409` if one is running, an earlier request is about to start one (that run serves this request too), or snapshots are disabled (admin token) |
 | `DELETE /api/system/<name>` | Permanently deletes the system's central rows (registry, snapshot, totals, per-user rows, sessions / storage-health / storage-breakdown snapshots) and its `data.db` (rollups included). Any spelling of the name works: the row of exactly that spelling if one is registered, else the one it resolves to. If another registered spelling shares the `data.db` (see [Central summary](#central-summary-metricsdb)), only the named one's central rows go and the `data.db` is kept (`per_system_db_kept_for`). |
 
 ### Health
@@ -563,13 +563,20 @@ The live databases belong on a local disk; the Manager copies them to a second l
 | `verify_copy` | `true` | Read every copied file back from `dest_dir` and compare its SHA-256. |
 | `catch_up` | `true` | If the Manager was down at the scheduled time, take the missed snapshot `startup_delay_seconds` (600) after it starts. |
 
-**What one run does.** Each database (`metrics.db`, every `<system>/data.db`) is copied with SQLite's online backup API to `<data_dir>\.snapshot-staging\`. That is a consistent copy, taken while the Manager keeps storing messages. Each copy is made self-contained (`journal_mode=DELETE`, no `-wal` file) and checked with `PRAGMA quick_check`. The checked files, plus any retention archives under `<system>/archive/`, are then copied to `<dest_dir>\snapshot-<UTC stamp>.partial\` as plain files, so SQLite never opens anything on the share. Each one is read back and compared by SHA-256. `manifest.json` (files, sizes, hashes, row counts per table) is written, and the folder is renamed to `snapshot-<stamp>`. **A folder without `.partial` is always complete.** A failed run removes its `.partial` folder and staging files and logs an `ERROR`; the previous snapshots are untouched.
+**What one run does.**
+1. Each database is copied with SQLite's online backup API to `<data_dir>\.snapshot-staging\`: every `<system>/data.db` first, `metrics.db` last. Each is a consistent copy of that database, taken while the Manager keeps storing messages. The staged copy is written without `fsync` (it is temporary and checked before use, and syncing it made every request wait for the disk), made self-contained (`journal_mode=DELETE`, no `-wal` file) and checked with `PRAGMA quick_check`. Nothing goes to `dest_dir` before every database is staged.
+2. Then the other stored files are listed and copied: the retention archives under `<system>/archive/` (a `.jsonl` up to its last complete line, in case retention is appending to it), the previous Manager's `<name>/usage.jsonl`, and the `<db>.post-upgrade-<stamp>` files `tools/rollback_upgrade.py` set aside. Listing them only after the databases are staged means a row that history retention moved out of a database during the run is in the snapshot's database or in its archive file, never in neither.
+3. Everything goes to `<dest_dir>\snapshot-<UTC stamp>.partial\` as plain files, so SQLite never opens anything on the share. Each one is read back and compared by SHA-256. `manifest.json` (files, sizes, hashes, row counts per table, and any database that could not be copied) is written, and the folder is renamed to `snapshot-<stamp>`. **A folder without `.partial` holds every file its manifest lists.**
 
-**Space.** Staging needs free space on the `data_dir` disk about the size of the databases, only during the run. `dest_dir` needs that much per kept snapshot. A run that would not fit is refused before it copies anything.
+**The databases of one snapshot are not of one instant.** `metrics.db` is taken last, so it can be a little newer than the `data.db` copies. That is the direction a replay repairs: the Manager commits `metrics.db` before a system's `data.db`, so every message in a copied `data.db` also has its central rows (per-user history, device card, totals) in the copied `metrics.db`; a message only `metrics.db` has is stored again in `data.db` by the collectors' re-sends or `tools/replay_archives.py` after a restore, and re-applying its central rows changes nothing.
 
-**Pruning** deletes only folders named `snapshot-<stamp>` that hold a `manifest.json` and are outside the keep rules, and the Manager's own `.partial` folders older than a day. Nothing else in `dest_dir` is touched.
+**A damaged database** (it fails `quick_check`, or SQLite reports `database disk image is malformed`) or one that can't be read does not stop the others: they are copied, the manifest lists that one under `failed`, the run ends as `partial` (`last_result`, `last_failed`, `last_error`, logged as an `ERROR`), and the newest snapshot that still holds a good copy of it is kept by pruning until it is copied again. A run that copies no database at all fails, removes its `.partial` folder and staging files and logs an `ERROR`; the previous snapshots are untouched. Not copied: the pre-upgrade `*.bak` files (each a full copy of a database, needed only to go back to the `f086e7e` Manager), a collector's own files, logs and lock files.
 
-**Checking.** `GET /api/snapshot` (read token) shows the last success and failure. A `last_failure` newer than `last_success` means the last run failed; `last_error` says why. `POST /api/snapshot` (admin token) takes one now. To check a snapshot's files against its manifest and run `quick_check` on each database (read-only; nothing is written next to it):
+**Space.** Staging needs free space on the `data_dir` disk about the size of the databases, only during the run. `dest_dir` needs that much per kept snapshot. A run that would not fit is refused before it copies anything. Staging files left by a Manager killed mid-run are removed at the next start (also with snapshots off) or run.
+
+**Pruning** deletes only this Manager's own snapshots: folders named `snapshot-<stamp>` whose `manifest.json` names this host and this `data_dir`, outside the keep rules, and its own `.partial` folders older than a day. Snapshots another Manager wrote to the same `dest_dir` (a test Manager given a copy of this config), or this one before its `data_dir` was moved, are never deleted; the log says how many there are. Nothing else in `dest_dir` is touched.
+
+**Checking.** `GET /api/snapshot` (read token) shows the last run: `last_result` is `ok`, `partial` or `error`. A `last_failure` newer than `last_success` means the last run failed or was partial; `last_error` says why. `POST /api/snapshot` (admin token) takes one now (a second request while one is pending or running gets `409`; a run in the same second as the previous one waits for the next second). To check a snapshot's files against its manifest and run `quick_check` on each database (read-only; nothing is written next to it; a database the manifest lists as failed is reported too):
 
 ```powershell
 python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapshot-20261122T083000Z
@@ -578,8 +585,8 @@ python manager\snapshot.py verify \\nas.example.org\lab-monitor\snapshots\snapsh
 **Restoring.**
 1. Stop the Manager.
 2. Move the current `metrics.db`, `<system>\data.db` and their `-wal` / `-shm` files aside.
-3. Copy all databases from one snapshot folder into `data_dir`. They belong to one point in time, so copy them together.
-4. Start the Manager. Collectors still hold anything not yet acknowledged; messages acknowledged after the snapshot are in the collectors' JSONL archives (`tools/replay_archives.py`).
+3. Copy all databases from one snapshot folder into `data_dir` (not `manifest.json`). Take them from one snapshot: within it every `data.db` is consistent with `metrics.db` (see above). A database the manifest lists as `failed` comes from the newest older snapshot that has it. Archive files (`<system>\archive\`, `usage.jsonl`) that were lost too come from the same snapshot; never overwrite one that is still there (it can only be longer).
+4. Start the Manager. Collectors still hold anything not yet acknowledged; messages acknowledged after the snapshot (and the few `metrics.db` holds but a `data.db` does not) are in the collectors' JSONL archives: replay from a little before the snapshot's `created_utc` with `tools/replay_archives.py`. Messages already stored come back as `duplicate`.
 
 ### Recommended layout
 
@@ -596,8 +603,8 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
 1. Stop the Manager task and check that no `manager.py` is left running.
 2. Copy the whole old `data_dir` (with `-wal` / `-shm` files, while the Manager is stopped) to a local folder, e.g. `E:\Users\lab-monitor\manager-data`:
    `robocopy \\nas\share\old-data-dir E:\Users\lab-monitor\manager-data /E /COPY:DAT /R:1 /W:1`. Exit codes below 8 are success.
-   If the old `data_dir` is the local collector's shared `E:\Users\lab-monitor\data`, copy only the Manager's files (`metrics.db*`, `<system>\data.db*` including `.bak`, `<system>\archive\`) and leave the collector's `YYYY-MM.jsonl`, `queue.json*` and `network_snapshot.json` where they are:
-   `robocopy E:\Users\lab-monitor\data E:\Users\lab-monitor\manager-data metrics.db* data.db* /S /COPY:DAT /R:1 /W:1` (plus `archive\` folders if `history_retention_days` was used).
+   If the old `data_dir` is the local collector's shared `E:\Users\lab-monitor\data`, copy only the Manager's files (`metrics.db*`, `<system>\data.db*` including `.bak`, `<system>\archive\`, the previous Manager's `<name>\usage.jsonl`) and leave the collector's `YYYY-MM.jsonl`, `queue.json*` and `network_snapshot.json` where they are:
+   `robocopy E:\Users\lab-monitor\data E:\Users\lab-monitor\manager-data metrics.db* data.db* usage.jsonl /S /COPY:DAT /R:1 /W:1` (plus `archive\` folders if `history_retention_days` was used). [docs/UPGRADE.md, Step 3b](../docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard) has the commands for both cases.
 3. In `manager\config.json` set `data_dir` to the local folder and add the `snapshot` block with `dest_dir` on the NAS (e.g. a `snapshots` folder next to the old data).
 4. Re-run the installer. It sees the UNC `dest_dir` and registers the tasks with a stored password, because an S4U task can't reach a share.
 5. Start the Manager. Check `/health` and the Dashboard, then `POST /api/snapshot` and `GET /api/snapshot` until `last_success` is set, and `snapshot.py verify` the new folder.
@@ -635,8 +642,9 @@ The installer creates this for a new config (`-SnapshotDir \\server\share\...` t
 
 ## Upgrading to the usage-metrics release
 
-This release goes on top of the review-fix release (CURRENT, `fb6498c`), once that one has been verified and
-deployed ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
+This release goes on top of the review-fix release (CURRENT: `fix/review-findings`, `160da09`, or its merge on
+`main`; `fb6498c` writes the same databases), once that one has been verified and deployed, with the databases
+in a local `manager-data` folder and nightly snapshots ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
 
 - **Order:** the installer upgrades the Manager and the Dashboard together; the new Dashboard works with both
   Manager versions. Then the collectors (one at a time per platform, see
@@ -668,7 +676,8 @@ deployed ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
   applies only to the old versions listed for it in `INTENDED_SIDES`: with CURRENT as the old side, the
   entries that describe changes CURRENT already made itself (N2, N5, N7, N8, N11, N13) are not applied, and
   a run that would need one of them FAILs.
-- **Going back to CURRENT (`fb6498c`)** needs no rollback: stop the Manager, check out CURRENT and start it on
+- **Going back to CURRENT (the commit recorded before the upgrade: `160da09` or its merge; not `fb6498c`, which
+  stores the same way but takes no snapshots)** needs no rollback: stop the Manager, check out that commit and start it on
   the same `data_dir`. CURRENT reserves the `_` and `storage_breakdown_` table prefixes, so it ignores the
   rollup and narrow tables, takes no backup and ingests normally. While it runs it does not show the
   storage-breakdown runs NEW stored (they are in the narrow tables): its `/api/data/<system>/storage_breakdown`
@@ -681,14 +690,17 @@ deployed ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
   NEW → CURRENT → NEW cycles by `tests/compat/test_new_payloads_old_managers.py`. **Do not run
   `tools/rollback_upgrade.py` for this:** it restores the databases the OLD (`f086e7e`) code needs, which after
   OLD → CURRENT → NEW means the copies from before CURRENT; everything stored since would be moved aside to
-  `*.post-upgrade-*` files (not lost, but no longer served). Never downgrade below `fb6498c`.
+  `*.post-upgrade-*` files (not lost, but no longer served). Never downgrade below the review-fix release.
 - **After a downgrade, `DELETE /api/system/<name>` on CURRENT** leaves that device's sessions, storage-health
   and storage-breakdown snapshots in `metrics.db` (CURRENT doesn't know those tables). When the device
   registers again on NEW, they are dropped, so `/api/sessions/<name>` and `/api/storage/health/<name>` answer
   404 until the next message of that type.
-- **`data_dir` on SMB:** SQLite's WAL mode over a network share is an existing risk (see
-  [docs/REMOTE_NAS_STORAGE.md](../docs/REMOTE_NAS_STORAGE.md#smbnetwork-considerations)); rollups add write
-  volume on top.
+- **`data_dir` on SMB: don't.** SQLite's WAL mode is not reliable on a network share (`disk I/O error`, failed
+  transactions), and rollups add write volume on top. Move it to a local disk first
+  ([Moving `data_dir` off the NAS](#moving-data_dir-off-the-nas)) and keep the NAS copy with
+  [snapshots](#snapshots-to-a-nas).
+- **Snapshots** take the rollup tables with everything else, so they grow with the databases. After the first
+  start, check the next one (`GET /api/snapshot`: `last_result` `ok`; `snapshot.py verify`).
 
 ---
 

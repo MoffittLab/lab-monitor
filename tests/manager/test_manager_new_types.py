@@ -594,7 +594,7 @@ def test_storage_breakdown_retention_archives_the_nested_runs(make_client, data_
 
 
 def _wide_breakdown_by_current(data_dir, runs):
-    """A wide storage_breakdown table as the CURRENT (fb6498c) Manager stores a newer collector's runs."""
+    """A wide storage_breakdown table as the CURRENT (160da09) Manager stores a newer collector's runs."""
     msgs = []
     for payload, ts, mid in runs:
         data = copy.deepcopy(payload)

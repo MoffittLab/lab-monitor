@@ -2102,10 +2102,13 @@ def get_snapshot_status():
     Snapshot settings and the outcome of the last runs:
         {"enabled", "dest_dir", "time", "keep_daily", "keep_monthly",
          "running", "running_since", "next_run", "last_attempt",
-         "last_success", "last_snapshot", "last_bytes", "last_files",
-         "last_seconds", "last_failure", "last_error", "hours_since_success"}
+         "last_result" ("ok" | "partial" | "error"), "last_success",
+         "last_partial", "last_snapshot", "last_bytes", "last_files",
+         "last_failed", "last_seconds", "last_failure", "last_error",
+         "hours_since_success"}
     Times are UTC ISO-8601.  A last_failure newer than last_success means the
-    most recent run failed (last_error says why).
+    most recent run failed or was partial (last_error says why; last_failed
+    lists the databases a partial run could not copy).
     """
     return jsonify(_snapshots.describe()), 200
 
@@ -2113,7 +2116,11 @@ def get_snapshot_status():
 @app.route('/api/snapshot', methods=['POST'])
 @require_scope('admin')
 def run_snapshot():
-    """Start a snapshot now, in the background (admin token).  202, or 409."""
+    """
+    Start a snapshot now, in the background (admin token).  202, or 409 when
+    snapshots are disabled, one is running, or an earlier request is about
+    to start one (that run serves this request too).
+    """
     if not _snapshots.settings['enabled']:
         return _error(409, "Snapshots are disabled (set snapshot.enabled and snapshot.dest_dir)")
     if _snapshots._thread is None or not _snapshots._thread.is_alive():
@@ -2122,8 +2129,12 @@ def run_snapshot():
             return _error(409, "A snapshot is already running")
         threading.Thread(target=_snapshots.run, args=('manual',),
                          name='nas-snapshot-manual', daemon=True).start()
-    elif not _snapshots.trigger():
-        return _error(409, "A snapshot is already running")
+    else:
+        state = _snapshots.trigger()
+        if state == 'running':
+            return _error(409, "A snapshot is already running")
+        if state != 'started':
+            return _error(409, "A snapshot was already requested and is about to start")
     _logger.info(f"Snapshot requested via POST /api/snapshot from {request.remote_addr}")
     return jsonify({"status": "started", "dest_dir": _snapshots.settings['dest_dir']}), 202
 

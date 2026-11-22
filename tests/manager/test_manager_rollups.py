@@ -6,7 +6,7 @@ The oracle everywhere is a brute-force GROUP BY over the raw table with the
 same SQL bucketing (UTC hour / day of strftime('%s', timestamp)) and the same
 "numeric values only" rule: the rollup tables must hold exactly that, however
 the rows got there (live ingest, backfill of OLD-format data written by the
-f086e7e code itself, CURRENT-format data written by the fb6498c code, a
+f086e7e code itself, CURRENT-format data written by the 160da09 code, a
 restart or kill in the middle of a backfill, a downgrade gap).
 """
 import glob
@@ -522,7 +522,7 @@ def test_backfill_of_old_format_data(old_fixture, make_client, data_dir):
 
 
 def _build_current(data_dir, msgs_by_name):
-    """CURRENT-format databases written by the fb6498c Manager itself."""
+    """CURRENT-format databases written by the CURRENT (160da09) Manager itself."""
     posts = []
     for name, msgs in msgs_by_name.items():
         for i in range(0, len(msgs), 100):
@@ -775,7 +775,7 @@ def test_spec_version_change_rolls_up_again(client, data_dir, monkeypatch):
 
 
 # =========================================================================== #
-# Downgrade NEW -> CURRENT (fb6498c) -> NEW                                   #
+# Downgrade NEW -> CURRENT (160da09) -> NEW                                   #
 # =========================================================================== #
 
 def test_downgrade_to_current_manager_and_back(make_client, data_dir):
