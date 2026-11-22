@@ -18,7 +18,9 @@ This is the layout the installer creates and the one the Manager checks at start
 warning if its `data_dir` is on a network share, holds a collector's files, or has no snapshot to
 another machine. Older installs used one shared `E:\Users\lab-monitor\data` (that still works) or a
 `data_dir` on a NAS share (SQLite is not reliable there: failed transactions and `disk I/O error`).
-To move: [manager/README.md, "Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas).
+To move: [manager/README.md, "Moving data_dir off the NAS"](../manager/README.md#moving-data_dir-off-the-nas);
+during the upgrade from the previous Manager, [UPGRADE.md, Step 3b](UPGRADE.md#step-3-upgrade-the-manager-and-dashboard),
+before the installer, so the first start migrates the databases on the local disk.
 
 ---
 
@@ -29,6 +31,8 @@ E:\Users\lab-monitor\manager-data\     ← Manager only (local disk)
 ├── metrics.db                    ← central summary DB
 │                                   (devices, device_snapshot, device_totals, per-user, dead_letter)
 ├── snapshot-status.json          ← last snapshot success / failure
+├── .snapshot-staging\            ← local copies while a snapshot runs (removed afterwards,
+│                                   and at the next start after a Manager was killed mid-run)
 ├── manager.lock                  ← one Manager per data_dir
 ├── atlantis\                     ← one folder per system
 │   ├── data.db                   ← full history for atlantis
@@ -98,7 +102,8 @@ Manager (task "Lab Monitor Manager")
 Collector removes the acknowledged messages from queue.json; "error" ones stay for the next run
 
 Manager, daily at snapshot.time (03:30)
-  │  online backup of every database into manager-data\.snapshot-staging\, quick_check
+  │  online backup of every database into manager-data\.snapshot-staging\ (every data.db, then
+  │  metrics.db), quick_check; then the retention archives
   ▼  plain file copy + SHA-256 read-back
 \\<nas>\<share>\snapshots\snapshot-<stamp>\   (then old snapshots pruned)
 
@@ -211,7 +216,8 @@ Manager reads metrics.db (and data.db for history charts)
 - `tools\verify_upgrade.py` reads the Manager's `data_dir` and fingerprints every file. In an older
   shared `data` folder the collector's own archive and queue changing during the run show up as a
   `source` difference (see [UPGRADE.md](UPGRADE.md#step-1-verify-against-your-real-data)); with a
-  separate `manager-data` they don't.
+  separate `manager-data` they don't. The Manager's `snapshot-status.json`, `.snapshot-staging\`
+  and `manager.lock` are never copied by it.
 - Re-running `install-collector-windows.ps1` resets the permissions of everything under
   `E:\Users\lab-monitor` (SYSTEM and Administrators get full control, Users read), including the
   Manager's databases. The data itself is not changed; the Manager tasks run elevated as an
@@ -227,7 +233,7 @@ Manager reads metrics.db (and data.db for history charts)
 |------|-----------|
 | Collector archives `data\atlantis\YYYY-MM.jsonl` | Forever (never deleted by the collector) |
 | Manager history (`data.db`, `user_metrics_history`) | Forever by default. With `history_retention_days` set, rows older than that are appended to `manager-data\<system>\archive\<YYYY-MM>-<data_type>.jsonl` and then deleted, once a day |
-| Snapshots on the NAS (`snapshot-<stamp>\`) | The newest `keep_daily` (14) plus the newest of each of the last `keep_monthly` (12) months |
+| Snapshots on the NAS (`snapshot-<stamp>\`) | The newest `keep_daily` (14) plus the newest of each of the last `keep_monthly` (12) months, and the newest good copy of a database a later run could not copy (`partial`). Only this Manager's own snapshots are pruned |
 | Manager snapshots and totals (`metrics.db`) | One row per system, always current |
 | Pre-upgrade backups (`*.pre-upgrade-*.bak`) | Until you delete them (after the upgrade is confirmed) |
 | Queue `queue.json` | Until acknowledged (usually seconds) |
@@ -244,11 +250,15 @@ Rough growth per system:
 - `folder_usage`: one scan a day, one row per folder.
 - The collector archive holds every message once more as JSON.
 
-To see the real numbers:
+To see the real numbers (the Manager's databases, the collector's archive and queue, the NAS snapshots):
 ```powershell
+Get-ChildItem E:\Users\lab-monitor\manager-data -Recurse -File | Measure-Object -Property Length -Sum
+Get-ChildItem E:\Users\lab-monitor\manager-data -Recurse -Filter *.db | Sort-Object Length -Descending | Select-Object FullName, Length -First 10
 Get-ChildItem E:\Users\lab-monitor\data -Recurse -File | Measure-Object -Property Length -Sum
-Get-ChildItem E:\Users\lab-monitor\data -Recurse -Filter *.db | Sort-Object Length -Descending | Select-Object FullName, Length -First 10
+Get-ChildItem "<snapshot.dest_dir>" -Recurse -File | Measure-Object -Property Length -Sum
 ```
+Each snapshot is about the size of the databases (`last_bytes` in `GET /api/snapshot`); the staging
+copies need that much free space on the `manager-data` disk while a snapshot runs.
 
 ---
 

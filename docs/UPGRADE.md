@@ -17,7 +17,9 @@ Paths below are the installer defaults. Check yours: `data_dir` is in `manager\c
 | Repository (Manager, Dashboard, and on atlantis also the collector) | `E:\Users\lab-monitor\scripts\lab-monitor` |
 | Manager config | `E:\Users\lab-monitor\scripts\lab-monitor\manager\config.json` |
 | Dashboard config | `E:\Users\lab-monitor\scripts\lab-monitor\dashboard\config.json` |
-| Manager `data_dir` | `E:\Users\lab-monitor\data` (`metrics.db` + `<system>\data.db`) |
+| Manager `data_dir` | `E:\Users\lab-monitor\manager-data` (`metrics.db` + `<system>\data.db`), on a local disk and used by nothing else. An existing installation keeps the `data_dir` its config names (often `E:\Users\lab-monitor\data`, the local collector's folder, or a `\\server\share` path) until [Step 3b](#step-3-upgrade-the-manager-and-dashboard) moves it |
+| Local collector's `data_dir` (atlantis) | `E:\Users\lab-monitor\data` (archive `<name>\YYYY-MM.jsonl`, queue) |
+| Nightly snapshots (`snapshot.dest_dir`) | A folder on the NAS, e.g. `\\<nas>\<share>\lab-monitor-snapshots` ([manager/README.md](../manager/README.md#snapshots-to-a-nas)) |
 | Logs | `E:\Users\lab-monitor\logs` |
 | Old scheduled task | "Lab Monitor Startup" (runs `E:\Users\lab-monitor\start-services.bat`) |
 | New scheduled tasks | "Lab Monitor Manager", "Lab Monitor Dashboard" (run `start-manager.bat`, `start-dashboard.bat`) |
@@ -29,8 +31,8 @@ Paths below are the installer defaults. Check yours: `data_dir` is in `manager\c
 | [0](#step-0-back-up) | server | Back up `data_dir`, both config files and the logs; record the running commit; save `/api/devices` and `/api/totals` |
 | [1](#step-1-verify-against-your-real-data) | server | Run `tools\verify_upgrade.py` against the real `data_dir`. Go on only after **PASS** (a config the new Manager would refuse is a FAIL: [fix it first](#fix-a-refused-token-without-downtime)) |
 | [2](#step-2-make-the-new-code-available) | developer | Merge the upgrade into `main` and push (installers and `update_collectors.py` pull `origin main`) |
-| [3](#step-3-upgrade-the-manager-and-dashboard) | server | Re-run `install-manager-dashboard-taskscheduler.ps1` (upgrades Dashboard and Manager together); let the first start migrate |
-| [4](#step-4-check-the-upgraded-server) | server | Check `/health`, devices, totals, the `.bak` files and the Dashboard |
+| [3](#step-3-upgrade-the-manager-and-dashboard) | server | Move the databases to a local `manager-data` folder and turn on nightly snapshots to the NAS (3b), then re-run `install-manager-dashboard-taskscheduler.ps1` (upgrades Dashboard and Manager together); let the first start migrate |
+| [4](#step-4-check-the-upgraded-server) | server | Check `/health`, devices, totals, the `.bak` files, the Dashboard and a first snapshot |
 | [5](#step-5-upgrade-the-collectors) | each collector | Upgrade collectors, one first, then the rest |
 | [6](#step-6-afterwards) | server | Later: move to scoped tokens; delete the `.bak` files once you won't roll back |
 
@@ -54,6 +56,7 @@ checkout and one installer, so steps 3 and 4 do both. Collectors always come las
 | Dashboard | An outage looked like a healthy page; HTML injection possible; no login | Outage and "degraded" banners, escaping everywhere, optional login, `—` for unmeasured values | Misleading and unsafe page |
 | Tools | Any SSH host key accepted; destructive tools ran without asking | Host keys pinned on first use; confirmations; new `replay_archives.py`, `verify_upgrade.py`, `rollback_upgrade.py` | Safety |
 | Retention | `retention_days` only trimmed the legacy `usage.jsonl` reports | `history_retention_days`, **off** by default | The old setting never pruned the history databases, so yours hold everything since installation; that stays so |
+| Where the databases live | `data_dir` wherever the config said: the local collector's `E:\Users\lab-monitor\data` or a NAS share | A local folder of their own (`E:\Users\lab-monitor\manager-data`) and a nightly, verified snapshot of every database to the NAS (`snapshot`, off until configured). The Manager logs a `WARNING` at startup when `data_dir` is on a share, holds a collector's files, or has no snapshot on another machine | SQLite in WAL mode on the share gave `disk I/O error` and failed transactions |
 
 Component details: [manager/README.md](../manager/README.md) ("Upgrading from the previous
 Manager"), [collector/README.md](../collector/README.md) ("Upgrading"),
@@ -140,7 +143,8 @@ listening** and brings it to the new schema:
   `retention_days` is ignored. `usage.jsonl` files written by the removed `POST /api/usage/report`
   stay where they are.
 
-**Disk space on the `data_dir` drive** for the first start: each `.bak` is a full copy of its
+**Disk space on the `data_dir` drive** (after [Step 3b](#step-3-upgrade-the-manager-and-dashboard):
+the local drive of `manager-data`) for the first start: each `.bak` is a full copy of its
 database, and the migrated folder history adds roughly 130 bytes per stored folder value while the
 old table is kept. On a test data set the `data_dir` grew from 12.5 MB to 26 MB. Have at least
 **1.5 times the current size of the databases** free, more if the folder history is very large
@@ -227,7 +231,8 @@ If the server has no "Lab Monitor Startup" task, start the services the way they
 before (for example `E:\Users\lab-monitor\start-services.bat`).
 
 If atlantis also runs a collector whose `data_dir` is the Manager's `data_dir` (see
-[ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md)), its archive files are copied too; that is fine.
+[ATLANTIS_DUAL_ROLE.md](ATLANTIS_DUAL_ROLE.md); the layout before Step 3b), its archive files are
+copied too; that is fine.
 
 ---
 
@@ -284,7 +289,7 @@ unexpected differences, warnings, and `RESULT: PASS` or `RESULT: FAIL`. Exit cod
 
 | Check | PASS means |
 |-------|-----------|
-| `source` | The live `data_dir` is byte-identical before and after. **WARN** if only database files changed while the live Manager was running (it stores collector data; the tool only reads) |
+| `source` | The live `data_dir` is byte-identical before and after. **WARN** if only database files changed while the live Manager was running (it stores collector data; the tool only reads). A `snapshot-status.json`, `.snapshot-staging\` or `manager.lock` that a review-fix Manager left there (after a rollback and before a second attempt) is never copied; the staging files and `manager.lock` are compared by size and modification time only. A changed `manager.lock` is a **FAIL** (the old Manager never writes it) |
 | `copies` | Every database copied and passes `PRAGMA quick_check` |
 | `config` | The new Manager accepts your `config.json`. **FAIL** if it would refuse it (it would not start after Step 3) |
 | `storage` | After migration, every original table still has every row with identical content; `folder_usage_legacy` equals the old wide table; one narrow row per old folder row and per measured value |
@@ -293,9 +298,9 @@ unexpected differences, warnings, and `RESULT: PASS` or `RESULT: FAIL`. Exit cod
 | `restart` | A second start of the new Manager migrates nothing and answers identically |
 | `ingest` | New messages are stored after the old history; totals continue from the old values; a re-send is a duplicate |
 | `legacy-resend` | Stored messages re-sent the way an old collector (no `msg_id`) or a collector upgraded before the Manager (its own `msg_id`) would are duplicates |
-| `backups` | Every database the new Manager changed has a `.bak` identical to the original |
+| `backups` | Every database the new Manager changed has a `.bak` identical to the original. An empty `data.db` (no table: the old Manager creates one when its Dashboard shows a system that has no history) needs none |
 | `files` | Other files (`usage.jsonl`, collector archives in a shared `data_dir`) are unchanged |
-| `rollback` | `rollback_upgrade.py` on the migrated copy restores every database, and the old Manager answers as before |
+| `rollback` | `rollback_upgrade.py` on the migrated copy restores every database, and the old Manager answers as before. An empty `data.db` has no backup and stays as the new Manager left it, so only the answers about that system's own data (`/api/data/<name>`) may now show what was stored since |
 | `dashboard` | The new Dashboard shows the same systems, metrics, folders and totals as the old one; charts load |
 
 **PASS** means: no check failed and there is no unexpected difference. A short list of
@@ -326,7 +331,7 @@ Other keys: `differences` (each with `endpoint`, `system`, `request`, `what`, `o
   directory with `--keep-work`).
 - `source` FAIL with `source_changes` listing only a collector's own files (`<name>\YYYY-MM.jsonl`,
   `queue.json`, `queue.json.lock`, `network_snapshot.json`): a collector on this server writes into
-  the same `data_dir` (dual role). The tool did not cause it. For a clean result, pause that
+  the same `data_dir` (dual role, the layout Step 3b ends). The tool did not cause it. For a clean result, pause that
   collector for the run (`Disable-ScheduledTask -TaskName "Lab Monitor - Metrics Collection"` and
   `"Lab Monitor - Disk Collection"`, then `Enable-ScheduledTask` afterwards; that collector's
   5-minute samples are missing for that time), or stop the Manager too for a strict check.
@@ -358,7 +363,8 @@ token (all collectors then get HTTP 401 until each one has its new token).
   5. Run Step 1 again: `config` must PASS.
 
 When you are done with the verification, remove the work folder (it holds full copies of your
-data). The `lab-monitor-new` worktree can stay until Step 3 or be removed with
+data). The `lab-monitor-new` worktree can stay until Step 3 (3b checks the edited config with it) or
+be removed with
 `git -C $Repo worktree remove E:\Users\lab-monitor\scripts\lab-monitor-new`.
 
 ---
@@ -383,7 +389,72 @@ collector's token is one the new Manager refuses, fix it first:
 
 **3a. Optional: take a fresh `/api/totals` snapshot** right before (Step 0b again, to a new file).
 
-**3b. Update the checkout and run the installer** (Anaconda PowerShell Prompt as Administrator).
+**3b. Move the databases to a local folder of their own, and turn on nightly snapshots.** This
+release keeps the Manager's databases on a local disk, in `E:\Users\lab-monitor\manager-data`, a
+folder nothing else writes to, and copies them to the NAS every night
+([manager/README.md, "Snapshots to a NAS"](../manager/README.md#snapshots-to-a-nas)). SQLite in WAL
+mode is not reliable on a network share: on this server it gave `disk I/O error` and failed
+transactions. Do this **before** the installer, so that the first start backs up and migrates the
+databases on the local disk, not on the share. Skip it only if `$Data` already is a local folder
+that holds nothing but the Manager's files. The installer keeps an existing `config.json` as it is
+(it only prints a `[NOTE]` about the layout), so the move is done by hand. Check that the local
+disk has room for the databases, plus about 1.5 times their size for the first start (above), plus
+about that size again for the staging copies while a snapshot runs, and that the NAS has a folder
+for the snapshots (each one is about the size of the databases; 14 daily and 12 monthly are kept).
+
+```powershell
+# Stop the old Manager and Dashboard (collectors queue meanwhile); write down when (UTC: a rollback's
+# replay starts here). The installer in 3c starts the new services.
+(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss") | Tee-Object -FilePath "$Backup\move-stop-utc.txt"
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match 'manager\.py|app\.py' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object CommandLine -match 'manager\.py'   # must list nothing
+
+# Copy the Manager's files only (databases with their -wal / -shm, retention archives, the old
+# Manager's usage.jsonl); a collector's YYYY-MM.jsonl, queue.json* and network_snapshot.json stay.
+# robocopy exit codes below 8 mean success; read move.log otherwise.
+$NewData = "E:\Users\lab-monitor\manager-data"
+robocopy $Data $NewData metrics.db* /COPY:DAT /DCOPY:T /R:2 /W:5 /NP /LOG:"$Backup\move.log"; "exit code: $LASTEXITCODE"
+robocopy $Data $NewData data.db* usage.jsonl /S /COPY:DAT /DCOPY:T /R:2 /W:5 /NP /LOG+:"$Backup\move.log"; "exit code: $LASTEXITCODE"
+Get-ChildItem $Data -Directory | Where-Object { Test-Path "$($_.FullName)\archive" } | ForEach-Object {
+    robocopy "$($_.FullName)\archive" "$NewData\$($_.Name)\archive" /E /COPY:DAT /DCOPY:T /R:2 /W:5 /NP /LOG+:"$Backup\move.log"
+    "exit code ($($_.Name)\archive): $LASTEXITCODE" }
+
+# Same databases, same sizes?
+Get-ChildItem $Data    -Recurse -File -Include metrics.db*, data.db* | Measure-Object Length -Sum | Select-Object Count, Sum
+Get-ChildItem $NewData -Recurse -File -Include metrics.db*, data.db* | Measure-Object Length -Sum | Select-Object Count, Sum
+
+# Point the Manager at the new folder and turn on snapshots (dest_dir: a folder on the NAS)
+$Cfg = Get-Content "$Repo\manager\config.json" -Raw | ConvertFrom-Json
+$Cfg.data_dir = $NewData
+$Cfg | Add-Member -Force -NotePropertyName snapshot -NotePropertyValue ([ordered]@{
+    enabled = $true; dest_dir = "\\<nas>\<share>\lab-monitor-snapshots"; time = "03:30"; keep_daily = 14; keep_monthly = 12 })
+$Cfg | ConvertTo-Json -Depth 5 | Set-Content -Path "$Repo\manager\config.json" -Encoding ASCII
+$Data = $NewData                             # from here on, $Data is the new folder
+
+# The new code (Step 1a's folder, if it is still there; the installer in 3c checks again) must accept
+# the edited config: "Config OK" (touches no database and no log file). It runs in the Manager's
+# Python environment (it needs Flask; a new Anaconda prompt starts in "base")
+conda activate lab-monitor
+python E:\Users\lab-monitor\scripts\lab-monitor-new\manager\manager.py --config "$Repo\manager\config.json" --check-config
+```
+
+- **Don't start the old services again** after this (a reboot would start them through "Lab Monitor
+  Startup" on the new folder, which is harmless; the installer stops them again). 3c follows right
+  away. If `--check-config` refuses the config, fix it first (the line says which setting); the
+  old services stay stopped meanwhile and the collectors keep queueing. `ModuleNotFoundError: No
+  module named 'flask'` is not a refused config: the `lab-monitor` environment is not active
+  (`conda activate lab-monitor`, then run the check again).
+- **Keep the old folder untouched** until the upgrade has run for a few days and a snapshot has
+  been checked (Step 4). It holds the data as it was at this step. Then remove the Manager's files
+  from it by hand (on atlantis the collector keeps its own files there).
+- A `snapshot.dest_dir` on a share means the tasks need a stored password: the installer in 3c sees
+  it and asks for the account's password (or takes `-TaskCredential`), because an S4U task has no
+  network access. A mapped drive letter (`Z:\`) stops the installer: use the UNC path.
+- `snapshot.dest_dir` must be outside `data_dir`; `--check-config` refuses the config otherwise.
+
+**3c. Update the checkout and run the installer** (Anaconda PowerShell Prompt as Administrator).
 The transcript keeps the installer's output; the time it stops the old services (UTC) is also
 appended to `E:\Users\lab-monitor\logs\installer-stop-times.txt` (a rollback needs it):
 
@@ -410,9 +481,10 @@ anything that changes the running services):
   rights) and when the Dashboard uses a full-rights token. `-ForceNewConfig` replaces **every**
   token (it removes `auth_tokens` and `collector_tokens` and asks first): all collectors then get
   HTTP 401 until each one has its new token, so don't use it to fix one bad token.
-- Checks the paths: S4U (no stored password) for a local `data_dir`; if `data_dir` or a log file
-  is a UNC path it asks for the account's password; a mapped drive letter stops the install here,
-  before it installs packages or writes a config.
+- Checks the paths: S4U (no stored password) for a local `data_dir`; if `data_dir`, a log file or
+  an enabled `snapshot.dest_dir` is a UNC path it asks for the account's password; a mapped drive
+  letter stops the install here, before it installs packages or writes a config. It prints a
+  `[NOTE]` if `data_dir` is still on a share or in the local collector's folder (Step 3b not done).
 - Installs `requirements.txt` (Flask, waitress, requests, paramiko) into the `lab-monitor` conda
   environment.
 - Runs the new `manager.py --check-config` on the config it is about to use (touches no database
@@ -446,7 +518,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
     Where-Object { $_.CommandLine -match 'manager\.py|app\.py' } | Select-Object ProcessId, CommandLine
 ```
 
-**3c. Follow the first start:**
+**3d. Follow the first start:**
 
 ```powershell
 Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 40 -Wait
@@ -454,8 +526,11 @@ Get-Content E:\Users\lab-monitor\logs\manager.log -Tail 40 -Wait
 
 Expect `Backed up … before migrating it` for each database, `migrated N folder_usage rows …; old
 table kept as 'folder_usage_legacy'`, warnings about legacy `auth_tokens` and any grandfathered or
-duplicate device names, then `Listening on 0.0.0.0:5000`. Startup errors (for example a refused
-config, exit code 2) are in `logs\manager-console.log`. Press Ctrl+C to stop following the log.
+duplicate device names, `Snapshots ENABLED: daily at 03:30 …`, then `Listening on 0.0.0.0:5000`.
+No layout `WARNING` should appear (one names what still differs from Step 3b: `data_dir` on a
+share or holding a collector's files, snapshots off, or `snapshot.dest_dir` not on a share).
+Startup errors (for example a refused config, exit code 2) are in `logs\manager-console.log`.
+Press Ctrl+C to stop following the log.
 
 ---
 
@@ -478,12 +553,28 @@ foreach ($p in $Before.devices.PSObject.Properties) {
         $p.Value.total_bytes_in, $a.total_bytes_in, $p.Value.total_bytes_out, $a.total_bytes_out
 }
 
-# One pre-upgrade backup per migrated database
+# One pre-upgrade backup per migrated database ($Data: the folder from Step 3b)
 Get-ChildItem $Data -Recurse -Filter "*.pre-upgrade-*.bak" | Select-Object FullName, Length
 ```
 
 Then open the Dashboard (`http://<server>:5001`): every system has its card, charts with "All
 Available" reach back to the first data, folder lists are complete.
+
+**A first snapshot.** Don't wait for 03:30 (the Manager also catches up 10 minutes after its first
+start). `POST /api/snapshot` needs an admin token (or the legacy `auth_tokens` one, which has full
+rights):
+
+```powershell
+$Admin = @{ Authorization = "Bearer <an admin_tokens or auth_tokens token>" }
+Invoke-RestMethod -Method Post http://localhost:5000/api/snapshot -Headers $Admin   # 409: one is running or about to start
+do { Start-Sleep 10; $S = Invoke-RestMethod http://localhost:5000/api/snapshot -Headers $H } while ($S.running)
+$S | Select-Object last_result, last_success, last_snapshot, last_files, last_bytes, last_error
+python "$Repo\manager\snapshot.py" verify $S.last_snapshot                          # must print OK
+```
+
+`last_result` must be `ok`. `partial` means a database could not be copied (`last_failed` names it,
+`last_error` says why; the others were copied): treat it like a damaged database
+([Troubleshooting](#troubleshooting)).
 
 If something is wrong, see [Troubleshooting](#troubleshooting) or [roll back](#rollback).
 
@@ -520,8 +611,8 @@ and Administrators can write to it and only they can read `collector\local\`.
 **atlantis (Manager and collector on one server):** if its collector runs from the same checkout
 (`E:\Users\lab-monitor\scripts\lab-monitor\collector`), Step 3 already upgraded it. Re-running
 `install-collector-windows.ps1` is optional. Note that its permission step resets the permissions
-of everything under `E:\Users\lab-monitor`, including the Manager's `data` and `logs` (contents are
-not changed). The Manager tasks run elevated as an administrator and keep access; if they run under
+of everything under `E:\Users\lab-monitor`, including the Manager's `manager-data` (or its old
+`data_dir` there) and `logs` (contents are not changed). The Manager tasks run elevated as an administrator and keep access; if they run under
 a stored-password account that is not a local administrator, give that account access again.
 
 **What to look for after a collector's first run:** its log
@@ -594,6 +685,8 @@ list two origins, which is harmless).
 | `history_retention_days` | `null` (default) keeps history forever. A number archives older rows to JSONL daily, then deletes them |
 | `retention_days` | Ignored now |
 | `backup_before_migration` | `true` (default): pre-upgrade `.bak` copies. Must be `true` or `false` |
+| `data_dir` | Unchanged by the installer. Move it to a local folder of its own (`E:\Users\lab-monitor\manager-data`) in [Step 3b](#step-3-upgrade-the-manager-and-dashboard): SQLite is not reliable on a share |
+| `snapshot` | New, off by default: `enabled`, `dest_dir` (a NAS folder, outside `data_dir`), `time` (`03:30`), `keep_daily` (14), `keep_monthly` (12), `verify_copy`, `catch_up`, `startup_delay_seconds` (600). A bad value or unknown key stops the Manager (exit code 2). An enabled UNC `dest_dir` makes the installer register the tasks with a stored password ([manager/README.md](../manager/README.md#snapshots-to-a-nas)) |
 | `max_request_bytes`, `max_messages_per_request`, `threads`, `log_max_bytes`, `log_backup_count`, `console_log_level` | New tuning keys with safe defaults ([manager/README.md](../manager/README.md)) |
 
 **The Manager refuses to start (exit code 2)** if any token contains `CHANGE-ME`, `CHANGE_ME`,
@@ -701,7 +794,8 @@ Manager that copied a partly migrated database). The current database and its `-
 are **renamed** to `<db>.post-upgrade-<stamp>` (+ suffix), never deleted, and the `.bak` stays. If
 any backup fails `PRAGMA quick_check`, nothing is changed. It refuses while a Manager answers
 `/health` on the configured port. Databases without a backup (systems first seen after the
-upgrade) are left as they are and listed.
+upgrade, or an empty `data.db` with no table that the old Manager created for a system without
+history) are left as they are and listed.
 
 Run it **before** checking out the old code (the tool exists only in the new code):
 
@@ -729,6 +823,10 @@ git -C $Repo checkout (Get-Content "$Backup\old-commit.txt").Trim()
 #    Copy-Item "$Backup\manager-config.json"   "$Repo\manager\config.json"
 #    Copy-Item "$Backup\dashboard-config.json" "$Repo\dashboard\config.json"
 #    (the installer's config.json.bak-<date> copies also work)
+#    The Step 0 manager config names the data_dir from before Step 3b. Set data_dir in it to the
+#    folder step 2 restored (E:\Users\lab-monitor\manager-data), so the old Manager serves the restored
+#    databases (the old folder still holds the data as of Step 3b and stays untouched). The old
+#    Manager ignores the "snapshot" section: no snapshots are taken while it runs.
 
 # 5. Start the services again (the launchers are outside the repository and run whatever is checked out)
 Enable-ScheduledTask -TaskName "Lab Monitor Manager"
@@ -751,9 +849,12 @@ After a rollback:
       --since <stop time from installer-stop-times.txt> --until <rollback-stop-utc.txt>
   ```
 
-  - `--since` is the time the installer stopped the old Manager in Step 3: the line of the upgrade
-    run in `E:\Users\lab-monitor\logs\installer-stop-times.txt` (also in
-    `installer-transcript.txt`, "Stopping at … UTC"). Messages collected while the old Manager was
+  - `--since` is the time the old Manager was stopped for the upgrade: `move-stop-utc.txt` from
+    Step 3b, or, if 3b was skipped, the line of the upgrade run in
+    `E:\Users\lab-monitor\logs\installer-stop-times.txt` (also in `installer-transcript.txt`,
+    "Stopping at … UTC"); when both exist, the earlier one (unless the old services ran again
+    between 3b and the installer, after a reboot: then the installer's line, because what that old
+    Manager stored is in the restored databases). Messages collected while the old Manager was
     down and the new one migrated belong to the window, so don't use the `.bak` time stamp, which
     is later. The restored databases hold nothing from after that point, so the window is safe.
   - `--until` is when the new Manager was stopped for the rollback (`rollback-stop-utc.txt`).
@@ -774,8 +875,8 @@ After a rollback:
 - Keep the `.bak` files. To undo the rollback, upgrade again (Step 3): the new Manager migrates the
   restored files again, after another backup if the old Manager stored anything since.
 
-To restore by hand instead (all databases together; they belong to one point in time): stop the
-Manager, rename `data.db` and its `-wal` / `-shm` files aside, copy the newest
+To restore by hand instead (all databases together: the first start took their copies together,
+before it listened): stop the Manager, rename `data.db` and its `-wal` / `-shm` files aside, copy the newest
 `data.db.pre-upgrade-<…>.bak` that has the old layout (a `folder_usage` table, no
 `folder_usage_msgs`) to `data.db`, and the same for `metrics.db` (no `dead_letter` table). The Step 0 copy of the
 whole `data_dir` is the last resort.
@@ -805,7 +906,10 @@ whole `data_dir` is the last resort.
 | Old Dashboard shows a `_scan_seconds` volume | A collector was upgraded before the Dashboard. Upgrade the server (Step 3) |
 | SSH tool: `HOST KEY CHANGED` | Expected only after a host was reinstalled; then remove its line from `tools/.known_hosts` |
 | `verify_upgrade.py` exit code 2 "not enough free space" | Use a `--work-dir` on a bigger disk (`--ignore-space` only if you know the estimate is too high) |
-| A database is damaged ("database disk image is malformed") | Messages for that system get `error` and stay queued. Stop the Manager, move the file aside, restore the `.bak` or the Step 0 copy, start again |
+| A database is damaged ("database disk image is malformed") | Messages for that system get `error` and stay queued. Stop the Manager, move the file aside (with its `-wal` / `-shm`), restore that database from the newest snapshot that holds a good copy of it ([manager/README.md, "Restoring"](../manager/README.md#snapshots-to-a-nas)), the `.bak` or the Step 0 copy, start again; collectors re-send what is still queued, `tools/replay_archives.py` the rest. The nightly snapshot keeps copying the other databases meanwhile (`last_result` `partial`) and keeps the last good copy of the damaged one |
+| `GET /api/snapshot`: `last_result` `error`, `last_error` names the share or "Not enough free space" | The share is unreachable from the task (a task without a stored password has no network access: re-run the installer, it asks), or full. Nothing was copied and the previous snapshots are untouched; the next run is at `snapshot.time`, or `POST /api/snapshot` |
+| Log: `snapshot(s) in <dest_dir> were made by another Manager or from another data_dir` | Snapshots whose manifest names another host or `data_dir` (a test Manager with a copy of the config, or this Manager before its `data_dir` was moved) are never pruned by this Manager. Delete them by hand when you no longer need them |
+| Startup `WARNING`: `data_dir … is on a network share`, `… is also a collector's data_dir`, `Snapshots are disabled` or `snapshot.dest_dir … is not on a network share` | The layout differs from Step 3b. Nothing is moved automatically and the Manager works as configured; do Step 3b (or [manager/README.md, "Moving `data_dir` off the NAS"](../manager/README.md#moving-data_dir-off-the-nas)) when convenient |
 
 More: [manager/README.md](../manager/README.md#troubleshooting),
 [collector/README.md](../collector/README.md#troubleshooting),
@@ -832,7 +936,9 @@ go away.
    size of the `data_dir` (`Get-ChildItem $Data -Recurse -File | Measure-Object Length -Sum`) and free
    space on each drive (`Get-PSDrive -PSProvider FileSystem`); the "Lab Monitor*" tasks and their
    state; whether a collector writes into the same `data_dir` (folders with `YYYY-MM.jsonl` next to
-   `data.db`); whether git is on PATH and which python the Manager uses (`conda activate
+   `data.db`: the layout Step 3b ends) and whether `data_dir` is on a share (Step 3b moves both
+   cases to a local `manager-data`); the NAS folder the owner wants for `snapshot.dest_dir` and
+   its free space; whether git is on PATH and which python the Manager uses (`conda activate
    lab-monitor`; `start-manager.bat` names it on upgraded servers).
 3. Confirm Step 0 exists (`$Backup\old-commit.txt`, `$Backup\data` with matching file count and
    size, robocopy exit code below 8). If not, ask the owner before stopping the Manager to make it.
@@ -846,15 +952,22 @@ go away.
    `source_changes`, `intended_differences` counts, `timings_seconds.new_manager_first_start`.
 7. Classify every non-PASS item:
    - `source` WARN with only `.db` / `-wal` / `-shm` changes while the live Manager runs: expected.
+     A `snapshot-status.json`, `.snapshot-staging\` or `manager.lock` in the `data_dir` (a review-fix
+     Manager ran on it before, e.g. before a rollback) is never copied or opened; only a review-fix
+     Manager changes them, so a WARN that says "its snapshot ran" while the old Manager is the live
+     one means a review-fix Manager is running on this `data_dir` too: stop and find out why. The
+     same changes with no live Manager answering are a FAIL, and so is a changed `manager.lock`.
    - `source` FAIL listing only a collector's own files: dual role (see Step 1c); re-run with that
      collector's tasks disabled if a clean PASS is needed.
    - Anything else: reproduce it with `--keep-work` (copy A = old, copy B = new, Manager logs in the
      work folder's `logs\`), find the cause in the code, and report it with the exact request and
      both answers. Do not upgrade.
-8. On PASS, report to the owner: PASS, the measured first-start time, the free space on the
-   `data_dir` drive versus about 1.5 times the database size, any warnings, and the plan for Steps
-   2-5. Wait for their go-ahead.
+8. On PASS, report to the owner: PASS, the measured first-start time, the free space on the drive
+   that will hold `manager-data` (Step 3b) versus the database size plus about 1.5 times it for the
+   first start (and that size again for a snapshot's staging copies), any warnings, and the plan
+   for Steps 2-5 including Step 3b. Wait for their go-ahead.
 9. After the owner upgrades (Step 3), run Step 4 and compare with the Step 0 snapshots; check one
-   `.bak` per migrated database and that only one `manager.py` process runs.
+   `.bak` per migrated database in `manager-data`, that only one `manager.py` process runs, and the
+   first snapshot (`last_result` `ok`, `snapshot.py verify` prints OK).
 10. Clean up only what you created: the verification work folder (it holds full copies of the data)
     and, when the owner agrees, the `lab-monitor-new` worktree.

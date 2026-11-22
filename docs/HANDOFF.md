@@ -14,6 +14,7 @@ reliability and security overhaul, plus a new Linux collector:
 |------|--------------|
 | Collector | Locked, atomic `queue.json`; every message gets a `msg_id`; per-message ACK; batches of 100; `null` (not 0) for unmeasured values; iterative disk scanner |
 | Manager | Duplicates detected by `msg_id` (and by natural key for old messages); narrow `folder_usage` storage (the old wide table is kept as `folder_usage_legacy`); scoped tokens (`collector_tokens`, `read_tokens`, `admin_tokens`; old `auth_tokens` still work); a `.pre-upgrade-<time>.bak` copy of each database before its first migration; thread-safe SQLite; waitress |
+| Storage layout | The databases in a local folder of their own (`E:\Users\lab-monitor\manager-data`, not the collector's `data` and not a share), and nightly snapshots of every database to a NAS folder (`snapshot` in the Manager config; consistent, verified copies; a damaged database makes the run `partial` instead of stopping it). Startup warnings when the layout differs. Nothing is moved automatically: UPGRADE.md Step 3b moves it by hand before the installer |
 | Dashboard | Outage and degraded states, XSS escaping, optional login, caching |
 | Tools | `verify_upgrade.py` (old vs new Manager on copies of your data), `rollback_upgrade.py`, `replay_archives.py`, SSH host-key pinning, queue-safe archive and reset |
 | Docs | [UPGRADE.md](UPGRADE.md) is the procedure. Most other docs were brought up to date |
@@ -21,7 +22,7 @@ reliability and security overhaul, plus a new Linux collector:
 
 `git log --oneline f086e7e..origin/fix/review-findings` lists the commits.
 
-**Tests:** 595 passed, 1 skipped (`shellcheck` missing), on Ubuntu 24.04 with Python 3.12.
+**Tests:** 667 passed, 1 skipped (`shellcheck` missing), on Ubuntu 24.04 with Python 3.12.
 **The suite has never run on Windows.**
 
 **Not on GitHub:** a second branch, `feature/usage-metrics` (per-user GPU and CPU, who is connected,
@@ -44,18 +45,30 @@ PowerShell. These are the most likely places for a bug, so test them here first,
 - The collector's PowerShell folder scan (`collector/lib/disk_usage.py`, path passed in `$env:LM_SCAN_PATH`)
 - Queue locking with `msvcrt` (`collector/lib/local_queue.py`) and file replacement on Windows
 - The Windows script that `tools/archive_all_collectors.py` sends (`FileStream.Lock`)
-- `verify_upgrade.py` opening databases read-only on a UNC path (`file:////server/share/...`)
+- SQLite opening a database by URI on a UNC path (`file:////server/share/...`, an empty URI
+  authority): `verify_upgrade.py`, `rollback_upgrade.py`, `snapshot.py verify` and a snapshot's
+  staging, the Manager's backup check. Tested here only by emulating Windows' path rules
+  (`tests/manager/test_manager_unc_paths.py`)
 - The Manager and Dashboard under waitress on Windows; the single-instance lock in `data_dir\manager.lock`
 - Task Scheduler behaviour, for example an S4U task reaching a UNC `data_dir`
 - Windows NVIDIA GPU stats (WDDM and TCC driver models)
+- Nightly snapshots on Windows: the installer's `-SnapshotDir`, a UNC `snapshot.dest_dir` reached by a
+  stored-password task, the copy to and the `.partial` → `snapshot-<stamp>` rename on an SMB share, pruning
+  (deleting folders) there, two Managers claiming a `.partial` folder at once there (`os.mkdir`), and
+  `snapshot.py verify` on a UNC path
+- `is_network_path` on Windows (`GetDriveTypeW` for mapped drives) behind the startup layout warnings
+- The PowerShell and robocopy commands of UPGRADE.md Step 3b (moving the databases to `manager-data`,
+  editing `config.json` with `ConvertTo-Json`)
 
 ## Your job, in order
 
 1. **Read** [UPGRADE.md](UPGRADE.md) in full, especially its last section, "For the next Claude
    session". Its rules apply to you. Then read [tools/README.md](../tools/README.md) sections 8 and 9.
 2. **Write down the facts** listed in that section: hostname, checkout path, running commit,
-   `data_dir`, sizes and free space, the scheduled tasks, whether the local collector shares the
-   `data_dir`, and the Python environment. Do not print any config file: they hold tokens.
+   `data_dir` (local, a share, or shared with the local collector), sizes and free space (also on the
+   drive that will hold `manager-data`), the scheduled tasks, the NAS folder the owner wants for the
+   snapshots (`snapshot.dest_dir`), and the Python environment. Do not print any config file: they
+   hold tokens.
 3. **Get the new code into a separate folder** (UPGRADE.md Step 1a). Never change the production
    checkout's branch.
 4. **Run the test suite on Windows** from that folder, in a **separate** Python environment so the
@@ -73,18 +86,25 @@ PowerShell. These are the most likely places for a bug, so test them here first,
    config: `data_dir` in a new empty folder, `host` `127.0.0.1`, an unused port, and freshly generated
    tokens. Then run the new collector against it with a scratch config (`--mode metrics`, then
    `--mode disk` on a small test folder). Finally point the new Dashboard at it (a second unused port) and
-   check that the card shows CPU, RAM, network, GPUs and the folders. This is the first time the
-   PowerShell scan, `msvcrt` locking and waitress run on Windows. Stop both servers afterwards and delete
-   the scratch folders.
+   check that the card shows CPU, RAM, network, GPUs and the folders. With a `snapshot` section in that
+   scratch config (`dest_dir` a scratch folder, on the NAS share if the owner agrees), take one snapshot
+   (`POST /api/snapshot` with the admin token, then `GET /api/snapshot` until `running` is false and
+   `last_result` is `ok`) and check it with `python manager\snapshot.py verify <its folder>`. This is the
+   first time the PowerShell scan, `msvcrt` locking, waitress and the snapshots run on Windows. Stop both
+   servers afterwards and delete the scratch folders.
 6. **Step 0 (backup), then Step 1 (`verify_upgrade.py` against the real data)**, exactly as UPGRADE.md
-   says. A local collector writing into the same `data_dir` is the "dual role" case in Step 1c.
+   says. A local collector writing into the same `data_dir` is the "dual role" case in Step 1c: the
+   layout before Step 3b, which moves the databases to a local `manager-data` folder. Note whether
+   `data_dir` is on a share or shared with the collector, and which NAS folder the owner wants for the
+   snapshots (`snapshot.dest_dir`).
 7. **Report to the owner** and wait. Give PASS or FAIL, every non-PASS item with its cause, the
    Windows test and smoke-test results, the measured first-start time, and the free space. Do not
    upgrade anything without the owner's go-ahead.
 8. **With the go-ahead:**
    - Step 2: merging into `main` is the owner's decision.
-   - Step 3: upgrade Dashboard and Manager together with the installer.
-   - Step 4: check the result.
+   - Step 3: move the databases to `manager-data` and turn on snapshots (3b), then upgrade Dashboard and
+     Manager together with the installer (3c).
+   - Step 4: check the result, including a first snapshot (`snapshot.py verify`).
    - Step 5: upgrade the collectors. Do the local one first, then one NAS, then the rest.
    - Watch the first day: metrics every 5 minutes, the 02:00 disk run, no errors in the logs.
 

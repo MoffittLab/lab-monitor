@@ -46,7 +46,10 @@ certificate).
    uses the NAS host name in lowercase, the Windows installer the computer name in lowercase).
 
 **What it does** (every check comes before anything that changes a running service):
-1. Creates `E:\Users\lab-monitor\data`, `logs` and `scripts`.
+1. Creates `E:\Users\lab-monitor\manager-data` (the Manager's `data_dir` in a new config: a local folder
+   used by nothing else), `logs` and `scripts`. `manager-data` is created, and left empty, even when an
+   existing config keeps another `data_dir`; the local collector's `E:\Users\lab-monitor\data` is the
+   collector installer's.
 2. Checks conda and creates the `lab-monitor` environment (Python 3.11) if missing.
 3. Clones the repository to `E:\Users\lab-monitor\scripts\lab-monitor`, or runs `git pull origin main`
    there. A failed pull stops the install (`-SkipGitPull` skips it).
@@ -54,9 +57,12 @@ certificate).
 5. Prepares `dashboard\config.json` with the Manager **read** token as `manager_token`, or keeps an
    existing one. If it creates the Dashboard config next to a kept Manager config that has no read
    token, it adds one to the Manager config. Nothing is written yet.
-6. Checks `data_dir` and the log paths and chooses the task account (see
-   [Network data_dir](#data_dir-on-a-network-share)). A mapped drive letter stops the install here,
-   before anything is installed or written.
+6. Checks `data_dir`, the log paths and an enabled `snapshot.dest_dir`, and chooses the task account
+   (see [Network paths](#data_dir-on-a-network-share)). A mapped drive letter stops the install here,
+   before anything is installed or written. For a kept config whose `data_dir` is on a share or is the
+   local collector's folder it prints a `[NOTE]` with the recommended layout; it never moves anything
+   ([manager/README.md, "Moving `data_dir` off the NAS"](manager/README.md#moving-data_dir-off-the-nas);
+   during the upgrade from the previous Manager: [docs/UPGRADE.md, Step 3b](docs/UPGRADE.md#step-3-upgrade-the-manager-and-dashboard)).
 7. Installs `requirements.txt` (Flask, waitress, requests, paramiko; all pinned).
 8. Validates the Manager config it is about to use (`manager.py --check-config`; touches no
    database and no log file) and the Python packages. **If the Manager would refuse the config,
@@ -92,7 +98,8 @@ enable it), and any generated collector tokens.
 | `-ManagerPort`, `-DashboardPort` | Ports (default 5000 / 5001) |
 | `-ForceNewConfig` | Regenerate the **tokens only** in both configs (old files backed up as `config.json.bak-<date>`). `data_dir`, log paths, ports, retention and the Dashboard login are kept. **All** existing tokens go, including `auth_tokens` and `collector_tokens` (it asks first): every collector gets HTTP 401 until it has a new token (`-CollectorNames` generates them). To fix one bad token, edit the config instead ([docs/UPGRADE.md](docs/UPGRADE.md#fix-a-refused-token-without-downtime)) |
 | `-IgnoreConfigCheck` | Install even if the new Manager refuses the config (it then stays down until the config is fixed) |
-| `-TaskCredential (Get-Credential)` | Account for the tasks when `data_dir` or a log file is on a network share |
+| `-SnapshotDir \\server\share\...` | New config only: turn on the nightly snapshots of `manager-data` to that NAS folder (`snapshot.enabled`, `snapshot.dest_dir`; 03:30, 14 daily and 12 monthly kept). An existing config keeps its own `snapshot` section: edit it there ([manager/README.md](manager/README.md#snapshots-to-a-nas)). A UNC folder makes the tasks run with a stored password |
+| `-TaskCredential (Get-Credential)` | Account for the tasks when `data_dir`, a log file or an enabled `snapshot.dest_dir` is on a network share |
 | `-SkipGitPull` | Install the code that is already checked out |
 
 Re-running the installer is safe: both configs and their tokens are kept unless you pass
@@ -139,12 +146,17 @@ For the Dashboard use "Lab Monitor Dashboard", `dashboard.pid` and `app\.py`. Fr
 
 ### data_dir on a network share
 
+**Don't put `data_dir` itself on a share.** SQLite is not reliable there (`disk I/O error`, failed
+transactions); keep it on a local disk and let the Manager copy it to the NAS each night
+([snapshots](manager/README.md#snapshots-to-a-nas)). The Manager logs a `WARNING` at every start
+while `data_dir` is on a share.
+
 The tasks normally run as the installing user through **S4U** (no stored password). An S4U task has
 **no network access**:
-- If `data_dir` or a log file is a UNC path (`\\server\share\...`), the installer asks for that
-  account's password (or takes `-TaskCredential`) and registers the tasks with a stored password.
-  The account needs access to the share. Re-run the installer after the password changes, or the
-  tasks stop starting.
+- If `data_dir`, a log file or an enabled `snapshot.dest_dir` (the usual case: snapshots go to the
+  NAS) is a UNC path (`\\server\share\...`), the installer asks for that account's password (or
+  takes `-TaskCredential`) and registers the tasks with a stored password. The account needs access
+  to the share. Re-run the installer after the password changes, or the tasks stop starting.
 - **Mapped drive letters (`Z:\...`) are not supported**: scheduled tasks can't see drive mappings.
   The installer stops before changing anything; use the UNC path instead.
 
