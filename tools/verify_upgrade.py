@@ -17,7 +17,8 @@ The live data_dir is NEVER written to:
     online backup API, which gives a consistent snapshot even while the live
     Manager keeps writing; other files (usage.jsonl, ...) are copied with shutil;
   - the size, mtime and sha256 of every file are recorded before and after the
-    run and compared;
+    run and compared (a review-fix Manager's snapshot staging files: size and
+    mtime only; they and its snapshot-status.json are never copied);
   - the work directory must not be inside the data_dir.
 Everything else happens on two copies under --work-dir:
   copy A  served by the OLD Manager (extracted with "git archive <--old-ref>",
@@ -29,7 +30,8 @@ tokens; the code is copied into the work directory first, so PID files and
 logs never touch the real installation.
 
 What is checked (each check is PASS / FAIL / WARN in the summary and report):
-  source      data_dir unchanged (size + mtime + sha256 of every file)
+  source      data_dir unchanged (size + mtime + sha256 of every file; a
+              review-fix Manager's snapshot staging files: size + mtime)
   copies      every database copied and passes PRAGMA quick_check
   config      the NEW Manager's --check-config on your --manager-config
   storage     copy B after migration: every original table and row is still
@@ -131,6 +133,24 @@ TS_KEYS = frozenset({
     'timestamp', 'first_seen', 'last_seen', 'last_updated', 'metrics_timestamp',
     'disk_timestamp', 'network_last_updated', 'received_at',
 })
+# manager/snapshot.py STAGING_DIR and STATUS_FILE (the review-fix release's
+# nightly snapshots): that Manager's snapshot scratch folder, whose files
+# appear, grow and vanish while a snapshot runs (or stay, half written with a
+# hot journal, after a Manager was killed mid-snapshot), and its snapshot
+# status file.  A data_dir has them once the review-fix Manager ran on it
+# with snapshots on (for example after a rollback to the old code and before
+# a second attempt).  Neither holds data: neither is copied, and changes to
+# them are that Manager's own writes.
+SNAPSHOT_STAGING = '.snapshot-staging'
+SNAPSHOT_STATUS = 'snapshot-status.json'
+# manager/storage_util.py INSTANCE_LOCK_NAME: the review-fix Manager's lock
+# file.  It is never deleted, so a data_dir that Manager ran on keeps it (for
+# example after a rollback to the old code, before a second attempt).  It holds
+# no data (a "pid=... started=..." line) and the NEW Manager on copy B writes
+# its own, so it is not copied; it is fingerprinted by size and mtime (on
+# Windows a held lock's byte can't be read).  The old Manager never writes it:
+# a change to it during the run is a FAIL of the source check.
+INSTANCE_LOCK_NAME = 'manager.lock'
 
 # --------------------------------------------------------------------------- #
 # Intended differences (the ONLY things normalized away)                       #
@@ -285,6 +305,21 @@ def is_within(child, parent) -> bool:
         return os.path.commonpath([c, p]) == p
     except ValueError:      # different drives (Windows)
         return False
+
+
+def is_snapshot_scratch(rel) -> bool:
+    """The review-fix Manager's snapshot staging folder or anything in it (relative path with '/')."""
+    return rel == SNAPSHOT_STAGING or rel.startswith(SNAPSHOT_STAGING + '/')
+
+
+def is_manager_status(rel) -> bool:
+    """The review-fix Manager's snapshot status file (and its temporary file while it is replaced)."""
+    return rel in (SNAPSHOT_STATUS, SNAPSHOT_STATUS + '.tmp')
+
+
+def is_lock_file(rel) -> bool:
+    """The review-fix Manager's lock file <data_dir>/manager.lock (relative path with '/')."""
+    return rel == INSTANCE_LOCK_NAME
 
 
 def is_sqlite(path) -> bool:
@@ -672,7 +707,15 @@ def points_of(data):
 # --------------------------------------------------------------------------- #
 
 def fingerprint(root):
-    """{'files': {rel: {size, mtime_ns, sha256}}, 'dirs': [rel]} for every file under root."""
+    """
+    {'files': {rel: {size, mtime_ns, sha256}}, 'dirs': [rel]} for every file
+    under root.  The files in a review-fix Manager's snapshot staging folder
+    (is_snapshot_scratch: temporary copies, possibly as large as the
+    databases, that a running snapshot may remove while they are read) get
+    size and mtime only, and one that vanishes while this runs is left out
+    instead of being reported unreadable.  So does that Manager's lock file
+    (is_lock_file: on Windows a held lock's byte can't be read).
+    """
     files, dirs = {}, []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -682,9 +725,14 @@ def fingerprint(root):
         for fn in sorted(filenames):
             p = os.path.join(dirpath, fn)
             rel = os.path.relpath(p, root).replace(os.sep, '/')
+            scratch = is_snapshot_scratch(rel)
             try:
                 st = os.stat(p)
-                files[rel] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'sha256': sha256_file(p)}
+                files[rel] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns,
+                              'sha256': None if scratch or is_lock_file(rel) else sha256_file(p)}
+            except FileNotFoundError as e:
+                if not scratch:
+                    files[rel] = {'error': '%s: %s' % (type(e).__name__, e)}
             except OSError as e:
                 files[rel] = {'error': '%s: %s' % (type(e).__name__, e)}
     return {'files': files, 'dirs': dirs}
@@ -775,12 +823,24 @@ def backup_sqlite(src, dst, staging):
 
 
 def copy_data_dir(src, dst, staging):
-    """Copy src -> dst: databases via the backup API, other files with shutil.copy2."""
+    """
+    Copy src -> dst: databases via the backup API, other files with
+    shutil.copy2.  Not copied: a review-fix Manager's snapshot staging folder
+    (is_snapshot_scratch: temporary copies a running snapshot writes and
+    removes, or a killed one left half written with a hot journal, which a
+    read-only connection can't even open), its snapshot status file
+    (is_manager_status) and its lock file (is_lock_file: no data; the NEW
+    Manager on copy B writes its own).  A file that vanishes while it is
+    copied is listed as 'vanished' (the source check reports it).
+    """
     copied = []
     os.makedirs(dst, exist_ok=True)
     for dirpath, dirnames, filenames in os.walk(src):
-        dirnames.sort()
         rel_dir = os.path.relpath(dirpath, src)
+        if rel_dir == '.' and SNAPSHOT_STAGING in dirnames:
+            dirnames.remove(SNAPSHOT_STAGING)
+            copied.append({'file': SNAPSHOT_STAGING, 'kind': 'scratch', 'method': 'not copied'})
+        dirnames.sort()
         target_dir = dst if rel_dir == '.' else os.path.join(dst, rel_dir)
         os.makedirs(target_dir, exist_ok=True)
         names = set(filenames)
@@ -791,6 +851,12 @@ def copy_data_dir(src, dst, staging):
                          if fn.endswith(s) and fn[:-len(s)] in names), None)
             if side and is_sqlite(os.path.join(dirpath, side)):
                 continue                      # copied together with its database
+            if is_manager_status(rel):
+                copied.append({'file': rel, 'kind': 'status', 'method': 'not copied'})
+                continue
+            if is_lock_file(rel):
+                copied.append({'file': rel, 'kind': 'lock', 'method': 'not copied'})
+                continue
             t = os.path.join(target_dir, fn)
             if is_sqlite(p):
                 method = backup_sqlite(p, t, staging)
@@ -800,11 +866,17 @@ def copy_data_dir(src, dst, staging):
                 # whether that backup is still current, so the copy must look like the original.
                 try:
                     times = [os.stat(x).st_mtime_ns for x in (p, p + '-wal') if os.path.exists(x)]
-                    os.utime(t, ns=(max(times), max(times)))
+                    if times:
+                        os.utime(t, ns=(max(times), max(times)))
                 except OSError:
                     pass
             else:
-                shutil.copy2(p, t)
+                try:
+                    shutil.copy2(p, t)
+                except FileNotFoundError:
+                    # removed meanwhile (a live process); the source check reports it
+                    copied.append({'file': rel, 'kind': 'vanished', 'method': 'not copied'})
+                    continue
                 copied.append({'file': rel, 'kind': 'file'})
     return copied
 
@@ -847,9 +919,14 @@ def db_tables(conn):
     return out
 
 
-def logical_hash(path, tables=None):
-    """Per-table content hashes of a database (tables: restrict to these, with these columns)."""
-    conn = ro_connect(path, immutable=True)
+def logical_hash(path, tables=None, immutable=True):
+    """
+    Per-table content hashes of a database (tables: restrict to these, with these
+    columns).  immutable=False also reads what is committed only in its -wal (a
+    database a Manager left with one; that connection may create -wal / -shm files,
+    so only for this tool's own copies).
+    """
+    conn = ro_connect(path, immutable=immutable)
     try:
         present = db_tables(conn)
         result = {}
@@ -1267,8 +1344,10 @@ class Verifier:
         self.read_token = 'verify-read-' + uuid.uuid4().hex
 
     def space_check(self, fp):
-        total = sum(f.get('size', 0) for f in fp['files'].values())
-        dbs = sum(f.get('size', 0) for rel, f in fp['files'].items() if rel.endswith('.db'))
+        # a review-fix Manager's snapshot staging files are not copied
+        total = sum(f.get('size', 0) for rel, f in fp['files'].items() if not is_snapshot_scratch(rel))
+        dbs = sum(f.get('size', 0) for rel, f in fp['files'].items()
+                  if rel.endswith('.db') and not is_snapshot_scratch(rel))
         # copy A + copy B + B's pre-upgrade backups + narrow folder tables + the rollback's restored copies
         need = int(total * 2 + dbs * 2.5) + 64 * 1024 * 1024
         free = shutil.disk_usage(str(self.work)).free
@@ -1464,7 +1543,8 @@ class Verifier:
             self.check('copies', 'FAIL', 'database integrity problems in the SOURCE data: %s' % bad, copied=self.copied)
         else:
             self.check('copies', 'PASS', '%d files copied (%s)' % (
-                len(self.copied), ', '.join('%s: %d' % kv for kv in sorted(methods.items()))))
+                sum(1 for c in self.copied if c.get('method') != 'not copied'),
+                ', '.join('%s: %d' % kv for kv in sorted(methods.items()))))
         shutil.copytree(str(self.copy_a), str(self.copy_b))
         self.b_files_initial = list_files(self.copy_b)
 
@@ -1766,6 +1846,7 @@ class Verifier:
             try:
                 self.old_answers[('old',) + tuple(key or ('simple', request))] = {
                     'pattern': pattern, 'path': path, 'params': params, 'normalize': normalize,
+                    'system': system,
                     'status': o.status, 'digest': digest(normalize(o.data)) if o.status == 200 else None}
             finally:
                 self.applied.enabled = was
@@ -2841,7 +2922,12 @@ class Verifier:
             mine = [f for f in cands if _backup_belongs(f, rel)]
             matching = [f for f in mine if orig_hash and cand_hash.get(f) == orig_hash]
             results[rel] = {'schema_changed': changed, 'backups': mine, 'matching_original': matching}
-            if changed and not mine:
+            if not orig_tables:
+                # It held no table, so nothing: the old Manager creates an empty <name>/data.db
+                # when anything (its Dashboard) reads a system that has no history.  The NEW
+                # Manager has nothing to migrate or back up there and creates its tables in it.
+                results[rel]['empty_original'] = True
+            elif changed and not mine:
                 problems.append('%s was altered by the NEW Manager but has no pre-upgrade backup' % rel)
             elif changed and orig_hash and not matching:
                 problems.append('%s: backup(s) %s do not contain the original content' % (rel, mine))
@@ -2855,7 +2941,9 @@ class Verifier:
         else:
             n = sum(1 for rel, r in results.items()
                     if r['matching_original'] and self.inv['dbs'][rel]['kind'] in ('central', 'system'))
-            self.check('backups', 'PASS', '%d databases have a pre-upgrade backup identical to the original' % n)
+            empty = [rel for rel, r in results.items() if r.get('empty_original')]
+            self.check('backups', 'PASS', '%d databases have a pre-upgrade backup identical to the original%s' % (
+                n, '; none needed (no table before the upgrade): %s' % ', '.join(empty[:5]) if empty else ''))
 
     def check_rollback(self):
         """
@@ -2864,11 +2952,27 @@ class Verifier:
         then the OLD Manager on it.  Every database must hold exactly its
         original content again, and every OLD answer recorded before any write
         must come back identical.
+
+        The one exception: a database that held no table before the upgrade (an
+        empty <name>/data.db the old Manager created when something read a system
+        without history) has no backup, because there was nothing in it.  The
+        tool leaves it as it is, with what the NEW Manager stored in it since,
+        like a system first seen after the upgrade.  It must then be exactly as
+        the NEW Manager left it, and the OLD answers about that system's own
+        data (/api/data/<system>...) must have the same HTTP status but may now
+        show that data.
         """
         tool = self.new_code / 'tools' / 'rollback_upgrade.py'
         if not tool.is_file():
             self.check('rollback', 'WARN', 'the NEW code has no tools/rollback_upgrade.py: rollback not checked')
             return
+
+        def content(path):
+            return logical_hash(path, immutable=not os.path.exists(str(path) + '-wal'))
+        empty = [rel for rel, dbinv in self.inv['dbs'].items() if not dbinv['tables']]
+        left_before = {rel: content(self.copy_b / rel) for rel in empty if (self.copy_b / rel).is_file()}
+        empty_dirs = {rel.split('/')[0] for rel in empty if self.inv['dbs'][rel]['kind'] == 'system'}
+        empty_systems = (empty_dirs | {s['name'] for s in self.inv['systems'] if s['dir'] in empty_dirs}) - {None}
         say('Rolling copy B back to its pre-upgrade backups (tools/rollback_upgrade.py) ...')
         r = subprocess.run([sys.executable, str(tool), '--data-dir', str(self.copy_b), '--apply', '--force'],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=self.env(), timeout=3600)
@@ -2885,6 +2989,11 @@ class Verifier:
             if not path.is_file():
                 problems.append('%s: missing after the rollback' % rel)
                 continue
+            if rel in empty:
+                if rel not in left_before or content(path) != left_before[rel]:
+                    problems.append('%s held no table before the upgrade (no backup): the rollback must leave '
+                                    'it as the NEW Manager left it, and it changed' % rel)
+                continue
             if None in want.values():          # --no-hash: row counts only
                 conn = ro_connect(path)
                 try:
@@ -2894,13 +3003,13 @@ class Verifier:
                 if got != {t: info['rows'] for t, info in dbinv['tables'].items()}:
                     problems.append('%s: row counts differ from the original after the rollback' % rel)
                 continue
-            got = logical_hash(path)
+            got = content(path)
             if got != want:
                 bad = sorted(t for t in set(got) | set(want) if got.get(t) != want.get(t))
                 problems.append('%s: content differs from the original after the rollback (tables %s)'
                                 % (rel, ', '.join(bad[:6])))
         moved = [f for f in list_files(self.copy_b) if '.post-upgrade-' in f]
-        replayed, changed = 0, []
+        replayed, changed, shows_new = 0, [], []
         if not problems:
             try:
                 proc, _secs = self.start_manager('old', self.copy_b)
@@ -2917,7 +3026,10 @@ class Verifier:
                     if resp.status != rec['status']:
                         changed.append('%s: HTTP %s -> %s' % (rec['path'], rec['status'], resp.status))
                     elif resp.status == 200 and digest(rec['normalize'](resp.data)) != rec['digest']:
-                        changed.append('%s: answer differs' % rec['path'])
+                        if rec.get('system') in empty_systems and rec['path'].startswith('/api/data/'):
+                            shows_new.append(rec['path'])        # the data stored since (see above)
+                        else:
+                            changed.append('%s: answer differs' % rec['path'])
             finally:
                 self.applied.enabled = True
                 h.close()
@@ -2927,9 +3039,15 @@ class Verifier:
             self.check('rollback', 'FAIL', '%d problems after the rollback, e.g. %s' % (len(problems), problems[0]),
                        problems=problems[:30], tool_output=out[-20:])
         else:
+            self.report['rollback_not_restored'] = {'empty_before_upgrade': empty, 'answers_showing_new_data':
+                                                    shows_new}
             self.check('rollback', 'PASS', 'tools/rollback_upgrade.py restored every database to its original '
                        'content (%d post-upgrade files kept aside); the OLD Manager on it gave the same %d '
-                       'answers as before the upgrade' % (len(moved), replayed))
+                       'answers as before the upgrade%s' % (
+                           len(moved), replayed - len(shows_new),
+                           '; left as they are, since they held no table before the upgrade (no backup): %s '
+                           '(%d answers about them now show what was stored since)'
+                           % (', '.join(empty[:5]), len(shows_new)) if empty else ''))
 
     def check_other_files(self):
         bad = []
@@ -2954,15 +3072,30 @@ class Verifier:
         n = len(self.fp_before['files'])
         size = sum(f.get('size', 0) for f in self.fp_before['files'].values())
         if not touched:
-            self.check('source', 'PASS', 'data_dir unchanged: %d files, %.2f GB (size, mtime, sha256)' % (n, size / 1e9))
+            scratch = sum(1 for rel in self.fp_before['files'] if is_snapshot_scratch(rel))
+            only_stat = ['%d snapshot staging files' % scratch] if scratch else []
+            if any(is_lock_file(rel) for rel in self.fp_before['files']):
+                only_stat.append(INSTANCE_LOCK_NAME)
+            self.check('source', 'PASS', 'data_dir unchanged: %d files, %.2f GB (size, mtime, sha256%s)' % (
+                n, size / 1e9, '; %s: size, mtime' % ' and '.join(only_stat) if only_stat else ''))
             return
+        # What a running Manager writes itself: its databases and their side files, and (the
+        # review-fix release) its snapshot staging folder and snapshot status file.  Not
+        # manager.lock: the live Manager here is the old one, which never writes it, so a
+        # changed lock file means a review-fix Manager started on the live data_dir.
         db_like = re.compile(r'\.db(-wal|-shm|-journal)?$')
-        only_db = all(db_like.search(f) for f in cmp_['added'] + cmp_['removed'] +
-                      [c['file'] for c in cmp_['changed']]) and not cmp_['dirs_added']
+
+        def manager_written(rel):
+            return bool(db_like.search(rel)) or is_snapshot_scratch(rel) or is_manager_status(rel)
+        files = cmp_['added'] + cmp_['removed'] + [c['file'] for c in cmp_['changed']]
+        only_db = all(manager_written(f) for f in files) and \
+            all(is_snapshot_scratch(d) for d in cmp_['dirs_added'])
+        snapshot_ran = any(is_snapshot_scratch(p) or is_manager_status(p) for p in files + cmp_['dirs_added'])
         if only_db and self.live_manager:
             self.check('source', 'WARN', 'database files in the data_dir changed during the run while the live '
-                       'Manager is running (it keeps storing collector data); this tool only opens them '
-                       'read-only. Stop the Manager task for a strict byte-identical check.', changes=cmp_)
+                       'Manager is running (it keeps storing collector data%s); this tool only opens them '
+                       'read-only. Stop the Manager task for a strict byte-identical check.'
+                       % (', and its snapshot ran' if snapshot_ran else ''), changes=cmp_)
         else:
             self.check('source', 'FAIL', 'the data_dir changed during the run: %s' % short(cmp_, 400), changes=cmp_)
 

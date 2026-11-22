@@ -12,6 +12,7 @@ import os
 import socket
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -225,3 +226,75 @@ def test_only_new_layout_backups_restore_the_newest_with_a_warning(tmp_path, cap
     code, _items = rb.rollback(str(d), apply=True, out=print)
     assert code == 0 and _rows(db) == ['only-copy']
     assert 'already has the new layout' in capsys.readouterr().out
+
+
+def test_manager_data_layout_with_snapshot_files_and_a_killed_managers_wal(tmp_path):
+    """
+    The review-fix layout: the databases in their own manager-data folder (an absolute
+    data_dir in the config), the nightly snapshots' status file and a killed snapshot's
+    staging leftover next to them, and a live database whose newest rows are only in its
+    -wal (the Manager was killed, not stopped).  The tool decides nothing from a live
+    database (it reads only the .bak files), so that -wal goes aside with its database and
+    stays readable there; the snapshot files are no system and are left as they are.
+    """
+    d = tmp_path / 'E' / 'manager-data'
+    atl = str(d / 'atlantis' / 'data.db')
+    _db(atl + '.pre-upgrade-20261201T100000Z.bak', ['atl-original'])
+    _db(atl, ['atl-migrated'], wal=True)
+    con = sqlite3.connect(atl)
+    con.execute('PRAGMA wal_autocheckpoint=0')
+    con.execute("INSERT INTO t VALUES ('only-in-wal')")
+    con.commit()
+    live = {s: Path(atl + s).read_bytes() for s in ('', '-wal')}
+    con.close()
+    for s, data in live.items():               # what a kill leaves: the -wal is not checkpointed
+        with open(atl + s, 'wb') as f:
+            f.write(data)
+    assert os.path.getsize(atl + '-wal') > 0
+    (d / 'snapshot-status.json').write_text('{"last_success": "2026-12-02T03:30:41Z"}')
+    staged = d / '.snapshot-staging' / '20261202T033000Z' / 'atlantis'
+    staged.mkdir(parents=True)
+    (staged / 'data.db').write_bytes(b'SQLite format 3\x00' + b'\x01' * 5000)
+    (staged / 'data.db-journal').write_bytes(b'\xd9\xd5\x05\xf9\x20\xa1\x63\xd7' + b'\x00' * 500)
+    keep = {k: v for k, v in _tree(d).items() if k.startswith(('.snapshot-staging', 'snapshot-status'))}
+    cfg = tmp_path / 'config.json'
+    cfg.write_text(json.dumps({'data_dir': str(d), 'port': 1}))
+    code, items = rb.rollback(str(d), apply=False, out=lambda *_: None)
+    assert code == 0 and [i['rel'] for i in items] == [os.path.join('atlantis', 'data.db')]
+    assert rb.main(['--manager-config', str(cfg), '--apply', '--force']) == 0
+    assert _rows(atl) == ['atl-original']
+    after = _tree(d)
+    assert {k: v for k, v in after.items() if k.startswith(('.snapshot-staging', 'snapshot-status'))} == keep
+    moved = sorted(k for k in after if '.post-upgrade-' in k)
+    base = [k for k in moved if not k.endswith(('-wal', '-shm'))][0]
+    scratch = tmp_path / 'reopen'
+    scratch.mkdir()
+    for suffix in ('', '-wal'):
+        (scratch / ('a.db' + suffix)).write_bytes((d / (base + suffix)).read_bytes())
+    assert _rows(str(scratch / 'a.db')) == ['atl-migrated', 'only-in-wal']
+
+
+def test_a_data_dir_on_a_share(data_dir, monkeypatch):
+    """
+    A data_dir on a NAS share (\\\\server\\share\\..., the layout before Step 3b):
+    every backup is checked through a read-only file: URI, which must have an empty
+    URI authority (file:////server/share/...); SQLite refuses pathlib's
+    file://server/share/... ("invalid uri authority").  On POSIX the tool is
+    switched to Windows' path rules and given a path starting with '//': a UNC path
+    to the tool, the same folder to Linux (tests/manager/test_manager_unc_paths.py).
+    """
+    if os.name == 'nt':
+        pytest.skip('POSIX emulation of a UNC path (needs a real share on Windows)')
+    from pathlib import PureWindowsPath
+    monkeypatch.setattr(rb, '_WINDOWS', True, raising=False)
+    monkeypatch.setattr(rb, 'Path', PureWindowsPath)
+    unc = '/' + os.path.abspath(str(data_dir))
+    items = rb.plan(unc)
+    assert {i['rel']: i['check'] for i in items if i['backup']} == {
+        'metrics.db': 'ok', os.path.join('atlantis', 'data.db'): 'ok', os.path.join('vault_2', 'data.db'): 'ok'}
+    assert all(i['old_layout'] for i in items if i['backup'])
+    code, _items = rb.rollback(unc, apply=True, out=lambda *_: None)
+    assert code == 0
+    monkeypatch.undo()
+    assert _rows(str(data_dir / 'atlantis' / 'data.db')) == ['atl-original']
+    assert _rows(str(data_dir / 'metrics.db')) == ['central-original']

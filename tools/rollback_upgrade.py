@@ -13,7 +13,7 @@ Run it ON THE MANAGER SERVER with the Manager STOPPED (Task Scheduler: end
 
     python tools\rollback_upgrade.py --manager-config manager\config.json             (dry run: the plan)
     python tools\rollback_upgrade.py --manager-config manager\config.json --apply
-    python tools\rollback_upgrade.py --data-dir E:\Users\lab-monitor\data --apply
+    python tools\rollback_upgrade.py --data-dir E:\Users\lab-monitor\manager-data --apply
 
 For metrics.db and every <system>\data.db with a pre-upgrade backup:
   1. the backup is checked (PRAGMA quick_check); if any backup fails the
@@ -26,7 +26,12 @@ For metrics.db and every <system>\data.db with a pre-upgrade backup:
 Nothing is deleted: the .bak stays where it is, and the moved-aside files
 keep everything the new Manager stored after the upgrade (the collectors'
 archives hold those messages too), so a rollback can itself be undone by
-renaming the files back.
+renaming the files back.  Only the backups are read (the choice and the check
+below); a current database is never opened, only renamed together with its
+side files, so what a killed Manager (Task Scheduler's End, Stop-Process
+-Force) left only in a -wal file stays readable in the moved-aside files.
+The new Manager's snapshot status file (snapshot-status.json) and staging
+folder (.snapshot-staging) hold no data and are left as they are.
 
 Which backup: the NEWEST pre-upgrade backup of each database that still has
 the layout the old Manager wrote (each one is taken just before the new
@@ -41,9 +46,10 @@ newest is used, with a warning.  --use-oldest picks the oldest instead.
 
 Databases WITHOUT a backup are left as they are and listed: databases the
 new Manager created after the upgrade (systems first seen since), or ones it
-never had to change.  The old Manager can open them; history the new Manager
-stored in their folder_usage_msgs / folder_usage_items tables is not shown by
-the old code.
+never had to change (such as an empty data.db with no table, which the old
+Manager created when something read a system that had no history).  The old
+Manager can open them; history the new Manager stored in their
+folder_usage_msgs / folder_usage_items tables is not shown by the old code.
 
 After the rollback (see also docs/UPGRADE.md):
   - check out the old code in the installation (git checkout <old commit>)
@@ -70,6 +76,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 BACKUP_INFIX = '.pre-upgrade-'           # manager/storage_util.py BACKUP_INFIX
 MOVED_INFIX = '.post-upgrade-'
@@ -116,8 +123,22 @@ def find_databases(data_dir):
     return dbs
 
 
+# Windows path rules for _ro_uri (a module setting so tests can try them on Linux)
+_WINDOWS = os.name == 'nt'
+
+
 def _ro_uri(path):
-    return Path(os.path.abspath(path)).as_uri() + '?mode=ro&immutable=1'
+    """
+    Read-only file: URI.  A UNC path (a data_dir on a share) becomes
+    file:////server/share/...: SQLite refuses pathlib's file://server/share/...
+    ("invalid uri authority").  The same as tools/verify_upgrade.py ro_uri.
+    """
+    p = os.path.abspath(path)
+    if _WINDOWS and (p.startswith('\\\\') or p.startswith('//')):
+        uri = 'file://' + quote(p.replace('\\', '/'), safe='/:')
+    else:
+        uri = Path(p).as_uri()
+    return uri + '?mode=ro&immutable=1'
 
 
 def has_old_layout(path, central):

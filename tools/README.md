@@ -448,8 +448,9 @@ device registry and snapshots) is still readable, unchanged, through the new Man
 Dashboard. It runs the OLD Manager and the NEW Manager side by side on two copies of your real
 `data_dir` and compares them. **The live `data_dir` is only read, never written.**
 
-**Where to run it:** on the server that holds the databases (e.g. `E:\Users\lab-monitor\data`),
-with the same Python environment as the Manager and git installed. Run it from a **separate
+**Where to run it:** on the server that holds the databases (the Manager's `data_dir` as its config
+names it: before docs/UPGRADE.md Step 3b moves it to `E:\Users\lab-monitor\manager-data`, often
+`E:\Users\lab-monitor\data` or a share), with the same Python environment as the Manager and git installed. Run it from a **separate
 checkout of the new code**, so the running Manager keeps its code:
 
 ```bat
@@ -497,13 +498,32 @@ and logs never touch the installed copies.
 - While the live Manager keeps running, its database files change during the run; that is
   reported as `WARN source` (the tool only reads them). For a strict byte-identical check, stop
   the "Lab Monitor Manager" task while it runs; collectors keep queueing in the meantime.
+- The review-fix Manager writes `<data_dir>\snapshot-status.json` and `<data_dir>\.snapshot-staging\`
+  when it takes a snapshot. The old Manager writes neither, but both stay in a `data_dir` the
+  review-fix Manager ran on (for example after a rollback, before a second attempt). Neither holds
+  data, so neither is copied: the staging folder can hold half-written copies (a snapshot killed
+  mid-run leaves them, with a hot journal) that SQLite could not even open read-only. Its files are
+  fingerprinted by size and mtime only, and not counted in the space check. Changes to either count
+  like the database files: `WARN source` while a live Manager answers `/health` on the configured
+  port, `FAIL` otherwise.
+- The review-fix Manager's lock file `<data_dir>\manager.lock` also stays in every `data_dir` it ran
+  on (it is never deleted). It holds no data and the NEW Manager on copy B writes its own, so it is
+  not copied (the `files` check compared it and failed) and is fingerprinted by size and mtime only
+  (on Windows a held lock's byte can't be read). The old Manager never writes it: a change to it
+  during the run is `FAIL source`, with or without a live Manager.
+- An empty `<name>\data.db` (no table) is what the old Manager's read path leaves for a system with
+  no history folder (its Dashboard asks for every card's data). There is nothing to back up: the
+  NEW Manager creates its tables there when that system's data arrives, and `rollback_upgrade.py`
+  leaves it as it is. `backups` accepts it without a `.bak`; `rollback` requires it to stay exactly
+  as the NEW Manager left it, and only the answers about that system's own data (`/api/data/<name>`)
+  may then differ (same HTTP status).
 
 **What it checks** (each line of the summary is PASS / WARN / FAIL):
 
 | Check | Meaning |
 |-------|---------|
-| `source` | the live data_dir is unchanged |
-| `copies` | every database copied and passes `PRAGMA quick_check` |
+| `source` | the live data_dir is unchanged (WARN if only what a live Manager writes changed while it answered `/health`: its database files, and a review-fix Manager's `snapshot-status.json` and `.snapshot-staging\`; a changed `manager.lock` is always FAIL) |
+| `copies` | every database copied and passes `PRAGMA quick_check` (a review-fix Manager's `snapshot-status.json`, `.snapshot-staging\` folder and `manager.lock` are not copied or opened) |
 | `config` | the NEW Manager accepts your config (FAIL if it would refuse it: the upgraded Manager would not start) |
 | `storage` | in copy B after migration: every original table and row is still there (row counts and content hashes); the old wide `folder_usage` table is kept as `folder_usage_legacy` with identical content; `folder_usage_msgs` has one row per original folder row and `folder_usage_items` one per measured folder value |
 | `endpoints` | every read endpoint the Dashboard and tools use, OLD vs NEW, for every system: `/api/devices`, `/api/systems`, `/api/metrics/all`, `/api/usage/all`, `/api/totals`, `/api/user_metrics/*`, `/api/data/*` (every row of every table over the full time range), `/api/usage/*`, `/api/history/*` for every field and the sampled folders (tail query, full range, and the Dashboard's own "All Available" query) |
@@ -512,9 +532,9 @@ and logs never touch the installed copies.
 | `restart` | the NEW Manager restarted on the migrated copy: nothing migrated twice, every answer identical |
 | `ingest` | one new-format metrics + folder message per device: totals continue from the old values, the new point appears after the old history, a re-send is a duplicate. Two old spellings of one name (`Atlantis` / `ATLANTIS`): the message is sent under the most recently seen one, and the other rows must stay exactly as they were (data under a registered spelling goes to that row) |
 | `legacy-resend` | already-stored messages re-sent the way an OLD collector would (no `msg_id`), and again the way a collector upgraded before the Manager would (its own random `msg_id`, which the old Manager dropped), are acknowledged as duplicates, not stored twice. A scan the old Manager kept only in the device card (its history insert failed, e.g. a folder whose name differs only in case from another) is stored now |
-| `backups` | every database the NEW Manager altered has a `*.pre-upgrade-*.bak` copy with exactly the original content (a backup from an earlier attempt that the new Manager reused counts only if it holds the original) |
+| `backups` | every database the NEW Manager altered has a `*.pre-upgrade-*.bak` copy with exactly the original content (a backup from an earlier attempt that the new Manager reused counts only if it holds the original); a database with no table before the upgrade needs none |
 | `files` | non-database files (`usage.jsonl`, ...) are byte-identical after the run |
-| `rollback` | `rollback_upgrade.py --apply` on the migrated copy B (after the new messages above): every database holds its original content again, and the OLD Manager started on it gives the same answers it gave before the upgrade |
+| `rollback` | `rollback_upgrade.py --apply` on the migrated copy B (after the new messages above): every database holds its original content again, and the OLD Manager started on it gives the same answers it gave before the upgrade. A database with no table before the upgrade (no backup) must stay exactly as the NEW Manager left it; the answers about that system's own data may show what was stored since |
 | `dashboard` | (`--with-dashboard`) the NEW Dashboard shows the same systems, metrics, folders and totals as the OLD one, and charts load; a chart longer than `--dashboard-max-points` must cover the whole old time range within one bucket, with every average inside the old values' range |
 
 Systems are taken from the device registry **and** from the `data_dir`: a `data/<name>/data.db`
@@ -566,9 +586,14 @@ no backup has the old layout, the newest is used with a warning), checked
 (`PRAGMA quick_check`; if any fails, nothing is changed), copied next to the database, the current
 database and its `-wal` / `-shm` / `-journal` files are **renamed** to
 `<db>.post-upgrade-<stamp>` (+ `-wal` ...), and the copy becomes `<db>`. The `.bak` files stay.
-Databases without a backup (systems first seen after the upgrade) are left as they are and listed.
+Databases without a backup (systems first seen after the upgrade, or an empty `data.db` with no
+table that the old Manager created for a system without history) are left as they are and listed.
 A database that can't be renamed (still open) is left unchanged and the tool stops with exit 1;
-run it again once the cause is fixed.
+run it again once the cause is fixed. Only the backups are read: a current database is never
+opened, only renamed with its side files, so what a killed Manager (Task Scheduler's End,
+`Stop-Process -Force`) left only in its `-wal` stays readable in the moved-aside files. The
+snapshot status file and staging folder are left as they are. With the review-fix layout,
+`--manager-config` takes the absolute `manager-data` path from the config.
 
 | Option | Meaning |
 |--------|---------|
@@ -584,7 +609,9 @@ again (the launchers `start-manager.bat` / `start-dashboard.bat` live outside th
 start whichever code is checked out). The old Manager only accepts tokens listed in
 `auth_tokens`: restore `manager\config.json` and `dashboard\config.json` from the
 `config.json.bak-<date>` copies the installer made, or add the Dashboard's `manager_token` (and
-any upgraded collector's token) to `auth_tokens`. Messages received after the upgrade are in the
+any upgraded collector's token) to `auth_tokens`. A restored config must name the `data_dir` the
+databases were just restored in (`E:\Users\lab-monitor\manager-data` after docs/UPGRADE.md
+Step 3b, not the folder from before it); the old Manager ignores the `snapshot` section. Messages received after the upgrade are in the
 `*.post-upgrade-*` files and in the collectors' archives.
 
 **Exit codes:** `0` rolled back (or the dry-run plan is ready), `1` a problem (bad backup, a file
