@@ -143,6 +143,33 @@ def read_inventory(csv_path) -> tuple:
     return rows, fieldnames
 
 
+def _host_matches(host: str, wanted: str) -> bool:
+    """
+    True if the inventory host (the ip column) is `wanted`, ignoring case, or
+    a host name whose first label is `wanted` (triton2 -> triton2.example.org).
+    An IP address only matches exactly, so '192' never selects 192.168.1.42.
+    """
+    host, wanted = host.strip().lower(), wanted.strip().lower()
+    if not host or not wanted:
+        return False
+    if host == wanted:
+        return True
+    looks_like_ip = all(c.isdigit() or c in '.:' for c in host)
+    return not looks_like_ip and host.split('.', 1)[0] == wanted
+
+
+def select_rows(rows: list, only: list) -> tuple:
+    """
+    The inventory rows chosen by --only values (all rows when `only` is empty).
+    Returns (selected rows in inventory order, values that matched no row).
+    """
+    if not only:
+        return list(rows), []
+    unmatched = [w for w in only if not any(_host_matches(row_value(r, 'ip'), w) for r in rows)]
+    selected = [r for r in rows if any(_host_matches(row_value(r, 'ip'), w) for w in only)]
+    return selected, unmatched
+
+
 def row_value(row: dict, key: str, default: str = '') -> str:
     """Stripped CSV cell value ('' when the column is absent or empty)."""
     value = row.get(key)

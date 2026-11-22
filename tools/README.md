@@ -174,7 +174,14 @@ python3 update_collectors.py --csv collectors.csv --upgrade-pip
 python3 update_collectors.py --csv /path/to/collectors.csv --upgrade-pip --timeout 60 --parallel 4
 # A host that also runs the Manager/Dashboard from the same environment:
 python3 update_collectors.py --csv collectors.csv --upgrade-pip --requirements requirements.txt
+# Only some systems (repeat --only), e.g. one first during an upgrade:
+python3 update_collectors.py --csv collectors.csv --only triton2 --dry-run
+python3 update_collectors.py --csv collectors.csv --only triton2 --only 192.168.1.43 --upgrade-pip
 ```
+
+`--only HOST` selects the rows whose `ip` column is `HOST` (case ignored), or whose host name starts
+with `HOST` followed by a dot (`triton2` selects `triton2.example.org`, not `triton20.example.org`). An IP
+address only matches in full. If a value matches no row, the tool stops before contacting anyone.
 
 **What it does:**
 - For each collector, SSHes in and runs `git -C {git_path} pull origin main`

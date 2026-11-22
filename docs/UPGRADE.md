@@ -591,6 +591,10 @@ then the rest.
 [tools/README.md](../tools/README.md)):
 
 ```bash
+# One collector first (--only: its ip column, or the first part of its host name)
+python3 tools/update_collectors.py --csv tools/collectors.csv --only <first> --dry-run
+python3 tools/update_collectors.py --csv tools/collectors.csv --only <first> --upgrade-pip
+# A few runs later, the rest (the first one's git pull then finds nothing new)
 python3 tools/update_collectors.py --csv tools/collectors.csv --dry-run
 python3 tools/update_collectors.py --csv tools/collectors.csv --upgrade-pip
 python3 tools/run_collectors.py --csv tools/collectors.csv --mode metrics
