@@ -20,7 +20,21 @@ UNITS_DIR = os.path.join(COLLECTOR_DIR, 'systemd')
 posix_only = pytest.mark.skipif(sys.platform == 'win32', reason='Linux collector')
 linux_only = pytest.mark.skipif(not sys.platform.startswith('linux') or not os.path.isdir('/proc/self'),
                                 reason='needs a Linux /proc')
-needs_bash = pytest.mark.skipif(shutil.which('bash') is None, reason='needs bash')
+
+
+def _bash_works():
+    """A bash that runs (on Windows, `bash` may be the WSL launcher with no distribution)."""
+    if shutil.which('bash') is None:
+        return False
+    try:
+        return subprocess.run(['bash', '-c', 'true'], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+needs_bash = pytest.mark.skipif(not _bash_works(), reason='needs a working bash')
+_IS_ROOT = hasattr(os, 'geteuid') and os.geteuid() == 0
 
 
 def _write(path, size):
@@ -85,6 +99,7 @@ def test_device_type_defaults_to_server_on_linux(collector, host):
     assert collector._identity({'name': 'box', 'device_type': 'NAS'}, log)[2] == 'NAS'
 
 
+@posix_only
 def test_linux_default_data_dir(collector, host, monkeypatch, tmp_path):
     monkeypatch.setattr(collector, 'DEFAULT_LINUX_DATA_DIR', str(tmp_path / 'varlib'))
     assert collector.get_data_dir({'name': 'box'}) == str(tmp_path / 'varlib')
@@ -261,6 +276,8 @@ class _Scandir:
 
 @pytest.fixture
 def mounted_tree(tmp_path, disk_usage, monkeypatch):
+    if sys.platform == 'win32':
+        pytest.skip('Linux mount tables and POSIX paths')
     """
     A real root directory whose (faked) contents include another filesystem
     (different st_dev), a bind mount of the same filesystem, a /proc-like
@@ -483,6 +500,8 @@ GPU_SERVER_PROCS = [
 @pytest.fixture
 def ubuntu_accounts(collector, monkeypatch, tmp_path):
     """/etc/login.defs as on Ubuntu, the collector running as labmon (a system account)."""
+    if sys.platform == 'win32':
+        pytest.skip('POSIX user IDs (os.getuid)')
     login_defs = tmp_path / 'login.defs'
     login_defs.write_text('# comment\nUID_MIN\t\t\t 1000\nUID_MAX\t\t\t60000\nSYS_UID_MIN\t\t  100\n')
     monkeypatch.setattr(collector, 'LOGIN_DEFS', str(login_defs))
@@ -776,7 +795,7 @@ def test_disk_unit_timeout_matches_the_collector_budget(collector, tmp_path, con
 
 
 @needs_bash
-@pytest.mark.skipif(not os.path.isdir('/run/systemd/system') or os.geteuid() == 0
+@pytest.mark.skipif(not os.path.isdir('/run/systemd/system') or _IS_ROOT
                     or os.path.exists('/etc/lab-monitor/collector.json'),
                     reason='needs a systemd host without the collector installed, and a non-root user')
 def test_dry_run_changes_nothing(tmp_path):
@@ -792,8 +811,9 @@ def test_dry_run_changes_nothing(tmp_path):
     assert proc.returncode == 0 and '[dry-run] rm -rf -- /opt/lab-monitor' in proc.stdout
 
 
+@posix_only
 @needs_bash
-@pytest.mark.skipif(os.geteuid() == 0, reason='checks the non-root refusal')
+@pytest.mark.skipif(_IS_ROOT, reason='checks the non-root refusal')
 def test_installer_needs_root_unless_dry_run():
     proc = run_installer('--non-interactive', '--manager-url', 'http://m:5000', '--token', TOKEN)
     assert proc.returncode == 1 and 'sudo' in proc.stderr
@@ -1039,6 +1059,7 @@ def test_collector_reports_network_scan_roots_in_errors_without_touching_them(
     assert not [k for k in data if k.startswith(root + '/home')]
 
 
+@posix_only
 def test_installer_default_scan_paths_on_an_nfs_home_are_refused(disk_usage):
     mounts = [_mount('/dev/sda2', '/', 'ext4'), _mount('nas:/export/home', '/home', 'nfs4'),
               _mount('/dev/sdb1', '/data', 'xfs')]

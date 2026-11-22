@@ -12,7 +12,27 @@ const fs = require('fs');
 const vm = require('vm');
 
 const jsPath = process.argv[2];
-const ctx = vm.createContext({ console, setTimeout, clearTimeout, AbortController });
+
+// Node < 15 (e.g. 14.x on the Windows server) has no global AbortController:
+// a minimal stand-in with what dashboard.js and the fake fetch below use.
+class MiniAbortController {
+    constructor() {
+        const listeners = [];
+        this.signal = {
+            aborted: false,
+            addEventListener(type, fn) { if (type === 'abort') listeners.push(fn); },
+            removeEventListener(type, fn) { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+        };
+        this._listeners = listeners;
+    }
+    abort() {
+        if (this.signal.aborted) return;
+        this.signal.aborted = true;
+        for (const fn of this._listeners.slice()) fn({ type: 'abort' });
+    }
+}
+const AbortControllerImpl = typeof AbortController === 'undefined' ? MiniAbortController : AbortController;
+const ctx = vm.createContext({ console, setTimeout, clearTimeout, AbortController: AbortControllerImpl });
 vm.runInContext(fs.readFileSync(jsPath, 'utf8'), ctx, { filename: jsPath });
 
 const failures = [];

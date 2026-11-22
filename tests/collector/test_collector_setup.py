@@ -121,12 +121,31 @@ def test_collector_requirements_are_pinned():
 # install-collector-synology.sh
 # ---------------------------------------------------------------------------
 
+def _bash_works():
+    """A bash that runs (on Windows, `bash` may be the WSL launcher with no distribution)."""
+    if shutil.which('bash') is None:
+        return False
+    try:
+        return subprocess.run(['bash', '-c', 'true'], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.mark.skipif(not _bash_works(), reason='needs a working bash')
 def test_synology_installer_syntax():
     subprocess.run(['bash', '-n', SYNOLOGY_INSTALLER], check=True)
 
 
+def test_shell_scripts_are_checked_out_with_lf():
+    """A CRLF checkout (git core.autocrlf on Windows) would break bash on the NAS or Linux host."""
+    for name in ('install-collector-synology.sh', 'install-collector-linux.sh'):
+        with open(os.path.join(REPO_DIR, name), 'rb') as f:
+            assert b'\r\n' not in f.read(), name
+
+
 def _installer_config_writer():
-    with open(SYNOLOGY_INSTALLER) as f:
+    with open(SYNOLOGY_INSTALLER, encoding='utf-8') as f:
         text = f.read()
     match = re.search(r"<<'PYCONFIG'\n(.*?)\nPYCONFIG\n", text, re.S)
     assert match, 'config writer heredoc not found'
@@ -152,7 +171,8 @@ def test_synology_installer_writes_valid_private_json(tmp_path):
     assert config['scan_paths'] == ["/volume1/Bob's Data", '/volume2/My Stuff', '/volume1/*']
     # Unset, so the default scales with the number of scan_paths entries
     assert 'total_timeout_seconds' not in config and config['max_batch_messages'] == 100
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    if sys.platform != 'win32':                 # Windows has no POSIX mode bits
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert not (tmp_path / 'pwned').exists()
     assert 'Scan Paths' in proc.stdout
 
@@ -168,7 +188,7 @@ def test_synology_installer_defaults_scan_paths_to_volume_globs(tmp_path):
 
 
 def test_synology_installer_reads_versions_from_collector_requirements():
-    with open(SYNOLOGY_INSTALLER) as f:
+    with open(SYNOLOGY_INSTALLER, encoding='utf-8') as f:
         text = f.read()
     assert 'collector/requirements.txt' in text
     assert not re.search(r"(requests|psutil)==\d", text)       # no hardcoded pins
@@ -179,12 +199,12 @@ def test_installers_do_not_suggest_https_on_the_managers_plain_http_port():
     # The Manager serves plain http on :5000; an https:// example there gives
     # an SSLError on every POST.
     for name in ('install-collector-synology.sh', 'install-collector-windows.ps1'):
-        with open(os.path.join(REPO_DIR, name)) as f:
+        with open(os.path.join(REPO_DIR, name), encoding='utf-8') as f:
             assert 'https://atlantis.med.harvard.edu:5000' not in f.read(), name
 
 
 def test_synology_installer_asks_before_tightening_an_existing_config():
-    with open(SYNOLOGY_INSTALLER) as f:
+    with open(SYNOLOGY_INSTALLER, encoding='utf-8') as f:
         text = f.read()
     rerun = text[text.index('Config file already exists'):text.index('Step 7')]
     assert 'Restrict config.json to 600 now? [y/N]' in rerun

@@ -24,8 +24,10 @@ def fake_proc(collector, monkeypatch):
     """
     Serve fake /proc files to collector.py only (shadows builtins.open in its
     module globals). Map a path to a string, a list of strings (one per open),
-    or an exception instance.
+    or an exception instance. The collector sees a Linux host, so the
+    fallbacks read /proc instead of taking their Windows branch.
     """
+    monkeypatch.setattr(sys, 'platform', 'linux')
     files = {}
     real_open = builtins.open
 
@@ -359,7 +361,8 @@ def test_cpu_psutil_failure_is_null(collector, monkeypatch):
 
 
 def test_cpu_no_longer_uses_loadavg(collector, fake_proc, no_psutil, monkeypatch):
-    monkeypatch.setattr(os, 'getloadavg', lambda: pytest.fail('loadavg must not be used'))
+    # raising=False: Windows has no os.getloadavg
+    monkeypatch.setattr(os, 'getloadavg', lambda: pytest.fail('loadavg must not be used'), raising=False)
     fake_proc['/proc/stat'] = [_stat(0, 100), _stat(50, 150)]
     monkeypatch.setattr(collector.time, 'sleep', lambda s: None)
     assert collector.get_cpu_percent() == 50.0

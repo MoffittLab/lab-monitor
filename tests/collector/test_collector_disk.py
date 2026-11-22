@@ -126,7 +126,11 @@ def test_windows_junctions_are_not_followed(tmp_path, disk_usage, monkeypatch):
 
 def test_deep_tree_does_not_hit_recursion_limit(tmp_path, disk_usage):
     depth = sys.getrecursionlimit() + 100
-    created = [str(tmp_path / 'deep')]
+    base = str(tmp_path)
+    if sys.platform == 'win32':
+        # A path of this depth is far past MAX_PATH (260): use an extended-length path
+        base = '\\\\?\\' + os.path.abspath(base)
+    created = [os.path.join(base, 'deep')]
     os.mkdir(created[0])
     try:
         for _ in range(depth):
@@ -148,6 +152,8 @@ def test_missing_or_unreadable_root_raises_instead_of_returning_zero(tmp_path, d
         disk_usage.measure_folder_recursive(str(tmp_path / 'nope'))
     if hasattr(os, 'geteuid') and os.geteuid() == 0:
         pytest.skip('root can read anything')
+    if sys.platform == 'win32':
+        pytest.skip('needs POSIX permissions (chmod 0 only sets read-only on Windows)')
     locked = tmp_path / 'locked'
     locked.mkdir()
     os.chmod(locked, 0)
