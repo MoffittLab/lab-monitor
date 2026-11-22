@@ -28,3 +28,5 @@ requests==2.32.3
 
 # --- Remote management over SSH (tools/*.py) ---
 paramiko==3.5.0
+# tools/inventory_crypt.py (encrypted collectors.csv) uses 'cryptography',
+# which paramiko already installs.

@@ -131,7 +131,24 @@ def read_inventory(csv_path) -> tuple:
     Header names are stripped of whitespace and a UTF-8 BOM (Excel) is
     tolerated. Columns: ip, username, password, git_path, python_path, plus
     the optional key_filename and port.
+
+    A file encrypted with inventory_crypt.py (recognized by its first bytes,
+    whatever its name) is decrypted in memory after asking for the passphrase
+    at a hidden prompt; a wrong passphrase exits with code 1.
     """
+    with open(csv_path, 'rb') as f:
+        head = f.read(16)
+    import inventory_crypt
+    if inventory_crypt.is_encrypted(head):
+        try:
+            rows, fieldnames, _ = inventory_crypt.load(csv_path)
+        except inventory_crypt.InventoryError as e:
+            print(f'ERROR: {csv_path}: {e}')
+            raise SystemExit(1)
+        except (KeyboardInterrupt, EOFError):
+            print('\nCancelled.')
+            raise SystemExit(1)
+        return rows, fieldnames
     with open(csv_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         fieldnames = [(n or '').strip() for n in (reader.fieldnames or [])]

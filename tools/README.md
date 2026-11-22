@@ -45,6 +45,48 @@ them keep working unchanged. A UTF-8 BOM (Excel) is fine.
 
 **Security:** Keep `collectors.csv` out of git — it's listed in `.gitignore`.
 
+### Keeping `collectors.csv` encrypted (`inventory_crypt.py`)
+
+The CSV holds SSH logins and passwords, so keep it encrypted. Every SSH tool accepts the
+encrypted file in place of the plain one: `--csv collectors.csv.enc` asks for the passphrase at a
+hidden prompt and decrypts it in memory only. The passphrase is only ever read from that prompt
+(never from the command line, a file or an environment variable), so the tools can't run unattended
+from an encrypted file. A forgotten passphrase can't be recovered: keep it in a password manager.
+
+```powershell
+python inventory_crypt.py encrypt collectors.csv             # one time: writes collectors.csv.enc
+python inventory_crypt.py show collectors.csv.enc            # the table, passwords shown as ****
+python inventory_crypt.py edit collectors.csv.enc            # edit in Notepad (Windows only)
+python inventory_crypt.py edit collectors.csv.enc --editor code
+python inventory_crypt.py set-password collectors.csv.enc --only seahorse1   # hidden prompt
+python inventory_crypt.py passphrase collectors.csv.enc      # change the passphrase
+python inventory_crypt.py decrypt collectors.csv.enc -o plain.csv            # escape hatch, asks first
+python update_collectors.py --csv collectors.csv.enc --dry-run
+```
+
+- **`encrypt`** checks the CSV (an `ip` and `username` column, every host once, no empty `ip` or
+  `username`), asks for a new passphrase twice (at least 10 characters) and reads the result back.
+  It keeps the plain file: delete it yourself, and if it lived in Dropbox or another synced
+  folder, delete its earlier versions there too and change the passwords that were in it.
+- **`edit`** decrypts to a temporary copy in `%LOCALAPPDATA%\lab-monitor\inventory-edit\` (private
+  to you, outside any synced folder) and opens it in the editor. Save, close the editor and press
+  Enter. It checks the file (and offers to reopen it if something is wrong), lists the changes by
+  host without showing any password, and saves only after you confirm. The temporary copy is
+  overwritten and deleted however the edit ends; if a crash leaves one behind, the next `edit` finds
+  it and offers to delete it. Don't use Excel: it can change CSV files when saving.
+- **`set-password`** changes passwords at a hidden prompt, so they never appear on screen or in a
+  temporary file. An empty password leaves that host to key authentication.
+- Every save keeps the previous encrypted file as `collectors.csv.enc.bak` and replaces the file in
+  one step. After `passphrase`, the `.bak` still opens with the **old** passphrase: delete it once
+  the new one works.
+- Deleting the temporary copy is best effort: an SSD may keep the old blocks. That is why it is
+  written only to your own local profile and only for the length of an edit.
+- Encrypted files are recognized by their first bytes, whatever their name. `*.csv.enc*` is in
+  `.gitignore`. Uses the `cryptography` package (installed with paramiko): scrypt key derivation
+  and AES-256-GCM, which also detects a damaged or altered file.
+- SSH keys are still better than passwords: with a key in the `key_filename` column (or in
+  `ssh-agent`) the `password` column can stay empty.
+
 ---
 
 ## SSH host keys and authentication
