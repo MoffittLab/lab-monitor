@@ -123,8 +123,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import rollups as rollup_engine
 from storage_util import (
     UPGRADE_RETRY_SECONDS, LockedConnection, MigrationBlockedError, backup_database,
-    canonical_timestamp, format_timestamp, normalize_device_name, parse_timestamp, row_keys_digest,
-    table_fingerprint,
+    canonical_timestamp, current_group, format_timestamp, group_member, normalize_device_name,
+    parse_timestamp, row_keys_digest, table_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -643,8 +643,16 @@ class TypedDataStore:
         """
         Cached connection for a system, keyed by the normalized name.
         With create=False (all read paths) returns None instead of creating
-        the directory or database for an unknown system.
+        the directory or database for an unknown system.  Inside a group
+        commit (storage_util.CommitGroup) the group's connection to this
+        system is returned without taking the cache lock: the thread holds
+        that connection's lock, and delete_system() / close() take the cache
+        lock before it.
         """
+        if current_group() is not None:
+            member = group_member(self._db_path(system_name))
+            if member is not None:
+                return member
         key = normalize_device_name(system_name)
         with self._cache_lock:
             db = self._dbs.get(key)
@@ -677,6 +685,11 @@ class TypedDataStore:
             self._init_rollups(db)
             self._dbs[key] = db
             return db
+
+    def cached_connection(self, system_name: str) -> Optional[LockedConnection]:
+        """The open connection of a system's database, or None if it isn't open (yet)."""
+        with self._cache_lock:
+            return self._dbs.get(normalize_device_name(system_name))
 
     def prepare_existing(self) -> int:
         """
@@ -837,6 +850,7 @@ class TypedDataStore:
         with db.lock:
             if not db.folder_migrated and \
                     time.monotonic() - db.folder_attempted >= UPGRADE_RETRY_SECONDS:
+                db.group_barrier('the folder_usage migration')
                 self._try_folder_migration(db)
             if not db.folder_migrated:
                 raise MigrationBlockedError(
@@ -885,6 +899,7 @@ class TypedDataStore:
         with db.lock:
             if not db.breakdown_migrated and \
                     time.monotonic() - db.breakdown_attempted >= UPGRADE_RETRY_SECONDS:
+                db.group_barrier('the storage_breakdown migration')
                 self._try_breakdown_migration(db)
             if not db.breakdown_migrated:
                 raise MigrationBlockedError(
@@ -979,6 +994,7 @@ class TypedDataStore:
         """
         if db.rollup_backup_done:
             return True
+        db.group_barrier('deciding the rollup tables\' backup')
         with db.lock:
             conn = db.conn
             tables = self._list_tables(conn)
@@ -1014,6 +1030,7 @@ class TypedDataStore:
     def _ensure_rollups(self, db: LockedConnection):
         if self.rollups is not None and not db.rollups_ready and not db.upgrade_blocked and \
                 time.monotonic() - db.rollups_attempted >= rollup_engine.INIT_RETRY_SECONDS:
+            db.group_barrier('the rollup setup')
             self._init_rollups(db)
 
     def _rollup_db(self, system_name: str) -> Optional[LockedConnection]:
@@ -1142,6 +1159,7 @@ class TypedDataStore:
         with db.lock:
             if db.upgrade_blocked and \
                     time.monotonic() - db.upgrade_attempted >= UPGRADE_RETRY_SECONDS:
+                db.group_barrier('the held-back migration')
                 self._upgrade_db(db)
             if db.upgrade_blocked:
                 raise MigrationBlockedError(

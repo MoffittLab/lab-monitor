@@ -369,6 +369,11 @@ class MetricsDB:
         """Context manager: one BEGIN IMMEDIATE ... COMMIT on the central DB."""
         return self._write()
 
+    @property
+    def connection(self) -> LockedConnection:
+        """The central DB's LockedConnection (a member of ingest's group commits)."""
+        return self._conn
+
     def _write(self):
         """A write transaction; MigrationBlockedError while a migration is held back."""
         self._check_writable()
@@ -435,6 +440,7 @@ class MetricsDB:
         with self._conn.lock:
             if self.upgrade_blocked and \
                     time.monotonic() - self._upgrade_attempted >= UPGRADE_RETRY_SECONDS:
+                self._conn.group_barrier('the held-back metrics.db migration')
                 if self._upgrade():
                     self._load_name_index()
             if self.upgrade_blocked:

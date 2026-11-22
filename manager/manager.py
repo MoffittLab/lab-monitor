@@ -36,8 +36,8 @@ from data_store import (
     TypedDataStore, RejectedMessage, DEFAULT_ROW_LIMIT, FOLDER_USAGE, table_for_data_type,
 )
 from storage_util import (
-    InstanceLock, InstanceLockError, canonical_timestamp, format_timestamp, is_transient_db_error,
-    is_valid_device_name, normalize_device_name, utc_now,
+    CommitGroup, GroupBarrier, InstanceLock, InstanceLockError, canonical_timestamp, format_timestamp,
+    is_transient_db_error, is_valid_device_name, normalize_device_name, utc_now,
 )
 
 
@@ -61,6 +61,12 @@ _PLACEHOLDER_MARKERS = (
 _MSG_ID_RE = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
 # /api/user_metrics/usage result cache (manager config "usage_cache_seconds")
 DEFAULT_USAGE_CACHE_SECONDS = 300
+# Group commit on ingest (manager config "ingest_commit_messages"; _store_messages):
+# up to this many messages of one request share one transaction per database,
+# and a group is committed once it has worked INGEST_COMMIT_SECONDS, so the
+# locks it holds (other requests and reads wait for them) stay short.
+DEFAULT_INGEST_COMMIT_MESSAGES = 100
+INGEST_COMMIT_SECONDS = 0.5
 USAGE_WINDOWS = {'24h': 86400, '7d': 7 * 86400, '30d': 30 * 86400}
 # /api/history ?resolution= and ?entity= (one user of user_metrics)
 HISTORY_RESOLUTIONS = ('auto', 'raw', 'hour', 'day')
@@ -205,6 +211,7 @@ _auth = None
 _cors_enabled = False
 _rollup_backfill = None   # rollups.BackfillThread, started by main()
 _usage_cache_seconds = DEFAULT_USAGE_CACHE_SECONDS
+_ingest_commit_messages = DEFAULT_INGEST_COMMIT_MESSAGES
 # (window, device, top) -> (time.monotonic() computed, answer)
 _usage_cache = {}
 _usage_cache_lock = threading.Lock()
@@ -405,6 +412,7 @@ def validate_config(config: dict, logger: logging.Logger) -> _AuthConfig:
     # default, never a reason to refuse to start
     rollups.settings_from_config(config, logger)
     usage_cache_seconds(config, logger)
+    ingest_commit_messages(config, logger)
     return auth
 
 
@@ -426,10 +434,28 @@ def usage_cache_seconds(config: dict, logger: logging.Logger = None) -> float:
     return value
 
 
+def ingest_commit_messages(config: dict, logger: logging.Logger = None) -> int:
+    """
+    Config "ingest_commit_messages" (default 100): how many messages of one
+    request are stored in one transaction per database (_store_messages);
+    1 = one transaction per message.  A bad value is logged (when logger is
+    given) and replaced by the default.
+    """
+    value = config.get('ingest_commit_messages')
+    if value is None:
+        return DEFAULT_INGEST_COMMIT_MESSAGES
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        if logger:
+            logger.warning(f"Config 'ingest_commit_messages' = {value!r} is invalid (a whole number "
+                           f">= 1); using the default {DEFAULT_INGEST_COMMIT_MESSAGES}")
+        return DEFAULT_INGEST_COMMIT_MESSAGES
+    return value
+
+
 def init_app(config: dict, logger: logging.Logger = None):
     """Initialize app with config. Raises ConfigError for unsafe config."""
     global _config, _logger, _metrics_db, _data_store, _user_metrics, _auth, _cors_enabled
-    global _usage_cache_seconds
+    global _usage_cache_seconds, _ingest_commit_messages
     logger = logger or logging.getLogger('manager')
 
     auth = validate_config(config, logger)
@@ -440,6 +466,7 @@ def init_app(config: dict, logger: logging.Logger = None):
     _auth = auth
     _grandfather_warned.clear()
     _usage_cache_seconds = usage_cache_seconds(config)
+    _ingest_commit_messages = ingest_commit_messages(config)
     with _usage_cache_lock:
         _usage_cache.clear()
 
@@ -658,7 +685,9 @@ def ingest_queue():
     queue only when stored == sent keep draining.  After the first 'error'
     (a storage failure) the remaining messages are not attempted and are
     answered 'error' as well, so a locked database costs one busy timeout
-    per request instead of one per message.
+    per request instead of one per message.  The answer is sent only after
+    everything it reports stored, duplicate or rejected is committed
+    (group commit, _store_messages).
     """
     data = request.get_json(silent=True)   # 413 propagates to the handler
     if not isinstance(data, dict):
@@ -709,22 +738,7 @@ def ingest_queue():
             f"(over max_messages_per_request {max_messages}); accepted from an old collector"
         )
 
-    results = []
-    for i, msg in enumerate(messages):
-        result = _process_message(name, system_id, msg)
-        results.append(result)
-        if result["status"] == "error" and i + 1 < len(messages):
-            # Storage failure (database locked, I/O, held-back migration):
-            # the rest would fail the same way, each after its own busy
-            # timeout, tying up this thread for minutes.  They are answered
-            # 'error' without being attempted; the collector keeps them.
-            rest = messages[i + 1:]
-            _logger.warning(
-                f"Queue {queue_id} from {name}: storage failure; the remaining {len(rest)} "
-                f"message(s) were not attempted (kept by the collector for retry)"
-            )
-            results.extend(_not_attempted(name, m) for m in rest)
-            break
+    results = _store_messages(name, system_id, messages, queue_id)
     counts = {"stored": 0, "duplicate": 0, "rejected": 0, "error": 0}
     for r in results:
         counts[r["status"]] += 1
@@ -745,6 +759,84 @@ def ingest_queue():
         "results":   results,
         "timestamp": utc_now(),
     }), 200
+
+
+def _store_messages(name: str, system_id, messages: list, queue_id: str) -> list:
+    """
+    Store a request's messages in order; returns one result per message.
+
+    Group commit: consecutive messages share one transaction per database
+    (storage_util.CommitGroup: the system's data.db and the central
+    metrics.db, each message in its own savepoint, so a message is still
+    stored or rolled back on its own), committed after
+    ingest_commit_messages messages or INGEST_COMMIT_SECONDS, and at the
+    end.  One transaction per message costs two fsyncs per message (its row,
+    its central side effects); a 100-message batch now costs a few.  The
+    results of a group count only once its COMMIT returned: if it fails,
+    every message of the group is answered 'error' (kept by the collector
+    and retried; re-applying central side effects is idempotent), whatever
+    it would have been.  metrics.db commits first, as in the per-message
+    path, so a row is never committed without its side effects.  Locks are
+    taken data.db first, as in the per-message path (side effects inside
+    the data.db transaction), even when a group's first message only writes
+    metrics.db (a rejected message's dead letter): a group holding
+    metrics.db while it waits for data.db would deadlock with another
+    request for the same system holding data.db (CommitGroup lock_order).
+    A message that needs a one-time step first (the system's database is
+    not open yet, a migration retry, the rollup setup) is stored on its own,
+    outside any group.  After the first 'error' (a storage failure) the rest would
+    fail the same way, each after its own busy timeout: they are answered
+    'error' without being attempted, and the collector keeps them.
+    """
+    results = []
+    i, n = 0, len(messages)
+    failed = False
+    while i < n and not failed:
+        db = _data_store.cached_connection(name) \
+            if _ingest_commit_messages > 1 and n - i > 1 else None
+        alone = db is None
+        if not alone:
+            start = i
+            deadline = time.monotonic() + INGEST_COMMIT_SECONDS
+            try:
+                central = _metrics_db.connection
+                with CommitGroup([central, db], lock_order=[db, central]) as group:
+                    while i < n and i - start < _ingest_commit_messages and \
+                            (i == start or time.monotonic() < deadline):
+                        try:
+                            result = _process_message(name, system_id, messages[i])
+                        except GroupBarrier:
+                            alone = True        # stored on its own once the group is committed
+                            break
+                        results.append(result)
+                        i += 1
+                        if result["status"] == "error":
+                            failed = True
+                            break
+                    group.commit()
+            except Exception as e:
+                level = logging.WARNING if is_transient_db_error(e) else logging.ERROR
+                _logger.log(level,
+                            f"Queue {queue_id} from {name}: committing {i - start} message(s) failed "
+                            f"({type(e).__name__}: {e}); they are answered 'error' (kept by the "
+                            f"collector for retry)", exc_info=level == logging.ERROR)
+                for r in results[start:]:
+                    r["status"] = "error"
+                    r["error"] = "storage failure; retry later"
+                failed = True
+                break
+        if alone and not failed and i < n:
+            results.append(_process_message(name, system_id, messages[i]))
+            i += 1
+            failed = results[-1]["status"] == "error"
+    if i < n:
+        rest = messages[i:]
+        _logger.warning(
+            f"Queue {queue_id} from {name}: storage failure; the remaining {len(rest)} "
+            f"message(s) were not attempted (kept by the collector for retry)"
+        )
+        results.extend(_not_attempted(name, m) for m in rest)
+    return results
 
 
 def _header_msg_id(msg):
@@ -1141,6 +1233,8 @@ def _process_message(batch_name: str, system_id, msg) -> dict:
             _logger.debug(f"Stored {table} message {msg_id} from {dev_name}")
         return {"msg_id": msg_id, "status": status}
 
+    except GroupBarrier:
+        raise           # nothing written: stored again outside the group commit (_store_messages)
     except RejectedMessage as e:
         return _reject(batch_name, msg_id, data_type, msg, str(e))
     except Exception as e:
@@ -1164,6 +1258,8 @@ def _reject(batch_name, msg_id, data_type, msg, reason, detail=None) -> dict:
         _metrics_db.add_dead_letter(
             batch_name, msg_id if isinstance(msg_id, str) else None, data_type,
             f"{reason}: {detail}" if detail else reason, msg)
+    except GroupBarrier:
+        raise
     except Exception as e:
         _logger.error(f"Could not record dead letter for {msg_id} from {batch_name}: {e}")
         return {"msg_id": msg_id, "status": "error", "error": "storage failure; retry later"}

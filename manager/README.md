@@ -30,6 +30,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
   "backup_before_migration": true,
   "rollups": {"enabled": true, "backfill_batch_ids": 2000, "backfill_max_duty": 0.5, "max_series_per_table": 5000},
   "usage_cache_seconds": 300,
+  "ingest_commit_messages": 100,
   "threads": 8,
 
   "log_file": "E:\\Users\\lab-monitor\\logs\\manager.log",
@@ -52,6 +53,7 @@ See [INSTALLATION.md](../INSTALLATION.md) for setup instructions.
 | `backup_before_migration` | `true` | Before the Manager changes a database written by an older version for the first time, it copies it to `<db>.pre-upgrade-<YYYYmmddTHHMMSSZ>.bak` next to it. If the copy fails, that database is not migrated. `false` migrates without a copy. See [Upgrading](#upgrading-from-the-previous-manager). |
 | `rollups` | see below | Hourly and daily aggregates of the history (see [Rollups](#rollups)). Every key optional: `enabled` (`true`; `false` = no rollups written and no backfill; rows stored meanwhile are rolled up as a gap when re-enabled), `backfill_batch_ids` (2000; row ids per backfill transaction, 1–1,000,000), `backfill_max_duty` (0.5; fraction of the time the backfill may work, above 0 and at most 1), `max_series_per_table` (5000; 1–1,000,000). A bad value or an unknown key logs a WARNING at start and with `--check-config`, and the default is used; it never stops the Manager. |
 | `usage_cache_seconds` | 300 | How long an `/api/user_metrics/usage` answer is reused (per window, device and top); `0` = no cache. A bad value logs a WARNING and the default is used. |
+| `ingest_commit_messages` | 100 | Group commit: up to this many messages of one `POST /api/data/queue` are stored in one transaction per database (each message in its own savepoint), and a group is also committed after 0.5 s of work. `1` = one transaction per message, as before this release. No ACK is sent before the commit (see [Ingest](#ingest)). A whole number ≥ 1; a bad value logs a WARNING and the default is used. |
 | `threads` | 8 | waitress worker threads. |
 | `log_file` | none | Rotating log file (10 MiB × 5; `log_max_bytes`, `log_backup_count`). Every module logs here. An existing file larger than `log_max_bytes` (the previous Manager's unrotated log) is renamed to `<log_file>.pre-rotation-<stamp>` at startup, outside the rotation set, so rotation never deletes it. `--check-config` never opens the log file. |
 | `data_dir` | `data` | Where `metrics.db` and the per-system databases live. A UNC path (`\\server\share\...`) works, but see [Running from Task Scheduler](#running-from-task-scheduler). Mapped drive letters don't work for scheduled tasks. |
@@ -246,7 +248,9 @@ the new fields; a message from an older collector is stored exactly as before.
 
 The top-level `stored` is `stored + duplicate + rejected`, the number of messages durably handled. Old collectors delete their queue only when `stored` equals the number sent, so they keep draining. New collectors remove exactly the `msg_id`s with a final status.
 
-Each message is stored in its own transaction. One bad message never fails the batch. After the first `error` (a storage failure) the rest of the request is not attempted and is answered `error` too, so the collector keeps it and a locked database costs one wait per request, not one per message.
+Each message is stored or rolled back on its own: one bad message never fails the batch. After the first `error` (a storage failure) the rest of the request is not attempted and is answered `error` too, so the collector keeps it and a locked database costs one wait per request, not one per message.
+
+**Group commit and durability.** Consecutive messages of one request share one transaction per database (the system's `data.db` and `metrics.db`), up to `ingest_commit_messages` (100) messages or 0.5 s of work per transaction. Each message runs in its own savepoint inside it, so a message that fails is rolled back alone, exactly as its own transaction would have been. Every database runs in WAL mode with `synchronous=FULL` (set explicitly, so it doesn't depend on how SQLite was built): each COMMIT syncs the WAL to disk. The answer is sent only after the transactions holding everything it reports as `stored`, `duplicate` or `rejected` are committed. If a COMMIT fails, every message of that transaction is answered `error`, whatever it would have been, and the collector sends it again. `metrics.db` commits first, so a stored row always has its central updates. A retry after a `data.db` commit failure re-applies them, and that is safe: snapshots keep the newer reading, network totals skip a reading that is not newer, and per-user history is deduplicated by `msg_id`. A Manager that dies mid-request loses only messages that were never acknowledged. One transaction per message cost two fsyncs per message (its row and its central updates), about 200 for a 100-message batch, and on an SSD with occasional slow flushes such a batch could take seconds. A group costs two (plus a WAL checkpoint now and then). A message that needs a one-time step first (the system's database opened for the first time, a migration retry, the rollup setup or its backup) is stored on its own, outside any group, so a backup never contains uncommitted rows. While a group is open, its thread holds the locks of both databases. It always takes them in the same order as the per-message path, `data.db` first, also when the group's first message is rejected and writes only a dead letter to `metrics.db`, so two requests, also for the same system (a collector's retry while its first request still runs), never wait for each other. Other requests and reads of those databases wait for each group ahead of them: its work plus its commit, at most 100 messages or 0.5 s of work.
 
 ### Device Registry
 
@@ -570,7 +574,8 @@ deployed ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
 - **Order:** the installer upgrades the Manager and the Dashboard together; the new Dashboard works with both
   Manager versions. Then the collectors (one at a time per platform, see
   [docs/FIELD_CHECKS.md](../docs/FIELD_CHECKS.md)). Never point new collectors at an OLD (`f086e7e`) Manager.
-- **Config:** no new key is required. `rollups` and `usage_cache_seconds` are optional (defaults above).
+- **Config:** no new key is required. `rollups`, `usage_cache_seconds` and `ingest_commit_messages` are
+  optional (defaults above).
 - **What the first start changes, after the usual pre-upgrade backup.** Nothing stored is rewritten or deleted:
   - `metrics.db` gets the three snapshot tables and the ten per-user usage columns in `device_user_snapshot`
     and `user_metrics_history` (NULL in existing rows), plus `usage_timestamp` in `device_user_snapshot` (when
@@ -589,8 +594,13 @@ deployed ([docs/UPGRADE.md](../docs/UPGRADE.md#the-usage-metrics-release)).
   of up to about 30 days stay on raw rows. The intended differences are listed in `tools/verify_upgrade.py`'s
   `INTENDED` (N18: per-user and storage-health history now report a unit where the old Manager had none;
   N19: the new Dashboard sections are not compared; N20: the new Dashboard hides users who logged off;
-  N21: data a usage-metrics collector sent to the old Manager, accepted only where it equals what is stored),
-  and N17 covers "All Available" charts answered from rollups (about 83 days of data or more).
+  N21: data a usage-metrics collector sent to the old Manager, accepted only where it equals what is stored;
+  N22: after going back to CURRENT, the storage-breakdown runs this Manager moved out of a wide table are not
+  shown, accepted only once every one of those rows is confirmed in `storage_breakdown_legacy`),
+  and N17 covers "All Available" charts answered from rollups (about 83 days of data or more). Each entry
+  applies only to the old versions listed for it in `INTENDED_SIDES`: with CURRENT as the old side, the
+  entries that describe changes CURRENT already made itself (N2, N5, N7, N8, N11, N13) are not applied, and
+  a run that would need one of them FAILs.
 - **Going back to CURRENT (`fb6498c`)** needs no rollback: stop the Manager, check out CURRENT and start it on
   the same `data_dir`. CURRENT reserves the `_` and `storage_breakdown_` table prefixes, so it ignores the
   rollup and narrow tables, takes no backup and ingests normally. While it runs it does not show the

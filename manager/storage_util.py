@@ -17,6 +17,12 @@ Storage helpers shared by the Manager's two databases.
     each other's transactions.  Once a write found the database locked by
     another process, the next writes give up quickly for a while.
 
+  - CommitGroup.  Group commit for ingest: the messages of one request are
+    stored in one transaction per database (each message in its own
+    savepoint) instead of one per message, so a 100-message batch costs a
+    few fsyncs instead of about 200.  Nothing is reported stored before the
+    group's COMMIT returned.
+
   - Pre-migration backups.  Before the Manager alters a database written by
     an older version for the first time, backup_database() copies it with
     SQLite's online backup API to "<db>.pre-upgrade-<UTC stamp>.bak" next to
@@ -41,6 +47,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 try:
     import fcntl          # POSIX
@@ -204,6 +211,173 @@ def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
     return 'locked' in msg or 'busy' in msg
 
 
+# --------------------------------------------------------------------------- #
+# Group commit                                                                #
+# --------------------------------------------------------------------------- #
+
+# The open CommitGroup of each thread (_local.group) and how many ungrouped
+# outermost transactions that thread has open (_local.plain)
+_local = threading.local()
+_GROUP_SAVEPOINT = 'lc_group_block'
+
+
+class GroupBarrier(Exception):
+    """
+    Raised, before anything is written, by a step that must not run inside
+    an open CommitGroup: a one-time migration, backup or setup of a member
+    database (a backup would copy the group's uncommitted rows, and the
+    step's own commits would wait for the group's), or a transaction of a
+    member opened inside an ungrouped transaction of another database (it
+    would commit after that one, the reverse of the order the code relies
+    on).  The caller commits the group and runs the step again outside it.
+    """
+
+
+class GroupCommitError(OSError):
+    """
+    A CommitGroup can't commit what its blocks wrote: SQLite rolled its
+    transaction back after an error (disk full, I/O error, ...), or a COMMIT
+    failed.  Nothing the group held is stored.  Subclasses OSError so ingest
+    answers 'error' (the collector keeps the messages and retries).
+    """
+
+
+def current_group() -> Optional['CommitGroup']:
+    """This thread's open CommitGroup, or None."""
+    return getattr(_local, 'group', None)
+
+
+def group_member(path: str) -> Optional['LockedConnection']:
+    """The member of this thread's open CommitGroup that has `path` open, or None."""
+    group = current_group()
+    if group is not None:
+        for db in group.members:
+            if db.path == path:
+                return db
+    return None
+
+
+class CommitGroup:
+    """
+    Group commit for one thread.  While the group is open, every outermost
+    transaction() this thread runs on a member connection is a SAVEPOINT
+    inside one BEGIN IMMEDIATE transaction per member (begun at the member's
+    first block, with the same busy handling as any BEGIN), and commit()
+    COMMITs the members in the order given.  A block that raises rolls back
+    its own savepoint only, exactly as its own transaction would have been
+    rolled back; the blocks before it stay in the group.  Nothing written by
+    a block is durable before commit() returns, so a caller reports success
+    for the group's blocks only after that (and failure for all of them if
+    commit() raises).  A begun member's lock stays held by this thread until
+    the group ends: other threads wait for it as for any transaction, so
+    keep groups short.
+
+        with CommitGroup([central, per_system], lock_order=[per_system, central]) as group:
+            ... transaction() blocks ...
+            group.commit()        # leaving without commit() rolls back
+
+    commit() order: the earlier member first.  If a later member's COMMIT
+    fails, the earlier ones stay committed (as with nested transactions on
+    two databases); callers order the members so that a retry repairs that.
+
+    lock_order (default: the commit order) is the order the members' locks
+    are taken in.  Code that holds two of these locks at once must take them
+    in one order everywhere, or two threads can each hold one and wait for
+    the other forever (ingest: a system's data.db, then metrics.db, as a
+    message's central side effects run inside its data.db transaction).  A
+    group keeps every lock it took until it ends, so it can't take them in
+    the order its blocks happen to need them: the first block of a member
+    first begins every member before it in lock_order (taking their locks),
+    and only then takes its own lock.  For example, ingest's first message
+    may be rejected (a dead letter, metrics.db only) while another request
+    for the same system holds that data.db and waits for metrics.db.
+    """
+
+    def __init__(self, members, lock_order=None):
+        self.members = [db for db in members if db is not None]
+        self.lock_order = self.members if lock_order is None else \
+            [db for db in lock_order if db is not None]
+        if sorted(map(id, self.lock_order)) != sorted(map(id, self.members)):
+            raise ValueError('lock_order must list the same connections as members')
+        self.broken: Optional[str] = None   # why the group can no longer commit
+        self._begun: list = []               # members with an open group transaction
+
+    def __enter__(self) -> 'CommitGroup':
+        if current_group() is not None:
+            raise RuntimeError('a CommitGroup is already open in this thread')
+        _local.group = self
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def _begin(self, db: 'LockedConnection'):
+        if self.broken:
+            raise GroupCommitError(self.broken)
+        if db in self._begun:
+            if not db.conn.in_transaction:
+                self.broken = f"{db.path}: the group's transaction was rolled back by SQLite"
+                raise GroupCommitError(self.broken)
+            return
+        db._lock_statement('BEGIN IMMEDIATE', short_wait=time.monotonic() < db.locked_until)
+        db.lock.acquire()               # held until the group ends
+        self._begun.append(db)
+
+    def _begin_earlier(self, db: 'LockedConnection'):
+        """
+        Called by transaction() before it takes db's lock: begin the members
+        that come before db in lock_order and are not begun yet, in that
+        order.  Once db is begun, they are too, so this thread never holds a
+        member's lock while it waits for an earlier member's.  (Callers must
+        not open a member's first block while they hold a later member's
+        lock outside any block, with `with db.lock:`; ingest never does.)
+        """
+        if db in self._begun:
+            return
+        for m in self.lock_order:
+            if m is db:
+                return
+            if m not in self._begun:
+                with m.lock:
+                    self._begin(m)
+
+    def _undo(self, db: 'LockedConnection'):
+        """Roll back the block that raised (its savepoint), or mark the group broken."""
+        try:
+            db.conn.execute(f'ROLLBACK TO {_GROUP_SAVEPOINT}')
+            db.conn.execute(f'RELEASE {_GROUP_SAVEPOINT}')
+        except sqlite3.Error as e:
+            self.broken = f"{db.path}: could not roll back one block of the group ({e})"
+        if not db.conn.in_transaction:
+            self.broken = f"{db.path}: the group's transaction was rolled back by SQLite"
+
+    def commit(self):
+        """COMMIT every begun member in order; raises (rolling back what is left) if any can't."""
+        try:
+            if self.broken:
+                raise GroupCommitError(self.broken)
+            for db in self._begun:
+                if not db.conn.in_transaction:
+                    raise GroupCommitError(f"{db.path}: the group's transaction was rolled back by SQLite")
+            for db in [m for m in self.members if m in self._begun]:
+                db._lock_statement('COMMIT')
+                db.locked_until = 0.0
+                self._begun.remove(db)
+                db.lock.release()
+        finally:
+            self.close()
+
+    def close(self):
+        """Roll back whatever is not committed, release the locks and end the group."""
+        for db in self._begun:
+            db._rollback()
+            db.lock.release()
+        self._begun = []
+        if current_group() is self:
+            _local.group = None
+
+
 class LockedConnection:
     """
     A sqlite3 connection in autocommit mode (isolation_level=None) guarded
@@ -225,6 +399,11 @@ class LockedConnection:
         self.locked_until = 0.0     # time.monotonic(); while later, BEGIN waits briefly
         self.conn.execute(f'PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}')
         self.conn.execute('PRAGMA journal_mode=WAL')
+        # Every COMMIT syncs the WAL, so what ingest acknowledges survives a
+        # power loss.  FULL is SQLite's usual default; set here because some
+        # builds default WAL connections to NORMAL (durable only up to the
+        # last checkpoint).  Group commit (CommitGroup) keeps the cost low.
+        self.conn.execute('PRAGMA synchronous=FULL')
 
     def _lock_statement(self, sql: str, short_wait: bool = False):
         """
@@ -251,7 +430,15 @@ class LockedConnection:
         """
         BEGIN IMMEDIATE ... COMMIT, or ROLLBACK if the block raises.
         Nested use joins the outer transaction (the outermost block commits).
+        Inside this thread's open CommitGroup, when this connection is a
+        member, the outermost block is a savepoint of the group's
+        transaction instead (committed by CommitGroup.commit()); the group's
+        members before this one in its lock_order are begun first, before
+        this connection's lock is taken.
         """
+        group = current_group()
+        if group is not None and self in group.members and not getattr(_local, 'plain', 0):
+            group._begin_earlier(self)
         with self.lock:
             if self._depth > 0:
                 self._depth += 1
@@ -261,21 +448,55 @@ class LockedConnection:
                     self._depth -= 1
                 return
 
+            if group is not None and self in group.members:
+                if getattr(_local, 'plain', 0):
+                    raise GroupBarrier(f"{self.path}: grouped block inside an ungrouped transaction")
+                group._begin(self)
+                self.conn.execute(f'SAVEPOINT {_GROUP_SAVEPOINT}')
+                self._depth = 1
+                try:
+                    yield self.conn
+                except BaseException:
+                    self._depth = 0
+                    group._undo(self)
+                    raise
+                self._depth = 0
+                try:
+                    self.conn.execute(f'RELEASE {_GROUP_SAVEPOINT}')
+                except sqlite3.Error as e:
+                    group.broken = f"{self.path}: could not end one block of the group ({e})"
+                    raise GroupCommitError(group.broken) from e
+                return
+
             self._lock_statement('BEGIN IMMEDIATE', short_wait=time.monotonic() < self.locked_until)
             self._depth = 1
+            _local.plain = getattr(_local, 'plain', 0) + 1
             try:
-                yield self.conn
-            except BaseException:
+                try:
+                    yield self.conn
+                except BaseException:
+                    self._depth = 0
+                    self._rollback()
+                    raise
                 self._depth = 0
-                self._rollback()
-                raise
-            self._depth = 0
-            try:
-                self._lock_statement('COMMIT')
-            except BaseException:
-                self._rollback()
-                raise
-            self.locked_until = 0.0
+                try:
+                    self._lock_statement('COMMIT')
+                except BaseException:
+                    self._rollback()
+                    raise
+                self.locked_until = 0.0
+            finally:
+                _local.plain -= 1
+
+    def in_group(self) -> bool:
+        """True while this connection is a member of this thread's open CommitGroup."""
+        group = current_group()
+        return group is not None and self in group.members
+
+    def group_barrier(self, what: str = 'this step'):
+        """Raise GroupBarrier if this connection is in this thread's open CommitGroup."""
+        if self.in_group():
+            raise GroupBarrier(f"{self.path}: {what} must not run inside a group commit")
 
     def _rollback(self):
         try:
