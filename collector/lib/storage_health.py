@@ -417,13 +417,36 @@ def _mount_table(text: str) -> List[Tuple[str, str, str, List[str]]]:
     return rows
 
 
+def _superblock_options(text: str) -> dict:
+    """
+    {mount point: the FILESYSTEM's own options} from /proc/self/mountinfo
+    (the fields after " - ": fstype, source, super options). The last entry at
+    a mount point is the one in use.
+
+    /proc/mounts shows the options of the mount as this process sees it, and a
+    systemd sandbox (ProtectSystem=strict, as in the collector's units) remounts
+    every filesystem read-only for the service alone. The superblock options
+    stay 'rw' then; they turn 'ro' when the filesystem itself is read-only,
+    e.g. after the kernel remounted it because of errors (errors=remount-ro).
+    """
+    options = {}
+    for line in text.splitlines():
+        left, sep, right = line.partition(' - ')
+        fields, tail = left.split(), right.split()
+        if sep and len(fields) >= 5 and len(tail) >= 3:
+            options[disk_usage._unescape_mount_field(fields[4])] = tail[2].split(',')
+    return options
+
+
 def read_volumes(config: dict, platform: str, proc_root: Optional[str] = None,
                  fstab: Optional[str] = None):
     """
     (status, volumes) for the volume roots: config "volumes", else the
     platform's (DSM /volumeN mounts; Linux real local filesystems, as the
-    disk run discovers them). read_only comes from /proc/mounts; a root
-    that fstab mounts 'ro' is expected to be read-only.
+    disk run discovers them). read_only is the filesystem's own state
+    (/proc/self/mountinfo superblock options, see _superblock_options), or
+    the /proc/mounts option where mountinfo can't be read; a root that fstab
+    mounts 'ro' is expected to be read-only.
     """
     text = _read(os.path.join(proc_root or PROC_ROOT, 'mounts'))
     if text is None:
@@ -432,6 +455,7 @@ def read_volumes(config: dict, platform: str, proc_root: Optional[str] = None,
     top = {}
     for row in table:                     # the last entry at a mount point is the one in use
         top[row[1]] = row
+    superblock = _superblock_options(_read(os.path.join(proc_root or PROC_ROOT, 'self', 'mountinfo')) or '')
     expected_ro = {os.path.normpath(r[1]) for r in _mount_table(_read(fstab or FSTAB) or '') if 'ro' in r[3]}
     roots = [v for v in config.get('volumes') or [] if isinstance(v, str)]
     if not roots:
@@ -451,7 +475,7 @@ def read_volumes(config: dict, platform: str, proc_root: Optional[str] = None,
         volume = {'id': root[:ID_MAX_CHARS], 'fs': None, 'read_only': None, 'health': None, 'status': None,
                   '_mounted': mount is not None}
         if mount is not None:
-            volume.update(fs=mount[2], read_only='ro' in mount[3],
+            volume.update(fs=mount[2], read_only='ro' in superblock.get(mount[1], mount[3]),
                           _expected_ro=os.path.normpath(mount[1]) in expected_ro)
         volumes.append(volume)
     return 'ok', volumes
