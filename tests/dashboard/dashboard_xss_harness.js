@@ -448,13 +448,8 @@ const okMetrics = extra => Object.assign({ timestamp: isoAgo(1), cpu_percent: 10
     check(!/class="storage-health[^"]*\baged\b/.test(ok), 'fresh health not stale');
     // Summary strip glyph
     const strip = st => ctx.buildSummaryButtonHtml('A', health(st), STATES[0]);
-    check(strip('warning').includes('sys-btn-health warning') && strip('warning').includes('>Warning<'), 'strip warning label');
-    check(strip('critical').includes('>Critical<'), 'strip critical label');
-    const label = extra => ctx.healthShortLabel(Object.assign({ overall_status: 'critical' }, extra));
-    check(label({ disks: [{ id: 'pd3', status: 'critical' }], status_reasons: ['pd3 temperature 88 C (critical at 77)'] }) === 'Drive hot', 'hot drive label');
-    check(label({ disks: [{ id: 'pd3', status: 'critical' }], status_reasons: ['pd3 has 8 pending sectors'] }) === 'Drive problem', 'drive label');
-    check(label({ disks: [{ id: 'pd2', status: 'warning' }], volumes: [{ id: '/', status: 'critical', read_only: true }] }) === 'Read-only', 'read-only label');
-    check(label({ arrays: [{ id: 'md2', status: 'critical' }] }) === 'RAID problem', 'array label');
+    check(strip('warning').includes('sys-btn-health warning') && strip('warning').includes('⚠'), 'strip warning glyph');
+    check(strip('critical').includes('✖'), 'strip critical glyph');
     check(!strip('ok').includes('sys-btn-health'), 'no glyph when healthy');
     // Health without a disk scan still gets a Storage section
     check(ctx.buildSystemCardHtml('A', health('ok'), STATES[0]).includes('<div class="section-label">Storage</div>'), 'health-only storage section');
@@ -790,29 +785,6 @@ async function asyncChecks() {
     check(els.connectedNow.textContent === '1 client' && els.freeSpace.textContent === '—', 'one client, no volumes');
     ctx.updateSnapshotTiles({});
     check(els.systemsReporting.textContent === '—' && els.connectedNow.textContent === '—', 'no systems: dashes');
-    check(els.attentionCount.textContent === '' && els.attentionList.hidden === true, 'no systems: no attention line');
-
-    // Needs attention: not reporting, or a storage-health problem; worst first
-    const evil = '<img src=x onerror=alert(1)>';
-    const sick = {
-        hot:  { device_type: 'server', metrics: { timestamp: now },
-                storage_health: { overall_status: 'critical', status_reasons: [evil, 'second', 'third'],
-                                  disks: [{ id: 'pd3', status: 'critical' }] } },
-        warm: { device_type: 'nas', metrics: { timestamp: now }, storage_health: { overall_status: 'warning', status_reasons: [] } },
-        fine: { device_type: 'nas', metrics: { timestamp: now }, storage_health: { overall_status: 'ok' } },
-        gone: { device_type: 'nas', metrics: null },
-    };
-    const problems = ctx.collectProblems(sick);
-    check(problems.map(p => p.system + ':' + p.label).join() === 'gone:Offline,hot:Drive problem,warm:Warning',
-          'problems: ' + problems.map(p => p.system + ':' + p.label).join());
-    check(problems[1].text === evil + ', second and 1 more', 'two reasons, then a count: ' + problems[1].text);
-    ctx.updateAttention(sick);
-    check(els.attentionCount.textContent === '3 need attention' && els.attentionCount.className === 'summary-sub critical',
-          'attention count: ' + els.attentionCount.textContent + ' / ' + els.attentionCount.className);
-    check(els.attentionList.hidden === false && !els.attentionList.innerHTML.includes('<img')
-          && els.attentionList.innerHTML.includes('data-system="hot"'), 'attention list is escaped: ' + els.attentionList.innerHTML);
-    ctx.updateAttention({ fine: sick.fine });
-    check(els.attentionCount.textContent === 'No problems reported' && els.attentionList.hidden === true, 'nothing to report');
 
     // Only the selected system's card is rendered; the hint shows when none is
     ctx.document.createTextNode = text => text;

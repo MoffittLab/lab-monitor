@@ -1498,7 +1498,7 @@ def test_connected_rows_carry_the_client_name(monkeypatch):
 def test_page_has_the_snapshot_tiles_and_the_detail_area(make_client):
     client, _ = make_client()
     page = client.get('/').get_data(as_text=True)
-    for element_id in ('systemsReporting', 'attentionCount', 'attentionList', 'connectedNow', 'totalStorage', 'freeSpace',
+    for element_id in ('systemsReporting', 'connectedNow', 'totalStorage', 'freeSpace',
                        'lifetimeTransferIn', 'lifetimeTransferOut',
                        'systemSummaryStrip', 'detailHint', 'nasGrid', 'chartCallout'):
         assert f'id="{element_id}"' in page, element_id
