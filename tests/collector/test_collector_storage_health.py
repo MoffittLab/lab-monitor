@@ -265,6 +265,37 @@ def test_read_only_volumes(health, tree, tmp_path):
     assert _classify(health, volumes=volumes)[:2] == ('ok', [])
 
 
+# What the collector's own systemd units show it: ProtectSystem=strict remounts
+# every filesystem read-only for the service alone (per-mount "ro"), while the
+# filesystems themselves stay read-write (superblock "rw")
+SANDBOX_MOUNTS = ('/dev/nvme1n1p2 / ext4 ro,relatime 0 0\n'
+                  '/dev/nvme0n1p1 /scratch ext4 ro,relatime 0 0\n'
+                  '/dev/sda1 /srv/broken ext4 ro,relatime 0 0\n')
+SANDBOX_MOUNTINFO = ('629 560 259:5 / / ro,relatime shared:1 - ext4 /dev/nvme1n1p2 rw,errors=remount-ro\n'
+                     '700 629 259:1 / /scratch ro,relatime shared:30 - ext4 /dev/nvme0n1p1 rw\n'
+                     '701 629 8:1 / /srv/broken ro,relatime shared:31 - ext4 /dev/sda1 ro,errors=remount-ro\n'
+                     '702 629 0:50 / /mnt/with\\040space rw - tmpfs tmpfs rw,size=1k\n'
+                     'a line that is not mountinfo\n')
+
+
+def test_superblock_options_are_the_filesystems_own(health):
+    options = health._superblock_options(SANDBOX_MOUNTINFO)
+    assert options['/'] == ['rw', 'errors=remount-ro'] and options['/scratch'] == ['rw']
+    assert options['/srv/broken'][0] == 'ro' and '/mnt/with space' in options
+    assert len(options) == 4 and health._superblock_options('') == {}
+
+
+@posix_only
+def test_sandbox_read_only_view_is_not_a_read_only_filesystem(health, tree):
+    tree.mounts(SANDBOX_MOUNTS)
+    tree.put(os.path.join(tree.proc, 'self', 'mountinfo'), SANDBOX_MOUNTINFO)
+    status, volumes = health.read_volumes({'volumes': ['/', '/scratch', '/srv/broken']}, 'linux')
+    assert [(v['id'], v['read_only']) for v in volumes] == [('/', False), ('/scratch', False), ('/srv/broken', True)]
+    # Only the filesystem that is really read-only (remounted after errors) is reported
+    overall, reasons, *_ = _classify(health, volumes=volumes)
+    assert overall == 'critical' and reasons == ['/srv/broken mounted read-only']
+
+
 def test_unreadable_mounts(health, tree):
     os.unlink(os.path.join(tree.proc, 'mounts'))
     assert health.read_volumes({}, 'linux') == ('unavailable', [])
