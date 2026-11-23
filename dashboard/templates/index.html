@@ -33,8 +33,20 @@
         <!-- Summary Section -->
         <section class="summary" id="summarySection">
             <div class="summary-card">
+                <h3>Systems Reporting</h3>
+                <p class="summary-value" id="systemsReporting">—</p>
+            </div>
+            <div class="summary-card">
+                <h3>Connected Now</h3>
+                <p class="summary-value" id="connectedNow">—</p>
+            </div>
+            <div class="summary-card">
                 <h3>Total Storage</h3>
                 <p class="summary-value" id="totalStorage">—</p>
+            </div>
+            <div class="summary-card">
+                <h3>Free Across All Volumes</h3>
+                <p class="summary-value" id="freeSpace">—</p>
             </div>
             <div class="summary-card">
                 <h3>Lifetime Transfer</h3>
@@ -49,9 +61,10 @@
         <!-- System Summary Strip -->
         <section class="system-summary-strip" id="systemSummaryStrip"></section>
 
-        <!-- NAS Grid -->
+        <!-- Detail of the selected system (click a chip above) -->
+        <p class="detail-hint" id="detailHint" hidden>Click a system above to see its details.</p>
         <section class="nas-grid" id="nasGrid">
-            <div class="loading">Loading NAS data...</div>
+            <div class="loading">Loading...</div>
         </section>
 
         <!-- Metric Chart Callout -->

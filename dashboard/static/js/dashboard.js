@@ -106,6 +106,10 @@ let loadInFlight = false;
 let lastGoodData = null;          // last successful /api/data payload, kept during outages
 const cardsByName = new Map();    // system name -> { el, html } (cards are updated in place)
 
+// The system whose detail is shown below the chips (one at a time; null = none).
+// Kept in the address (#system=<name>) so a reload or a bookmark opens it again.
+let selectedSystem = null;
+
 // The chart callout shows one selection at a time.  Every request bumps
 // chart.seq; a response whose seq is no longer current is dropped, so a slow
 // earlier request can never overwrite a newer selection.
@@ -171,6 +175,7 @@ function initDashboard(config) {
     if (config.maxChartPoints) maxChartPoints = config.maxChartPoints;
     if (config.dataTimeoutMs)  dataTimeoutMs  = config.dataTimeoutMs;
 
+    selectedSystem = selectionFromAddress();
     setupChartCallout();
     setupCardClicks();
     document.addEventListener('visibilitychange', onVisibilityChange);
@@ -207,6 +212,11 @@ function setupCardClicks() {
         const card = e.target.closest('.nas-card');
         if (!card) return;
         const system = card.dataset.systemName;
+
+        if (e.target.closest('[data-close-detail]')) {
+            selectSystem(null);
+            return;
+        }
 
         if (e.target.closest('[data-expand]')) {
             toggleOwnerList(system);
@@ -472,8 +482,10 @@ function updateDashboard(data) {
         totalStorageCapacity += vols.total;
     }
     updateSummary(globalTotals, totalStorageUsed, totalStorageCapacity, failedEndpoints(data));
+    updateSnapshotTiles(systems);
 
     if (names.length === 0) {
+        setDetailHint(false);
         document.getElementById('systemSummaryStrip').replaceChildren();
         renderCards([]);
         setGridMessage('No systems reporting yet');
@@ -495,8 +507,74 @@ function updateDashboard(data) {
         ordered.push([key, grouped[key]]);
     }
 
+    // Chips for every system; the full detail only for the selected one
+    if (selectedSystem !== null && !Object.prototype.hasOwnProperty.call(systems, selectedSystem)) {
+        setSelectedSystem(null);       // the system is gone (deleted on the Manager)
+    }
     renderSummaryStrip(ordered);
-    renderCards(ordered.flatMap(([, items]) => items));
+    clearGridMessage();
+    renderCards(ordered.flatMap(([, items]) => items).filter(([name]) => name === selectedSystem));
+    setDetailHint(selectedSystem === null);
+}
+
+// The lab-wide tiles next to Total Storage and Lifetime Transfer
+function updateSnapshotTiles(systems) {
+    const all = Object.values(systems);
+    const reporting = all.filter(sys => systemState(sys).state === 'ok').length;
+    document.getElementById('systemsReporting').textContent =
+        all.length ? `${reporting} of ${all.length}` : '—';
+
+    // Clients connected right now, over the systems that report sessions
+    let clients = null;
+    let free = null;
+    for (const sys of all) {
+        const n = toNumber(((sys.sessions || {}).summary || {}).clients_total);
+        if (n !== null) clients = (clients || 0) + n;
+        for (const vol of ((sys.disk || {}).volumes || [])) {
+            const total = toNumber(vol.total_bytes);
+            const used  = toNumber(vol.usage_bytes);
+            let f = toNumber(vol.free_bytes);
+            if (f === null && total !== null && used !== null) f = total - used;
+            if (f !== null && total !== null && total > 0) free = (free || 0) + Math.max(0, f);
+        }
+    }
+    document.getElementById('connectedNow').textContent =
+        clients === null ? '—' : `${fmtInt(clients)} ${clients === 1 ? 'client' : 'clients'}`;
+    document.getElementById('freeSpace').textContent = formatBytes(free);
+}
+
+// --- Selection: which system's detail is open -----------------------------
+
+function selectionFromAddress() {
+    try {
+        const m = /^#system=(.+)$/.exec(window.location.hash || '');
+        return m ? decodeURIComponent(m[1]) : null;
+    } catch (e) {
+        return null;       // no window (tests) or a malformed address
+    }
+}
+
+function setSelectedSystem(name) {
+    selectedSystem = name;
+    try {
+        const here = window.location.pathname + window.location.search;
+        window.history.replaceState(null, '', name === null ? here : here + '#system=' + encodeURIComponent(name));
+    } catch (e) { /* the address is a convenience only */ }
+}
+
+// Chip click: open that system's detail, or close it when it is already open
+function selectSystem(name) {
+    const opening = name !== null && name !== selectedSystem;
+    setSelectedSystem(opening ? name : null);
+    rerenderCards();
+    if (opening) {
+        const entry = cardsByName.get(name);
+        if (entry && entry.el.scrollIntoView) entry.el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+function setDetailHint(show) {
+    document.getElementById('detailHint').hidden = !show;
 }
 
 function updateSummary(globalTotals, storageUsed, storageCap, failed) {
@@ -586,8 +664,10 @@ function renderSummaryStrip(orderedGroups) {
 }
 
 function createSummaryButton(systemName, sys) {
-    const btn = document.createElement('div');
+    const btn = document.createElement('button');
+    btn.type  = 'button';
     const st  = systemState(sys);
+    const selected = systemName === selectedSystem;
 
     let level;
     if (NAS_TYPES.has((sys.device_type || '').toLowerCase())) {
@@ -601,17 +681,17 @@ function createSummaryButton(systemName, sys) {
               : [cpuLevel, ramLevel].includes('warning') ? 'warning' : '';
     }
 
-    btn.className = ['sys-btn', level, st.state === 'ok' ? '' : st.state].filter(Boolean).join(' ');
-    btn.title = st.state === 'unknown' ? 'Metrics unavailable right now (Manager call failed)'
-              : st.ageMs === null      ? 'No reports yet'
-              : 'Last report ' + formatAge(st.ageMs) + ' ago';
+    btn.className = ['sys-btn', level, st.state === 'ok' ? '' : st.state, selected ? 'selected' : '']
+        .filter(Boolean).join(' ');
+    btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    btn.title = (st.state === 'unknown' ? 'Metrics unavailable right now (Manager call failed)'
+               : st.ageMs === null      ? 'No reports yet'
+               : 'Last report ' + formatAge(st.ageMs) + ' ago')
+              + (selected ? '. Click to close its details' : '. Click for details');
     btn.innerHTML = buildSummaryButtonHtml(systemName, sys, st);
 
-    // Click scrolls to the full card
-    btn.onclick = () => {
-        const entry = cardsByName.get(systemName);
-        if (entry) entry.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    };
+    // Click opens this system's detail below the chips (or closes it)
+    btn.onclick = () => selectSystem(systemName);
     return btn;
 }
 
@@ -700,6 +780,7 @@ function renderCards(entries) {
         if (cardHtml !== entry.html) {
             const scroll = saveScrollPositions(entry.el);
             entry.el.innerHTML = cardHtml;
+            addCloseButton(entry.el);
             restoreScrollPositions(entry.el, scroll);
             entry.html = cardHtml;
         }
@@ -716,6 +797,21 @@ function renderCards(entries) {
             cardsByName.delete(name);
         }
     }
+}
+
+// The detail's close button, added as an element (the card's markup itself
+// stays div/span only, which the XSS regression test enforces)
+function addCloseButton(card) {
+    const header = card.querySelector('.nas-card-header');
+    if (!header) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'detail-close';
+    btn.dataset.closeDetail = '';
+    btn.title = 'Close';
+    btn.setAttribute('aria-label', 'Close details');
+    btn.textContent = '×';
+    header.appendChild(btn);
 }
 
 function saveScrollPositions(card) {

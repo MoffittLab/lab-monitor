@@ -2,7 +2,7 @@
 
 Web interface for viewing system usage statistics (disk, CPU, RAM, network, disk I/O, GPU, per-user activity, who is connected, storage health and storage owners) and their history.
 
-The Dashboard owns no data. Its Flask server polls the Manager's read API on behalf of the browser (the Manager token never reaches the browser) and serves one page that renders a card per system.
+The Dashboard owns no data. Its Flask server polls the Manager's read API on behalf of the browser (the Manager token never reaches the browser) and serves one page: a chip per system, and the full detail of the system you click.
 
 ## Installation & Setup
 
@@ -100,6 +100,9 @@ The dashboard refuses to start if `auth` is present but incomplete or its `passw
 1. **Start the service** (or verify it's running via Task Scheduler)
 2. **Open in browser:** `http://atlantis.med.harvard.edu:5001`
 3. **View:**
+   - **Top row:** systems reporting (those with a current report, of all systems), clients connected now (summed over the systems that report sessions), total storage, free space across all volumes, and lifetime transfer.
+   - **Chips:** one per system, grouped by device type. A NAS chip shows its usage bar and used / total; a server chip its CPU and RAM. Badges mark offline, stale and storage-health problems.
+   - **Detail:** click a chip and that system's full detail opens below the chips, one system at a time; click the chip again, or the × in the detail, to close it. The address keeps the selection (`#system=<name>`), so a reload or a bookmark opens the same system.
    - Real-time metrics (CPU%, RAM%, network, GPU, per-user activity). Refreshes every 30 seconds while the tab is visible, pauses while it is hidden, and refreshes immediately when you come back.
    - Disk usage by volume and folder, with the age of the last disk scan
    - Click any metric or volume for its history chart (24h / 7d / 30d / 90d / 1y / all / custom range, PNG and CSV export)

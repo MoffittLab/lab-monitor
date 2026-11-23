@@ -1454,3 +1454,12 @@ def test_pages_use_versioned_static_urls_so_cached_copies_are_not_reused(make_cl
         monkeypatch.setattr(dash, 'STATIC_HEADERS_VERSION', dash.STATIC_HEADERS_VERSION + 1)
         assert dash.static_url('js/dashboard.js') != before
         assert dash.static_url('no/such/file.js').endswith(f'?v={dash.STATIC_HEADERS_VERSION}')
+
+
+def test_page_has_the_snapshot_tiles_and_the_detail_area(make_client):
+    client, _ = make_client()
+    page = client.get('/').get_data(as_text=True)
+    for element_id in ('systemsReporting', 'connectedNow', 'totalStorage', 'freeSpace',
+                       'lifetimeTransferIn', 'lifetimeTransferOut',
+                       'systemSummaryStrip', 'detailHint', 'nasGrid', 'chartCallout'):
+        assert f'id="{element_id}"' in page, element_id
