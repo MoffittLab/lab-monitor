@@ -296,7 +296,8 @@ first. The rules:
 - **Volumes:** mounted read-only when `/etc/fstab` doesn't say `ro` is critical; a configured DSM
   `/volumeN` that isn't mounted is critical; Windows Unhealthy critical, Warning a warning.
 - **Windows events:** disk 52 critical; disk 7/11/51/154 or ntfs 50/55/98 a warning; disk 153 or a
-  miniport's 129 at 10 or more per hour a warning.
+  miniport's 129 at 10 or more per hour a warning. Only critical, error and warning events count:
+  ntfs 98 is also logged, as information, when a volume is checked and found healthy.
 
 The message carries `arrays`, `disks` (with model and serial) and `volumes` lists, plus flattened
 top-level numbers for history: `disk_<sid>_{temperature_c, status_code, power_on_hours,

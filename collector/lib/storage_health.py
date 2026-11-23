@@ -21,7 +21,8 @@ Windows, hourly (whatever the SYSTEM account can read):
           storage_health.timeout_seconds, default 90 s):
           Get-PhysicalDisk with Get-StorageReliabilityCounter, Storage
           Spaces virtual disks and jobs, Get-Volume, and the System log's
-          disk / Ntfs / storport-miniport events since the previous run.
+          disk / Ntfs / storport-miniport events (critical, error and
+          warning only) since the previous run.
 Between expensive runs their last results come from
 storage_health_state.json.
 
@@ -546,7 +547,7 @@ $failed = 0
 $since = [DateTime]::Parse([string]$env:LM_HEALTH_SINCE, [Globalization.CultureInfo]::InvariantCulture)
 foreach ($p in @('disk', 'Ntfs', 'Microsoft-Windows-Ntfs', 'storahci', 'stornvme', 'iaStorA', 'iaStorAVC')) {
     try {
-        $filter = @{ LogName = 'System'; ProviderName = $p; StartTime = $since }
+        $filter = @{ LogName = 'System'; ProviderName = $p; StartTime = $since; Level = 1, 2, 3 }
         foreach ($e in @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)) {
             $key = (([string]$e.ProviderName).ToLower() -replace '^microsoft-windows-', '') + '/' + [string]$e.Id
             if ($events.ContainsKey($key)) { $events[$key] += 1 } else { $events[$key] = 1 }
