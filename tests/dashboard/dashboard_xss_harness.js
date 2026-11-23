@@ -767,6 +767,46 @@ async function asyncChecks() {
           'owner error: ' + ctx.buildFolderOwnersHtml('Tri', '/x'));
 }
 
+// --- Chips + one detail: the lab-wide tiles and which card is rendered ---
+{
+    const now = new Date().toISOString();
+    const systems = {
+        A: { device_type: 'server', metrics: { timestamp: now }, sessions: { summary: { clients_total: 3 } },
+             disk: { volumes: [{ usage_bytes: 60, total_bytes: 100, free_bytes: 40 }] } },
+        B: { device_type: 'nas', metrics: null, sessions: { summary: { clients_total: 2 } },
+             disk: { volumes: [{ usage_bytes: 10, total_bytes: 50 }, { usage_bytes: 5 }] } },   // free from total - used; no capacity: skipped
+        C: { device_type: 'nas', metrics: { timestamp: now }, disk: null },                       // no sessions, no disk
+    };
+    ctx.updateSnapshotTiles(systems);
+    check(els.systemsReporting.textContent === '2 of 3', 'systems reporting: ' + els.systemsReporting.textContent);
+    check(els.connectedNow.textContent === '5 clients', 'connected now: ' + els.connectedNow.textContent);
+    check(els.freeSpace.textContent === '80 B', 'free space: ' + els.freeSpace.textContent);
+    ctx.updateSnapshotTiles({ A: { device_type: 'nas', metrics: { timestamp: now }, sessions: { summary: { clients_total: 1 } } } });
+    check(els.connectedNow.textContent === '1 client' && els.freeSpace.textContent === '—', 'one client, no volumes');
+    ctx.updateSnapshotTiles({});
+    check(els.systemsReporting.textContent === '—' && els.connectedNow.textContent === '—', 'no systems: dashes');
+
+    // Only the selected system's card is rendered; the hint shows when none is
+    ctx.document.createTextNode = text => text;
+    const rendered = [];
+    vm.runInContext('var __realRenderCards = renderCards; var __realStrip = renderSummaryStrip;', ctx);
+    ctx.__capture = entries => rendered.push(entries.map(e => e[0]));
+    vm.runInContext('renderCards = e => __capture(e); renderSummaryStrip = () => {};', ctx);
+    const data = { systems, global_totals: {}, errors: [] };
+    vm.runInContext('selectedSystem = null;', ctx);
+    ctx.updateDashboard(data);
+    check(JSON.stringify(rendered.pop()) === '[]' && els.detailHint.hidden === false, 'no selection: no card, hint shown');
+    vm.runInContext('selectedSystem = "B";', ctx);
+    ctx.updateDashboard(data);
+    check(JSON.stringify(rendered.pop()) === '["B"]' && els.detailHint.hidden === true, 'selected system only, hint hidden');
+    vm.runInContext('selectedSystem = "Gone";', ctx);
+    ctx.updateDashboard(data);
+    check(JSON.stringify(rendered.pop()) === '[]' && vm.runInContext('selectedSystem', ctx) === null,
+          'a system that no longer exists is deselected');
+    vm.runInContext('renderCards = __realRenderCards; renderSummaryStrip = __realStrip; selectedSystem = null;', ctx);
+    check(ctx.selectionFromAddress() === null, 'no window: no selection from the address');
+}
+
 asyncChecks().catch(err => failures.push('async checks threw: ' + (err && err.stack || err))).then(() => {
     if (failures.length) {
         for (const f of failures) console.log('FAIL: ' + f);

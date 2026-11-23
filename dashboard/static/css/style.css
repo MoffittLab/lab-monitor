@@ -1175,3 +1175,112 @@ body {
     border-radius: 4px;
     border: 1px solid #eee;
 }
+
+/* ------------------------------------------------------------------------
+   Chips for every system, one system's detail below them
+   ------------------------------------------------------------------------ */
+
+.container {
+    max-width: 1500px;
+}
+
+/* A chip is a <button>: undo the browser's button look */
+.sys-btn {
+    font: inherit;
+    color: inherit;
+    text-align: left;
+}
+
+.sys-btn:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.sys-btn:focus-visible {
+    outline: 3px solid var(--secondary);
+    outline-offset: 2px;
+}
+
+/* The chip whose detail is open */
+.sys-btn.selected {
+    outline: 3px solid var(--secondary);
+    outline-offset: 1px;
+    opacity: 1;
+}
+
+.detail-hint {
+    margin: 0 0 20px;
+    padding: 14px 18px;
+    background: rgba(255, 255, 255, 0.85);
+    border-radius: 8px;
+    font-size: 14px;
+    color: #4a5665;
+    text-align: center;
+}
+
+/* The detail: one card across the page, its sections flowing into columns */
+.nas-grid {
+    display: block;
+}
+
+.nas-card {
+    cursor: default;
+    border: 2px solid var(--secondary);
+    columns: 3 340px;
+    column-gap: 28px;
+}
+
+.nas-card > * {
+    break-inside: avoid;
+}
+
+.nas-card > .state-banner,
+.nas-card > .section-notice,
+.nas-card > .nas-card-header {
+    column-span: all;
+}
+
+.nas-card-header {
+    align-items: center;
+    gap: 12px;
+}
+
+.nas-card-header > div:first-child {
+    flex: 1;
+}
+
+.nas-card .nas-name {
+    font-size: 22px;
+}
+
+.detail-close {
+    flex: none;
+    width: 36px;
+    height: 36px;
+    font-size: 22px;
+    line-height: 1;
+    color: var(--primary);
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.detail-close:hover,
+.detail-close:focus-visible {
+    background: var(--light);
+}
+
+/* The first section of a column needs no rule above it */
+.nas-card > .card-section {
+    margin-top: 0;
+    margin-bottom: 14px;
+}
+
+/* More room for the lists than the old narrow cards had */
+.nas-card .folder-list {
+    max-height: 420px;
+}
+
+.nas-card .user-list-scrollable {
+    max-height: 420px;
+}
