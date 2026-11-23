@@ -208,6 +208,13 @@ function setupChartCallout() {
 // per-element listeners would have to be re-attached on each refresh).
 // History stays clickable even when a system is offline.
 function setupCardClicks() {
+    document.getElementById('attentionList').addEventListener('click', (e) => {
+        const row = e.target.closest('[data-system]');
+        if (!row) return;
+        if (row.dataset.system === selectedSystem) setSelectedSystem(null);   // selectSystem toggles: reopen
+        selectSystem(row.dataset.system);
+    });
+
     document.getElementById('nasGrid').addEventListener('click', (e) => {
         const card = e.target.closest('.nas-card');
         if (!card) return;
@@ -523,6 +530,7 @@ function updateSnapshotTiles(systems) {
     const reporting = all.filter(sys => systemState(sys).state === 'ok').length;
     document.getElementById('systemsReporting').textContent =
         all.length ? `${reporting} of ${all.length}` : '—';
+    updateAttention(systems);
 
     // Clients connected right now, over the systems that report sessions
     let clients = null;
@@ -541,6 +549,70 @@ function updateSnapshotTiles(systems) {
     document.getElementById('connectedNow').textContent =
         clients === null ? '—' : `${fmtInt(clients)} ${clients === 1 ? 'client' : 'clients'}`;
     document.getElementById('freeSpace').textContent = formatBytes(free);
+}
+
+// --- Needs attention: systems not reporting, or with a storage-health problem ---
+// (A nearly full NAS is not listed: its chip is already red.)
+
+function collectProblems(systems) {
+    const rank = { critical: 0, warning: 1 };
+    const problems = [];
+    for (const [name, sys] of Object.entries(systems)) {
+        const st = systemState(sys);
+        if (st.state === 'offline') {
+            problems.push({ system: name, level: 'critical', label: 'Offline',
+                            text: st.ageMs === null ? 'No reports yet' : 'No report for ' + formatAge(st.ageMs) });
+        } else if (st.state === 'stale') {
+            problems.push({ system: name, level: 'warning', label: 'Stale',
+                            text: 'Last report ' + formatAge(st.ageMs) + ' ago' });
+        }
+        const h = sys.storage_health;
+        if (h && typeof h === 'object' && managerFeatures.storage_health !== false && h.overall_status in rank) {
+            const reasons = Array.isArray(h.status_reasons) ? h.status_reasons.filter(r => typeof r === 'string') : [];
+            problems.push({ system: name, level: h.overall_status, label: healthShortLabel(h),
+                            text: reasons.length ? summarizeList(reasons, 2)
+                                                 : 'Storage health: ' + HEALTH_LABELS[h.overall_status] });
+        }
+    }
+    return problems.sort((a, b) => rank[a.level] - rank[b.level] || a.system.localeCompare(b.system));
+}
+
+// Two or three words for a chip: what kind of storage-health problem it is
+function healthShortLabel(h) {
+    const worst   = h.overall_status;
+    const bad     = list => (Array.isArray(list) ? list : []).filter(x => x && typeof x === 'object' && x.status === worst);
+    const reasons = (Array.isArray(h.status_reasons) ? h.status_reasons : []).map(String);
+    if (bad(h.arrays).length) return 'RAID problem';
+    const disks = bad(h.disks);
+    if (disks.length) {
+        const hot = disks.every(dk => reasons.some(r => r.startsWith(String(dk.id) + ' temperature')));
+        return hot ? 'Drive hot' : 'Drive problem';
+    }
+    const volumes = bad(h.volumes);
+    if (volumes.length) return volumes.some(v => v.read_only === true) ? 'Read-only' : 'Volume problem';
+    return HEALTH_LABELS[worst] || 'Problem';
+}
+
+function buildAttentionHtml(problems) {
+    if (!problems.length) return '';
+    const rowsHtml = problems.map(p => {
+        const levelCls = p.level === 'critical' ? 'critical' : 'warning';
+        return html`<button type="button" class="attention-row ${levelCls}" data-system="${escapeHtml(p.system)}" title="Show ${escapeHtml(p.system)}"><span class="health-pill ${levelCls}">${escapeHtml(p.label)}</span><span class="attention-system">${escapeHtml(p.system)}</span><span class="attention-text">${escapeHtml(p.text)}</span></button>`;
+    }).join('');
+    return html`<div class="attention-label">Needs attention</div>${rowsHtml}`;
+}
+
+function updateAttention(systems) {
+    const problems = collectProblems(systems);
+    const affected = new Set(problems.map(p => p.system)).size;
+    const count = document.getElementById('attentionCount');
+    count.textContent = !Object.keys(systems).length ? ''
+                      : affected === 0 ? 'No problems reported'
+                      : affected === 1 ? '1 needs attention' : `${affected} need attention`;
+    count.className = 'summary-sub' + (affected === 0 ? '' : problems[0].level === 'critical' ? ' critical' : ' warning');
+    const list = document.getElementById('attentionList');
+    list.hidden = problems.length === 0;
+    list.innerHTML = buildAttentionHtml(problems);
 }
 
 // --- Selection: which system's detail is open -----------------------------
@@ -739,12 +811,12 @@ function buildSummaryButtonHtml(systemName, sys, st) {
     return html`<div class="sys-btn-header">${badgeHtml}<div class="sys-btn-name">${escapeHtml(systemName)}</div>${healthHtml}</div>${bodyHtml}`;
 }
 
-// Storage-health warning (⚠) or critical (✖) mark next to the name in the strip
+// Storage-health problem next to the name in the strip: "Drive hot", "Read-only", ...
 function buildHealthGlyphHtml(h) {
     if (!h || managerFeatures.storage_health === false) return '';
     const status = h.overall_status;
     if (status !== 'warning' && status !== 'critical') return '';
-    const glyph   = status === 'critical' ? '✖' : '⚠';
+    const glyph   = healthShortLabel(h);
     const reasons = Array.isArray(h.status_reasons) ? h.status_reasons.map(String) : [];
     const tip     = ['Storage health: ' + HEALTH_LABELS[status], ...reasons.slice(0, 3)].join('\n');
     const glyphCls = status;
@@ -1280,12 +1352,12 @@ function buildSessionListHtml(s, sources, now) {
             : html`<span class="user-name muted" title="${escapeHtml(noNameTip)}">—</span>`;
         const viaTip    = plural(g.connections, 'connection');
         // The cells are narrow: the full address and start time are in the tooltips
-        const clientTip = [g.client, g.host].filter(Boolean).join(' · ');
+        const clientTip = [g.name, g.client, g.host].filter(Boolean).join(' · ');
         const sinceTip  = g.since === null ? '' : formatDateTime(g.since);
         return html`
             <div class="user-row session-row">
                 ${userHtml}
-                <span class="session-client" title="${escapeHtml(clientTip)}">${escapeHtml(g.client || g.host || '—')}</span>
+                <span class="session-client" title="${escapeHtml(clientTip)}">${escapeHtml(g.name || g.client || g.host || '—')}</span>
                 <span class="session-via" title="${escapeHtml(viaTip)}">${escapeHtml(g.via.join(', '))}</span>
                 <span class="session-since" title="${escapeHtml(sinceTip)}">${escapeHtml(g.since === null ? '—' : formatSince(g.since))}</span>
             </div>`;
@@ -1319,9 +1391,10 @@ function groupSessionRows(list) {
         const key = [user, client, host].join('\0');
         let g = groups.get(key);
         if (!g) {
-            g = { user, client, host, via: [], since: null, connections: 0 };
+            g = { user, client, host, name: '', via: [], since: null, connections: 0 };
             groups.set(key, g);
         }
+        if (!g.name && typeof r.client_name === 'string') g.name = r.client_name;
         const svc = (typeof r.service === 'string' && r.service ? r.service : '?').toUpperCase()
                   + (r.state === 'disconnected' ? ' (disc.)' : '');
         if (!g.via.includes(svc)) g.via.push(svc);

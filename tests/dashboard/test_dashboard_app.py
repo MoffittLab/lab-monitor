@@ -128,6 +128,7 @@ def make_client(monkeypatch):
             'manager_token': TOKEN,
             'refresh_interval_seconds': 30,
             'host': '127.0.0.1',
+            'client_names': False,      # no DNS lookups from the tests
         }
         config.update(overrides or {})
         dash.init_app(config, logging.getLogger('test-dashboard'))
@@ -1456,10 +1457,48 @@ def test_pages_use_versioned_static_urls_so_cached_copies_are_not_reused(make_cl
         assert dash.static_url('no/such/file.js').endswith(f'?v={dash.STATIC_HEADERS_VERSION}')
 
 
+def test_client_addresses_get_names():
+    lookups = []
+
+    def by_addr(ip):
+        lookups.append(ip)
+        return {'10.0.0.7': 'scope3.lab.example', '10.0.0.8': '10.0.0.8',
+                '10.0.0.9': 'host.docker.internal'}[ip]        # KeyError: no name
+
+    names = dash._ClientNames(addr_lookup=by_addr, name_lookup={'triton5': '10.0.0.5'}.__getitem__)
+    wanted = ['10.0.0.5', '10.0.0.7', '10.0.0.8', '10.0.0.9', '10.0.0.10']
+    assert names.names(wanted, ['triton5', 'gone', 'not a host name']) == {}     # nothing known yet: no waiting
+    names.wait()
+    names.names(wanted, ['triton5', 'gone'])        # triton5's address is known now; the others get looked up
+    names.wait()
+    assert names.names(wanted, ['triton5', 'gone']) == {'10.0.0.5': 'triton5', '10.0.0.7': 'scope3'}
+    count = len(lookups)
+    names.names(wanted, ['triton5'])
+    names.wait()
+    assert len(lookups) == count                    # answers and failures are both remembered
+
+
+def test_connected_rows_carry_the_client_name(monkeypatch):
+    monkeypatch.setattr(dash, '_config', {})
+    monkeypatch.setattr(dash, '_client_names', type('Fixed', (), {
+        'names': staticmethod(lambda addresses, systems: {'10.0.0.5': 'triton5'})})())
+    systems = {'kraken': {'sessions': {'sessions': [
+        {'client': '10.0.0.5', 'service': 'smb'}, {'client': '10.0.0.6', 'service': 'smb'},
+        {'client': '127.0.0.1', 'service': 'ssh'}, {'username': 'ann', 'service': 'console'}]}}}
+    dash._name_clients(systems)
+    rows = systems['kraken']['sessions']['sessions']
+    assert [r.get('client_name') for r in rows] == ['triton5', None, None, None]
+
+    monkeypatch.setattr(dash, '_config', {'client_names': False})
+    rows[0].pop('client_name')
+    dash._name_clients(systems)
+    assert 'client_name' not in rows[0]
+
+
 def test_page_has_the_snapshot_tiles_and_the_detail_area(make_client):
     client, _ = make_client()
     page = client.get('/').get_data(as_text=True)
-    for element_id in ('systemsReporting', 'connectedNow', 'totalStorage', 'freeSpace',
+    for element_id in ('systemsReporting', 'attentionCount', 'attentionList', 'connectedNow', 'totalStorage', 'freeSpace',
                        'lifetimeTransferIn', 'lifetimeTransferOut',
                        'systemSummaryStrip', 'detailHint', 'nasGrid', 'chartCallout'):
         assert f'id="{element_id}"' in page, element_id
