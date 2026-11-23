@@ -16,6 +16,7 @@ Usage:
     python3 run_collectors.py --csv collectors.csv --mode disk --dry-run    # preview commands
     python3 run_collectors.py --csv collectors.csv --mode disk --timeout 60 # custom SSH connect timeout
     python3 run_collectors.py --csv collectors.csv --mode metrics --parallel 4
+    python3 run_collectors.py --csv collectors.csv --mode metrics --only kraken   # one system
 
 Requirements:
     pip install paramiko
@@ -199,6 +200,7 @@ def main():
                              '(default: 600 for metrics, no limit for disk)')
     parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
                         help='Run up to N systems at once (default: 1 = one at a time)')
+    _ssh.add_only_argument(parser, 'Run on')
     parser.add_argument('--verbose', action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -228,10 +230,12 @@ def main():
         print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
+    rows = _ssh.apply_only(rows, args.only, csv_path)
+
     limit = f"{command_timeout}s" if command_timeout else "none"
     print("=" * 70)
     print(f"Lab Monitor - Run Collectors ({args.mode.upper()})")
-    print(f"Systems: {len(rows)}  |  Timeout: {args.timeout}s  |  Command limit: {limit}  |  "
+    print(f"Systems: {len(rows)}" + (f" (--only {', '.join(args.only)})" if args.only else '') + f"  |  Timeout: {args.timeout}s  |  Command limit: {limit}  |  "
           f"Parallel: {args.parallel}  |  Dry-run: {args.dry_run}")
     print("=" * 70)
     print()

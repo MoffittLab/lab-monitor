@@ -325,10 +325,7 @@ def main():
                         help='Limit for each remote step (git pull, pip); 0 = no limit (default 600)')
     parser.add_argument('--parallel', type=_ssh.positive_int, default=1, metavar='N',
                         help='Update up to N systems at once (default: 1 = one at a time)')
-    parser.add_argument('--only', action='append', default=[], metavar='HOST',
-                        help='Update only this system: its ip column, or the first part of its '
-                             'host name (triton2 selects triton2.example.org). Repeat for more '
-                             'systems. A value that matches no row stops the tool')
+    _ssh.add_only_argument(parser, 'Update')
     parser.add_argument('--verbose',  action='store_true',
                         help='Log SSH connections, commands, and responses')
     args = parser.parse_args()
@@ -354,12 +351,7 @@ def main():
         print(f"ERROR: CSV missing required columns: {', '.join(sorted(missing))}")
         sys.exit(1)
 
-    if args.only:
-        rows, unmatched = _ssh.select_rows(rows, args.only)
-        if unmatched:
-            print(f"ERROR: --only matched no system in {csv_path}: {', '.join(unmatched)}")
-            print("       Use the ip column's value, or the first part of a host name.")
-            sys.exit(1)
+    rows = _ssh.apply_only(rows, args.only, csv_path)
 
     if 'python_path' not in fields and args.upgrade_pip:
         print("ERROR: 'python_path' column not found but --upgrade-pip was requested.")
