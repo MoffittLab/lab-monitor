@@ -52,6 +52,7 @@ Dashboard reads `config.json` in its directory (see `config.example.json`):
 | `auth.cookie_secure` | `false` | Set `true` behind an HTTPS proxy that doesn't tell the dashboard the request was HTTPS |
 | `refresh_interval_seconds` | 30 | Browser poll interval (minimum 5). Also the server-side cache TTL. |
 | `cache_ttl_seconds` | = refresh interval | Override for how long one Manager poll is reused |
+| `client_names` | true | Show a name instead of the address in each Connected list: the system's name when the address belongs to a monitored system, otherwise the name DNS gives. Looked up in the background and remembered for 6 hours; `false` shows addresses only. |
 | `manager_timeout_seconds` | 5 | Timeout for each Manager request |
 | `stale_minutes` | 15 | A system with no `system_metrics` for this long is shown as **stale** (amber) |
 | `offline_minutes` | 120 | ...and after this long as **offline** (red) |

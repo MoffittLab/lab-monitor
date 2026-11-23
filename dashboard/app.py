@@ -21,6 +21,8 @@ import getpass
 import hashlib
 import logging
 import secrets
+import socket
+import ipaddress
 import mimetypes
 import argparse
 import threading
@@ -793,6 +795,120 @@ def _clean_sessions(entry: dict) -> dict:
     }
 
 
+# --- Names for the client addresses in the Connected lists ------------------
+# A monitored system's own name when the address is one of theirs, otherwise
+# the name DNS gives for the address.  A lookup can take seconds, so one
+# background thread does them and a poll only uses what is already known: a
+# new address gets its name a poll or two later.
+CLIENT_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$')
+
+
+class _ClientNames:
+    OK_TTL      = 6 * 3600     # seconds a found name (or address) is kept
+    FAIL_TTL    = 3600         # seconds before a failed lookup is tried again
+    MAX_ENTRIES = 5000
+
+    def __init__(self, addr_lookup=None, name_lookup=None):
+        self._addr_lookup = addr_lookup or (lambda ip: socket.gethostbyaddr(ip)[0])
+        self._name_lookup = name_lookup or socket.gethostbyname
+        self._lock    = threading.Lock()
+        self._known   = {}     # ('addr', ip) -> (name or None, expires); ('name', system) -> (ip or None, expires)
+        self._pending = []
+        self._worker  = None
+
+    def _get(self, key, now):
+        """The cached value (None if unknown); a missing or expired one is queued for the worker."""
+        with self._lock:
+            hit = self._known.get(key)
+            if (hit is None or hit[1] <= now) and key not in self._pending:
+                if len(self._known) >= self.MAX_ENTRIES:
+                    self._known = {k: v for k, v in self._known.items() if v[1] > now}
+                if len(self._known) < self.MAX_ENTRIES:
+                    self._pending.append(key)
+                    if self._worker is None:
+                        self._worker = threading.Thread(target=self._run, name='client-names', daemon=True)
+                        self._worker.start()
+            return hit[0] if hit else None
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._worker = None
+                    return
+                key = self._pending[0]
+            value = self._lookup(key)
+            with self._lock:
+                self._pending.remove(key)
+                self._known[key] = (value, _monotonic() + (self.OK_TTL if value else self.FAIL_TTL))
+
+    def _lookup(self, key):
+        kind, value = key
+        try:
+            if kind == 'name':
+                return str(ipaddress.ip_address(self._name_lookup(value)))
+            full = str(self._addr_lookup(value))
+            name = full.split('.')[0]
+            # Not a name: the address echoed back, or a hosts-file alias such as host.docker.internal
+            if not CLIENT_NAME_RE.match(name) or name.isdigit() or full.lower().endswith(('.internal', 'localhost')):
+                return None
+            return name
+        except Exception:
+            return None
+
+    def wait(self, timeout: float = 5.0) -> None:
+        """Block until the queued lookups are done (tests)."""
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+
+    def names(self, addresses, system_names) -> dict:
+        """{address: name} for the addresses whose name is known by now."""
+        now = _monotonic()
+        own = {}
+        for system in system_names:
+            if isinstance(system, str) and CLIENT_NAME_RE.match(system):
+                ip = self._get(('name', system), now)
+                if ip:
+                    own[ip] = system
+        found = {}
+        for ip in addresses:
+            name = own.get(ip) or self._get(('addr', ip), now)
+            if name:
+                found[ip] = name
+        return found
+
+
+_client_names = _ClientNames()
+
+
+def _client_address(value):
+    """value as a normalised IP address string, or None (not an address, or a local one)."""
+    try:
+        addr = ipaddress.ip_address(value)
+    except (ValueError, TypeError):
+        return None
+    return None if addr.is_loopback or addr.is_link_local or addr.is_unspecified else str(addr)
+
+
+def _name_clients(systems: dict) -> None:
+    """Add client_name to the Connected rows whose address has a known name ("client_names": false turns it off)."""
+    if _config.get('client_names', True) is False:
+        return
+    rows = []
+    for sys_ in systems.values():
+        for row in (sys_.get('sessions') or {}).get('sessions') or []:
+            ip = _client_address(row.get('client'))
+            if ip:
+                rows.append((ip, row))
+    if not rows:
+        return
+    names = _client_names.names(sorted({ip for ip, _ in rows}), sorted(systems))
+    for ip, row in rows:
+        if ip in names:
+            row['client_name'] = names[ip]
+
+
 def _health_status(row: dict) -> dict:
     """Statuses outside the shared vocabulary read as null (shown as unknown)."""
     if row.get('status') not in HEALTH_STATUSES:
@@ -1030,6 +1146,8 @@ def get_all_systems_data(results: dict = None) -> tuple:
         for name, entry in _optional(path).items():
             if name in systems and isinstance(entry, dict):
                 systems[name][key] = clean(entry)
+
+    _name_clients(systems)
 
     usage_resp = _optional(USAGE_ENDPOINT)
     usage_devices = usage_resp.get('devices')
